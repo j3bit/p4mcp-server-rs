@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# Local Cargo overrides and vendored dependency snapshots
+/.cargo/config.toml
+/vendor/
+
+# Release/package artifacts
+*.tgz
+*.tar.gz
+*.zip
+
+# Local logs and runtime state
+/logs/
+*.log
+/.mcp.json
+/.p4session_*.json
+/.p4tickets
+*.p4tickets
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
