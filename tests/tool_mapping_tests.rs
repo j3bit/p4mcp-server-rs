@@ -1,9 +1,10 @@
 use p4mcp_server_rs::{
     config::Toolset,
+    error::P4McpError,
     p4::runner::{OutputMode, P4Invocation},
     permissions::{Access, SafetyPolicy},
     tools::{
-        files::build_file_invocation,
+        files::{build_file_invocation, build_file_modify_invocation},
         params::{FileModifyAction, FileQueryAction, ModifyFilesParams, QueryFilesParams},
         server::{ServerQueryAction, build_server_invocation},
     },
@@ -212,4 +213,229 @@ fn query_file_grep_requires_pattern() {
     };
     let error = build_file_invocation(&params).unwrap_err().to_string();
     assert!(error.contains("pattern is required for grep"));
+}
+
+#[test]
+fn modify_file_add_maps_changelist() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Add,
+        file_paths: Some(vec!["src/new.rs".to_string()]),
+        changelist: "123".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(invocation.args, vec!["add", "-c", "123", "src/new.rs"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn modify_file_delete_requires_confirmation_before_command() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Delete,
+        file_paths: Some(vec!["//depot/main/old.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    assert!(build_file_modify_invocation(&params).is_err());
+}
+
+#[test]
+fn modify_file_resolve_safe_maps_to_as() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Resolve,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "safe".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(
+        invocation.args,
+        vec!["resolve", "-as", "//depot/main/file.rs"]
+    );
+}
+
+#[test]
+fn modify_file_add_requires_files() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Add,
+        file_paths: None,
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    let error = build_file_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("file_paths is required for add"));
+}
+
+#[test]
+fn modify_file_confirmed_delete_requires_files_after_confirmation() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Delete,
+        file_paths: None,
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        confirmation: Some("PROCEED".to_string()),
+    };
+
+    let error = build_file_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("file_paths is required for delete"));
+}
+
+#[test]
+fn modify_file_confirmed_revert_maps_changelist_and_file() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Revert,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "456".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        confirmation: Some("PROCEED".to_string()),
+    };
+
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(
+        invocation.args,
+        vec!["revert", "-c", "456", "//depot/main/file.rs"]
+    );
+}
+
+#[test]
+fn modify_file_move_source_target_mismatch_errors() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Move,
+        file_paths: None,
+        changelist: "default".to_string(),
+        source_paths: Some(vec!["//depot/main/source.rs".to_string()]),
+        target_paths: Some(vec![]),
+        mode: "auto".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    let error = build_file_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("source_paths and target_paths must have the same length"));
+}
+
+#[test]
+fn modify_file_sync_force_maps_flag_and_file() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Sync,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: true,
+        confirmation: None,
+    };
+
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(invocation.args, vec!["sync", "-f", "//depot/main/file.rs"]);
+}
+
+#[test]
+fn modify_file_invalid_resolve_mode_errors() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Resolve,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "bad".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    let error = build_file_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("invalid resolve mode: bad"));
+}
+
+#[test]
+fn modify_file_resolve_theirs_requires_confirmation() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Resolve,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "theirs".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    assert!(matches!(
+        build_file_modify_invocation(&params),
+        Err(P4McpError::ConfirmationRequired)
+    ));
+}
+
+#[test]
+fn modify_file_resolve_force_requires_confirmation() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Resolve,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "force".to_string(),
+        force: false,
+        confirmation: None,
+    };
+
+    assert!(matches!(
+        build_file_modify_invocation(&params),
+        Err(P4McpError::ConfirmationRequired)
+    ));
+}
+
+#[test]
+fn modify_file_resolve_theirs_confirmed_maps_to_at() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Resolve,
+        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "theirs".to_string(),
+        force: false,
+        confirmation: Some("PROCEED".to_string()),
+    };
+
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(
+        invocation.args,
+        vec!["resolve", "-at", "//depot/main/file.rs"]
+    );
 }

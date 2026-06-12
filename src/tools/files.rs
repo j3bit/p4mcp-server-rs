@@ -1,7 +1,7 @@
 use crate::{
     error::{P4McpError, Result},
     p4::runner::{OutputMode, P4Invocation},
-    tools::params::{FileQueryAction, QueryFilesParams},
+    tools::params::{FileModifyAction, FileQueryAction, ModifyFilesParams, QueryFilesParams},
 };
 
 pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> {
@@ -96,4 +96,127 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
         }
     };
     Ok(invocation)
+}
+
+pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invocation> {
+    params.confirmed()?;
+
+    let files = params.file_paths.clone().unwrap_or_default();
+    let invocation = match params.action {
+        FileModifyAction::Add => {
+            require_files(&files, "add")?;
+            with_files(vec!["add", "-c", &params.changelist], files)
+        }
+        FileModifyAction::Edit => {
+            require_files(&files, "edit")?;
+            with_files(vec!["edit", "-c", &params.changelist], files)
+        }
+        FileModifyAction::Delete => {
+            require_files(&files, "delete")?;
+            with_files(vec!["delete", "-c", &params.changelist], files)
+        }
+        FileModifyAction::Revert => {
+            require_files(&files, "revert")?;
+            with_files(vec!["revert", "-c", &params.changelist], files)
+        }
+        FileModifyAction::Reconcile => {
+            with_files(vec!["reconcile", "-c", &params.changelist], files)
+        }
+        FileModifyAction::Sync => {
+            let mut args = vec!["sync".to_string()];
+            if params.force {
+                args.push("-f".to_string());
+            }
+            args.extend(files);
+            P4Invocation {
+                args,
+                stdin: None,
+                mode: OutputMode::JsonLines,
+            }
+        }
+        FileModifyAction::Move => {
+            let sources = params.source_paths.clone().unwrap_or_default();
+            let targets = params.target_paths.clone().unwrap_or_default();
+            if sources.len() != targets.len() {
+                return Err(P4McpError::P4Command {
+                    message: "source_paths and target_paths must have the same length".to_string(),
+                });
+            }
+            if sources.len() != 1 {
+                return Err(P4McpError::P4Command {
+                    message: "move accepts exactly one source and one target per tool call"
+                        .to_string(),
+                });
+            }
+            P4Invocation {
+                args: vec![
+                    "move".into(),
+                    "-c".into(),
+                    params.changelist.clone(),
+                    sources[0].clone(),
+                    targets[0].clone(),
+                ],
+                stdin: None,
+                mode: OutputMode::JsonLines,
+            }
+        }
+        FileModifyAction::Resolve => {
+            let flag = match params.mode.as_str() {
+                "auto" => "-am",
+                "safe" => "-as",
+                "preview" => "-n",
+                "yours" => "-ay",
+                "force" => {
+                    require_proceed_confirmation(params)?;
+                    "-af"
+                }
+                "theirs" => {
+                    require_proceed_confirmation(params)?;
+                    "-at"
+                }
+                other => {
+                    return Err(P4McpError::P4Command {
+                        message: format!("invalid resolve mode: {other}"),
+                    });
+                }
+            };
+            let mut args = vec!["resolve".to_string(), flag.to_string()];
+            if params.changelist != "default" {
+                args.extend(["-c".to_string(), params.changelist.clone()]);
+            }
+            args.extend(files);
+            P4Invocation {
+                args,
+                stdin: None,
+                mode: OutputMode::JsonLines,
+            }
+        }
+    };
+    Ok(invocation)
+}
+
+fn require_files(files: &[String], action: &str) -> Result<()> {
+    if files.is_empty() {
+        return Err(P4McpError::P4Command {
+            message: format!("file_paths is required for {action}"),
+        });
+    }
+    Ok(())
+}
+
+fn require_proceed_confirmation(params: &ModifyFilesParams) -> Result<()> {
+    if params.confirmation.as_deref() == Some("PROCEED") {
+        return Ok(());
+    }
+    Err(P4McpError::ConfirmationRequired)
+}
+
+fn with_files(prefix: Vec<&str>, files: Vec<String>) -> P4Invocation {
+    let mut args: Vec<String> = prefix.into_iter().map(str::to_string).collect();
+    args.extend(files);
+    P4Invocation {
+        args,
+        stdin: None,
+        mode: OutputMode::JsonLines,
+    }
 }
