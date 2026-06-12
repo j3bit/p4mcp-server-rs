@@ -4,9 +4,14 @@ use p4mcp_server_rs::{
     p4::runner::{OutputMode, P4Invocation},
     permissions::{Access, SafetyPolicy},
     tools::{
+        changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{build_file_invocation, build_file_modify_invocation},
+        jobs::build_job_query_invocation,
         params::{FileModifyAction, FileQueryAction, ModifyFilesParams, QueryFilesParams},
         server::{ServerQueryAction, build_server_invocation},
+        shelves::build_shelf_query_invocation,
+        streams::build_stream_query_invocation,
+        workspaces::build_workspace_query_invocation,
     },
 };
 
@@ -438,4 +443,92 @@ fn modify_file_resolve_theirs_confirmed_maps_to_at() {
         invocation.args,
         vec!["resolve", "-at", "//depot/main/file.rs"]
     );
+}
+
+#[test]
+fn default_changelist_get_uses_opened_not_describe() {
+    let invocation =
+        build_changelist_query_invocation("get", Some("default"), None, None, 10).unwrap();
+    assert_eq!(invocation.args, vec!["opened", "-c", "default"]);
+}
+
+#[test]
+fn numbered_changelist_get_uses_describe() {
+    let invocation = build_changelist_query_invocation("get", Some("123"), None, None, 10).unwrap();
+    assert_eq!(invocation.args, vec!["describe", "-s", "123"]);
+}
+
+#[test]
+fn changelist_submit_uses_numbered_change() {
+    let invocation = build_changelist_modify_invocation("submit", "123", None).unwrap();
+    assert_eq!(invocation.args, vec!["submit", "-c", "123"]);
+}
+
+#[test]
+fn changelist_create_without_stdin_errors() {
+    let error = build_changelist_modify_invocation("create", "", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("stdin is required for create"));
+}
+
+#[test]
+fn changelist_update_without_stdin_errors() {
+    let error = build_changelist_modify_invocation("update", "123", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("stdin is required for update"));
+}
+
+#[test]
+fn changelist_submit_empty_id_errors() {
+    let error = build_changelist_modify_invocation("submit", " ", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changelist_id is required for submit"));
+}
+
+#[test]
+fn changelist_delete_empty_id_errors() {
+    let error = build_changelist_modify_invocation("delete", "", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changelist_id is required for delete"));
+}
+
+#[test]
+fn shelf_diff_uses_shelved_describe() {
+    let invocation = build_shelf_query_invocation("diff", Some("123"), None, 10).unwrap();
+    assert_eq!(invocation.args, vec!["describe", "-S", "-du", "123"]);
+    assert_eq!(invocation.mode, OutputMode::Text);
+}
+
+#[test]
+fn workspace_where_maps_file_argument() {
+    let invocation =
+        build_workspace_query_invocation("where", None, Some("//depot/main/file.rs"), 10).unwrap();
+    assert_eq!(invocation.args, vec!["where", "//depot/main/file.rs"]);
+}
+
+#[test]
+fn job_list_for_changelist_uses_fixes() {
+    let invocation = build_job_query_invocation("list_jobs", Some("123"), None, 10).unwrap();
+    assert_eq!(invocation.args, vec!["fixes", "-c", "123"]);
+}
+
+#[test]
+fn stream_list_with_owner_uses_owner_filter() {
+    let invocation = build_stream_query_invocation("list", None, Some("alice"), 25).unwrap();
+    assert_eq!(
+        invocation.args,
+        vec!["streams", "-m", "25", "-F", "Owner=alice"]
+    );
+}
+
+#[test]
+fn stream_integration_status_uses_istat() {
+    let invocation =
+        build_stream_query_invocation("integration_status", Some("//streams/dev"), None, 10)
+            .unwrap();
+    assert_eq!(invocation.args, vec!["istat", "-s", "//streams/dev"]);
 }
