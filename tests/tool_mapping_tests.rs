@@ -459,6 +459,14 @@ fn numbered_changelist_get_uses_describe() {
 }
 
 #[test]
+fn changelist_get_blank_id_errors() {
+    let error = build_changelist_query_invocation("get", Some(" "), None, None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changelist_id is required"));
+}
+
+#[test]
 fn changelist_submit_uses_numbered_change() {
     let invocation = build_changelist_modify_invocation("submit", "123", None).unwrap();
     assert_eq!(invocation.args, vec!["submit", "-c", "123"]);
@@ -504,6 +512,14 @@ fn shelf_diff_uses_shelved_describe() {
 }
 
 #[test]
+fn shelf_diff_blank_changelist_errors() {
+    let error = build_shelf_query_invocation("diff", Some(" "), None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changelist_id is required"));
+}
+
+#[test]
 fn workspace_where_maps_file_argument() {
     let invocation =
         build_workspace_query_invocation("where", None, Some("//depot/main/file.rs"), 10).unwrap();
@@ -511,9 +527,25 @@ fn workspace_where_maps_file_argument() {
 }
 
 #[test]
+fn workspace_get_blank_name_errors() {
+    let error = build_workspace_query_invocation("get", Some(" "), None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("workspace_name is required"));
+}
+
+#[test]
 fn job_list_for_changelist_uses_fixes() {
     let invocation = build_job_query_invocation("list_jobs", Some("123"), None, 10).unwrap();
     assert_eq!(invocation.args, vec!["fixes", "-c", "123"]);
+}
+
+#[test]
+fn job_get_blank_id_errors() {
+    let error = build_job_query_invocation("get_job", None, Some(" "), 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("job_id is required"));
 }
 
 #[test]
@@ -531,4 +563,12 @@ fn stream_integration_status_uses_istat() {
         build_stream_query_invocation("integration_status", Some("//streams/dev"), None, 10)
             .unwrap();
     assert_eq!(invocation.args, vec!["istat", "-s", "//streams/dev"]);
+}
+
+#[test]
+fn stream_get_blank_name_errors() {
+    let error = build_stream_query_invocation("get", Some(" "), None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("stream is required"));
 }

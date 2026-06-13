@@ -10,7 +10,8 @@ use p4mcp_server_rs::{
     p4::runner::{P4CommandOutput, P4Env, P4Executor, P4Invocation},
     server::P4McpServer,
     tools::{
-        params::{FileQueryAction, QueryFilesParams},
+        params::{CommonModifyParams, CommonQueryParams, FileQueryAction, QueryFilesParams},
+        reviews::{ReviewAction, ReviewRequest},
         server::ServerQueryAction,
     },
 };
@@ -32,6 +33,13 @@ fn test_config() -> AppConfig {
     }
 }
 
+fn write_config() -> AppConfig {
+    AppConfig {
+        readonly: false,
+        ..test_config()
+    }
+}
+
 #[test]
 fn server_constructs_with_config() {
     let server = P4McpServer::new(test_config());
@@ -42,7 +50,27 @@ fn server_constructs_with_config() {
 fn initial_tool_names_are_registered() {
     let names = P4McpServer::tool_names();
 
-    assert_eq!(names, ["modify_files", "query_files", "query_server"]);
+    assert_eq!(
+        names,
+        [
+            "modify_changelists",
+            "modify_files",
+            "modify_jobs",
+            "modify_reviews",
+            "modify_shelves",
+            "modify_streams",
+            "modify_workspaces",
+            "query_changelists",
+            "query_files",
+            "query_jobs",
+            "query_reviews",
+            "query_server",
+            "query_shelves",
+            "query_streams",
+            "query_workspaces",
+        ]
+    );
+    assert_eq!(names.len(), 15);
 }
 
 #[tokio::test]
@@ -63,6 +91,157 @@ async fn query_server_calls_injected_executor() {
     assert_eq!(response.0.message, json!([{"serverRoot": "/p4"}]));
     assert_eq!(executor.invocations().len(), 1);
     assert_eq!(executor.invocations()[0].args, ["info"]);
+}
+
+#[tokio::test]
+async fn query_changelists_calls_injected_executor() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: vec![json!({"change": "123"})],
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_changelists(Parameters(CommonQueryParams {
+            action: "list".to_string(),
+            changelist_id: None,
+            workspace_name: Some("ws-main".to_string()),
+            file_path: None,
+            user: None,
+            status: Some("pending".to_string()),
+            job_id: None,
+            stream: None,
+            owner: None,
+            max_results: 7,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "list");
+    assert_eq!(response.0.message, json!([{"change": "123"}]));
+    assert_eq!(executor.invocations().len(), 1);
+    assert_eq!(
+        executor.invocations()[0].args,
+        ["changes", "-m", "7", "-s", "pending", "-c", "ws-main"]
+    );
+}
+
+#[tokio::test]
+async fn modify_workspaces_rejects_delete_without_workspace_name() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(write_config(), executor.clone());
+
+    let err = match server
+        .modify_workspaces(Parameters(CommonModifyParams {
+            action: "delete".to_string(),
+            changelist_id: None,
+            workspace_name: None,
+            stream: None,
+            description: None,
+            files: Vec::new(),
+            form: None,
+            confirmation: Some("PROCEED".to_string()),
+        }))
+        .await
+    {
+        Ok(_) => panic!("modify_workspaces should reject delete without a workspace name"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(
+        err.message
+            .contains("workspace_name is required for delete")
+    );
+    assert!(executor.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn modify_changelists_update_requires_changelist_id() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(write_config(), executor.clone());
+
+    let err = match server
+        .modify_changelists(Parameters(CommonModifyParams {
+            action: "update".to_string(),
+            changelist_id: None,
+            workspace_name: None,
+            stream: None,
+            description: Some("update description".to_string()),
+            files: Vec::new(),
+            form: None,
+            confirmation: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("modify_changelists should reject update without changelist_id"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("changelist_id is required for update"));
+    assert!(executor.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn modify_changelists_update_form_uses_requested_changelist() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(write_config(), executor.clone());
+
+    let response = server
+        .modify_changelists(Parameters(CommonModifyParams {
+            action: "update".to_string(),
+            changelist_id: Some("123".to_string()),
+            workspace_name: None,
+            stream: None,
+            description: Some("update description".to_string()),
+            files: vec!["//depot/main/file.rs".to_string()],
+            form: None,
+            confirmation: None,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].args, ["change", "-i"]);
+    assert!(
+        invocations[0]
+            .stdin
+            .as_deref()
+            .is_some_and(|stdin| stdin.contains("Change: 123"))
+    );
+}
+
+#[tokio::test]
+async fn query_reviews_returns_dry_run_request_metadata() {
+    let server = P4McpServer::new(test_config());
+
+    let response = server
+        .query_reviews(Parameters(ReviewRequest {
+            action: ReviewAction::List,
+            review_id: None,
+            max_results: 5,
+            body: json!({}),
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "dry_run");
+    assert_eq!(response.0.action, "query_reviews");
+    assert_eq!(response.0.message["method"], "GET");
+    assert_eq!(response.0.message["path"], "/reviews");
 }
 
 #[tokio::test]

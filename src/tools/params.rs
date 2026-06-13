@@ -110,6 +110,48 @@ impl ModifyFilesParams {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct CommonQueryParams {
+    pub action: String,
+    #[serde(default)]
+    pub changelist_id: Option<String>,
+    #[serde(default)]
+    pub workspace_name: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default = "default_max_results")]
+    pub max_results: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct CommonModifyParams {
+    pub action: String,
+    #[serde(default)]
+    pub changelist_id: Option<String>,
+    #[serde(default)]
+    pub workspace_name: Option<String>,
+    #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub form: Option<String>,
+    #[serde(default)]
+    pub confirmation: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }

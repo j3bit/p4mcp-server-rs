@@ -46,9 +46,10 @@ pub fn build_stream_query_invocation(
 }
 
 fn required(value: Option<&str>, name: &str) -> Result<String> {
-    value
-        .map(str::to_string)
-        .ok_or_else(|| P4McpError::InvalidInput {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => Err(P4McpError::InvalidInput {
             message: format!("{name} is required"),
-        })
+        }),
+    }
 }

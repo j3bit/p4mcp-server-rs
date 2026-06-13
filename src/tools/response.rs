@@ -18,4 +18,12 @@ impl ToolResponse {
             message,
         }
     }
+
+    pub fn dry_run(action: impl Into<String>, message: Value) -> Self {
+        Self {
+            status: "dry_run".to_string(),
+            action: action.into(),
+            message,
+        }
+    }
 }
