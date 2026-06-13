@@ -3,6 +3,7 @@ pub mod files;
 pub mod jobs;
 pub mod params;
 pub mod response;
+pub mod reviews;
 pub mod server;
 pub mod shelves;
 pub mod streams;
