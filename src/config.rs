@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, fmt, path::PathBuf, str::FromStr};
+use std::{collections::BTreeSet, env, fmt, net::IpAddr, path::PathBuf, str::FromStr};
 
 use clap::{Parser, ValueEnum};
 
@@ -87,6 +87,7 @@ pub struct AppConfig {
     pub allow_usage: bool,
     pub toolsets: BTreeSet<Toolset>,
     pub transport: TransportMode,
+    pub host: IpAddr,
     pub port: u16,
     pub p4_bin: PathBuf,
     pub log_dir: Option<PathBuf>,
@@ -110,6 +111,9 @@ pub struct Cli {
 
     #[arg(long, value_enum, default_value_t = TransportMode::Stdio)]
     pub transport: TransportMode,
+
+    #[arg(long, env = "P4MCP_HOST", default_value = "127.0.0.1")]
+    pub host: IpAddr,
 
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
@@ -165,6 +169,7 @@ impl Cli {
             allow_usage: self.allow_usage,
             toolsets,
             transport: self.transport,
+            host: self.host,
             port: self.port,
             p4_bin: self.p4_bin,
             log_dir: self.log_dir,

@@ -1,7 +1,8 @@
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct ToolResponse {
     pub status: String,

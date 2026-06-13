@@ -32,9 +32,12 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
         },
         FileQueryAction::Diff => {
             if params.diff2 {
-                let file2 = params.file2.clone().ok_or_else(|| P4McpError::P4Command {
-                    message: "file2 is required for diff2".to_string(),
-                })?;
+                let file2 = params
+                    .file2
+                    .clone()
+                    .ok_or_else(|| P4McpError::InvalidInput {
+                        message: "file2 is required for diff2".to_string(),
+                    })?;
                 P4Invocation {
                     args: vec!["diff2".into(), params.file_path.clone(), file2],
                     stdin: None,
@@ -42,7 +45,7 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
                 }
             } else {
                 if params.file2.is_some() {
-                    return Err(P4McpError::P4Command {
+                    return Err(P4McpError::InvalidInput {
                         message: "file2 cannot be used for workspace diff".to_string(),
                     });
                 }
@@ -62,7 +65,7 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
             let pattern = params
                 .pattern
                 .clone()
-                .ok_or_else(|| P4McpError::P4Command {
+                .ok_or_else(|| P4McpError::InvalidInput {
                     message: "pattern is required for search".to_string(),
                 })?;
             P4Invocation {
@@ -80,7 +83,7 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
             let pattern = params
                 .pattern
                 .clone()
-                .ok_or_else(|| P4McpError::P4Command {
+                .ok_or_else(|| P4McpError::InvalidInput {
                     message: "pattern is required for grep".to_string(),
                 })?;
             let mut args = vec!["grep".into(), "-n".into()];
@@ -138,12 +141,12 @@ pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invo
             let sources = params.source_paths.clone().unwrap_or_default();
             let targets = params.target_paths.clone().unwrap_or_default();
             if sources.len() != targets.len() {
-                return Err(P4McpError::P4Command {
+                return Err(P4McpError::InvalidInput {
                     message: "source_paths and target_paths must have the same length".to_string(),
                 });
             }
             if sources.len() != 1 {
-                return Err(P4McpError::P4Command {
+                return Err(P4McpError::InvalidInput {
                     message: "move accepts exactly one source and one target per tool call"
                         .to_string(),
                 });
@@ -175,7 +178,7 @@ pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invo
                     "-at"
                 }
                 other => {
-                    return Err(P4McpError::P4Command {
+                    return Err(P4McpError::InvalidInput {
                         message: format!("invalid resolve mode: {other}"),
                     });
                 }
@@ -197,7 +200,7 @@ pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invo
 
 fn require_files(files: &[String], action: &str) -> Result<()> {
     if files.is_empty() {
-        return Err(P4McpError::P4Command {
+        return Err(P4McpError::InvalidInput {
             message: format!("file_paths is required for {action}"),
         });
     }

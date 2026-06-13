@@ -66,7 +66,7 @@ impl ReviewRequest {
         }
 
         let id = || {
-            self.review_id.ok_or_else(|| P4McpError::P4Command {
+            self.review_id.ok_or_else(|| P4McpError::InvalidInput {
                 message: "review_id is required".to_string(),
             })
         };

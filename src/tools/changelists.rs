@@ -80,7 +80,7 @@ pub fn build_changelist_modify_invocation(
 fn required_stdin(stdin: Option<String>, action: &str) -> Result<String> {
     match stdin {
         Some(value) if !value.trim().is_empty() => Ok(value),
-        _ => Err(P4McpError::P4Command {
+        _ => Err(P4McpError::InvalidInput {
             message: format!("stdin is required for {action}"),
         }),
     }
@@ -88,7 +88,7 @@ fn required_stdin(stdin: Option<String>, action: &str) -> Result<String> {
 
 fn required_value(value: &str, name: &str, action: &str) -> Result<String> {
     if value.trim().is_empty() {
-        Err(P4McpError::P4Command {
+        Err(P4McpError::InvalidInput {
             message: format!("{name} is required for {action}"),
         })
     } else {
@@ -99,13 +99,13 @@ fn required_value(value: &str, name: &str, action: &str) -> Result<String> {
 fn required(value: Option<&str>, name: &str) -> Result<String> {
     value
         .map(str::to_string)
-        .ok_or_else(|| P4McpError::P4Command {
+        .ok_or_else(|| P4McpError::InvalidInput {
             message: format!("{name} is required"),
         })
 }
 
 fn unknown<T>(action: &str) -> Result<T> {
-    Err(P4McpError::P4Command {
+    Err(P4McpError::InvalidInput {
         message: format!("unknown action: {action}"),
     })
 }

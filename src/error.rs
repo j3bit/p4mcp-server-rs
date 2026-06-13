@@ -1,5 +1,8 @@
 #[derive(Debug, thiserror::Error)]
 pub enum P4McpError {
+    #[error("{message}")]
+    InvalidInput { message: String },
+
     #[error("p4 command failed: {message}")]
     P4Command { message: String },
 

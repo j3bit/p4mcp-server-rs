@@ -18,7 +18,7 @@ pub fn build_job_query_invocation(
         "get_job" => vec!["job".into(), "-o".into(), required(job_id, "job_id")?],
         "list" => vec!["jobs".into(), "-m".into(), max_results.to_string()],
         other => {
-            return Err(P4McpError::P4Command {
+            return Err(P4McpError::InvalidInput {
                 message: format!("unknown action: {other}"),
             });
         }
@@ -33,7 +33,7 @@ pub fn build_job_query_invocation(
 fn required(value: Option<&str>, name: &str) -> Result<String> {
     value
         .map(str::to_string)
-        .ok_or_else(|| P4McpError::P4Command {
+        .ok_or_else(|| P4McpError::InvalidInput {
             message: format!("{name} is required"),
         })
 }

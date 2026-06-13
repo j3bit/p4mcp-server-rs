@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::OsString,
+    net::{IpAddr, Ipv4Addr},
     sync::{Mutex, MutexGuard},
 };
 
@@ -11,6 +12,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
     p4_bin: Option<OsString>,
+    host: Option<OsString>,
     log_dir: Option<OsString>,
     ca_bundle: Option<OsString>,
     ssl_verify: Option<OsString>,
@@ -22,12 +24,14 @@ impl EnvGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let p4_bin = env::var_os("P4MCP_P4_BIN");
+        let host = env::var_os("P4MCP_HOST");
         let log_dir = env::var_os("P4MCP_LOG_DIR");
         let ca_bundle = env::var_os("P4MCP_CA_BUNDLE");
         let ssl_verify = env::var_os("P4MCP_SSL_VERIFY");
 
         unsafe {
             env::remove_var("P4MCP_P4_BIN");
+            env::remove_var("P4MCP_HOST");
             env::remove_var("P4MCP_LOG_DIR");
             env::remove_var("P4MCP_CA_BUNDLE");
             env::remove_var("P4MCP_SSL_VERIFY");
@@ -36,6 +40,7 @@ impl EnvGuard {
         Self {
             _lock: lock,
             p4_bin,
+            host,
             log_dir,
             ca_bundle,
             ssl_verify,
@@ -49,6 +54,11 @@ impl Drop for EnvGuard {
             match &self.p4_bin {
                 Some(value) => env::set_var("P4MCP_P4_BIN", value),
                 None => env::remove_var("P4MCP_P4_BIN"),
+            }
+
+            match &self.host {
+                Some(value) => env::set_var("P4MCP_HOST", value),
+                None => env::remove_var("P4MCP_HOST"),
             }
 
             match &self.log_dir {
@@ -77,6 +87,7 @@ fn defaults_match_upstream_toolsets() {
 
     assert!(!config.readonly);
     assert_eq!(config.transport, TransportMode::Stdio);
+    assert_eq!(config.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
     assert_eq!(config.port, 8000);
     assert_eq!(config.toolsets, Toolset::default_set());
 }
@@ -91,6 +102,8 @@ fn parses_explicit_toolsets_and_readonly() {
         "files,changelists",
         "--transport",
         "http",
+        "--host",
+        "0.0.0.0",
         "--port",
         "9000",
     ])
@@ -100,6 +113,7 @@ fn parses_explicit_toolsets_and_readonly() {
 
     assert!(config.readonly);
     assert_eq!(config.transport, TransportMode::Http);
+    assert_eq!(config.host, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     assert_eq!(config.port, 9000);
     assert_eq!(config.toolsets.len(), 2);
     assert!(config.toolsets.contains(&Toolset::Files));

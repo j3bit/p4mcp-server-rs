@@ -52,13 +52,13 @@ pub fn build_shelf_query_invocation(
 fn required(value: Option<&str>, name: &str) -> Result<String> {
     value
         .map(str::to_string)
-        .ok_or_else(|| P4McpError::P4Command {
+        .ok_or_else(|| P4McpError::InvalidInput {
             message: format!("{name} is required"),
         })
 }
 
 fn unknown<T>(action: &str) -> Result<T> {
-    Err(P4McpError::P4Command {
+    Err(P4McpError::InvalidInput {
         message: format!("unknown action: {action}"),
     })
 }
