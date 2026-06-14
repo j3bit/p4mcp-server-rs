@@ -17,6 +17,7 @@ use p4mcp_server_rs::{
 };
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::Tool;
 use serde_json::json;
 
 fn test_config() -> AppConfig {
@@ -64,6 +65,59 @@ fn initial_tool_names_are_registered() {
         ]
     );
     assert_eq!(names.len(), 15);
+}
+
+#[test]
+fn tool_metadata_marks_query_tools_read_only() {
+    let tools = P4McpServer::tools();
+
+    for tool in tools.iter().filter(|tool| tool.name.starts_with("query_")) {
+        assert_eq!(
+            annotations(tool).read_only_hint,
+            Some(true),
+            "{} should be marked read-only",
+            tool.name
+        );
+    }
+}
+
+#[test]
+fn tool_metadata_marks_modify_tools_writable() {
+    let tools = P4McpServer::tools();
+
+    for tool in tools.iter().filter(|tool| tool.name.starts_with("modify_")) {
+        assert_eq!(
+            annotations(tool).read_only_hint,
+            Some(false),
+            "{} should be marked writable",
+            tool.name
+        );
+    }
+}
+
+#[test]
+fn tool_metadata_marks_destructive_modify_tools() {
+    let tools = P4McpServer::tools();
+    let destructive_tools = [
+        "modify_changelists",
+        "modify_files",
+        "modify_reviews",
+        "modify_shelves",
+        "modify_streams",
+        "modify_workspaces",
+    ];
+
+    for tool_name in destructive_tools {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} should be registered"));
+        assert_eq!(
+            annotations(tool).destructive_hint,
+            Some(true),
+            "{tool_name} should be marked destructive"
+        );
+    }
 }
 
 #[tokio::test]
@@ -219,6 +273,12 @@ impl FakeExecutor {
 enum FakeResult {
     Success(P4CommandOutput),
     Failure(P4McpError),
+}
+
+fn annotations(tool: &Tool) -> &rmcp::model::ToolAnnotations {
+    tool.annotations
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} should have annotations", tool.name))
 }
 
 #[async_trait]

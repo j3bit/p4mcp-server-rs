@@ -5,6 +5,7 @@ use clap::Parser;
 use rmcp::{
     ErrorData, Json, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
+    model::Tool,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -96,11 +97,14 @@ impl P4McpServer {
     }
 
     pub fn tool_names() -> Vec<String> {
-        Self::tool_router()
-            .list_all()
+        Self::tools()
             .into_iter()
             .map(|tool| tool.name.into_owned())
             .collect()
+    }
+
+    pub fn tools() -> Vec<Tool> {
+        Self::tool_router().list_all()
     }
 
     async fn run_p4(&self, invocation: P4Invocation) -> McpResult<P4CommandOutput> {
@@ -527,7 +531,10 @@ type McpResult<T> = std::result::Result<T, ErrorData>;
 
 #[tool_router]
 impl P4McpServer {
-    #[tool(description = "Query Perforce server metadata")]
+    #[tool(
+        description = "Query Perforce server metadata",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_server(
         &self,
         Parameters(action): Parameters<ServerQueryAction>,
@@ -540,7 +547,10 @@ impl P4McpServer {
         )))
     }
 
-    #[tool(description = "Query Perforce files")]
+    #[tool(
+        description = "Query Perforce files",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_files(
         &self,
         Parameters(params): Parameters<QueryFilesParams>,
@@ -553,7 +563,10 @@ impl P4McpServer {
         self.call_p4_tool(action, invocation).await
     }
 
-    #[tool(description = "Modify Perforce files")]
+    #[tool(
+        description = "Modify Perforce files",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     pub async fn modify_files(
         &self,
         peer: Peer<RoleServer>,
@@ -563,7 +576,10 @@ impl P4McpServer {
             .await
     }
 
-    #[tool(description = "Get changelist information or list changelists")]
+    #[tool(
+        description = "Get changelist information or list changelists",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_changelists(
         &self,
         Parameters(params): Parameters<CommonQueryParams>,
@@ -582,7 +598,10 @@ impl P4McpServer {
         self.call_p4_tool(&params.action, invocation).await
     }
 
-    #[tool(description = "Create, update, submit, or delete changelists")]
+    #[tool(
+        description = "Create, update, submit, or delete changelists",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     pub async fn modify_changelists(
         &self,
         peer: Peer<RoleServer>,
@@ -592,7 +611,10 @@ impl P4McpServer {
             .await
     }
 
-    #[tool(description = "List shelves, show shelf diff, or list shelf files")]
+    #[tool(
+        description = "List shelves, show shelf diff, or list shelf files",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_shelves(
         &self,
         Parameters(params): Parameters<CommonQueryParams>,
@@ -610,7 +632,10 @@ impl P4McpServer {
         self.call_p4_tool(&params.action, invocation).await
     }
 
-    #[tool(description = "Shelve, unshelve, or delete shelved files")]
+    #[tool(
+        description = "Shelve, unshelve, or delete shelved files",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     pub async fn modify_shelves(
         &self,
         peer: Peer<RoleServer>,
@@ -620,7 +645,10 @@ impl P4McpServer {
             .await
     }
 
-    #[tool(description = "List, get, map, or inspect workspaces")]
+    #[tool(
+        description = "List, get, map, or inspect workspaces",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_workspaces(
         &self,
         Parameters(params): Parameters<CommonQueryParams>,
@@ -638,7 +666,10 @@ impl P4McpServer {
         self.call_p4_tool(&params.action, invocation).await
     }
 
-    #[tool(description = "Create, update, or delete workspaces using p4 client forms")]
+    #[tool(
+        description = "Create, update, or delete workspaces using p4 client forms",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     pub async fn modify_workspaces(
         &self,
         peer: Peer<RoleServer>,
@@ -648,7 +679,10 @@ impl P4McpServer {
             .await
     }
 
-    #[tool(description = "List or get jobs and fixes")]
+    #[tool(
+        description = "List or get jobs and fixes",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_jobs(
         &self,
         Parameters(params): Parameters<CommonQueryParams>,
@@ -666,7 +700,10 @@ impl P4McpServer {
         self.call_p4_tool(&params.action, invocation).await
     }
 
-    #[tool(description = "Attach or detach jobs from changelists")]
+    #[tool(
+        description = "Attach or detach jobs from changelists",
+        annotations(read_only_hint = false)
+    )]
     pub async fn modify_jobs(
         &self,
         peer: Peer<RoleServer>,
@@ -677,7 +714,8 @@ impl P4McpServer {
     }
 
     #[tool(
-        description = "List streams, get stream specs, graph streams, and inspect stream integration status"
+        description = "List streams, get stream specs, graph streams, and inspect stream integration status",
+        annotations(read_only_hint = true)
     )]
     pub async fn query_streams(
         &self,
@@ -696,7 +734,10 @@ impl P4McpServer {
         self.call_p4_tool(&params.action, invocation).await
     }
 
-    #[tool(description = "Create, update, or delete stream specs")]
+    #[tool(
+        description = "Create, update, or delete stream specs",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     pub async fn modify_streams(
         &self,
         peer: Peer<RoleServer>,
@@ -706,7 +747,10 @@ impl P4McpServer {
             .await
     }
 
-    #[tool(description = "Query P4 Code Review / Swarm reviews")]
+    #[tool(
+        description = "Query P4 Code Review / Swarm reviews",
+        annotations(read_only_hint = true)
+    )]
     pub async fn query_reviews(
         &self,
         Parameters(params): Parameters<ReviewRequest>,
@@ -721,7 +765,10 @@ impl P4McpServer {
         )))
     }
 
-    #[tool(description = "Modify P4 Code Review / Swarm reviews")]
+    #[tool(
+        description = "Modify P4 Code Review / Swarm reviews",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
     pub async fn modify_reviews(
         &self,
         peer: Peer<RoleServer>,
