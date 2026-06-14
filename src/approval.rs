@@ -4,15 +4,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{
+    error::{P4McpError, Result},
+    tools::response::ToolResponse,
+};
 use async_trait::async_trait;
 use rmcp::{Peer, RoleServer};
+use schemars::JsonSchema;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const APPROVAL_TOKEN_TTL_SECONDS: u64 = 300;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ApprovalPreview {
     pub summary: String,
     pub tool: String,
@@ -22,36 +27,28 @@ pub struct ApprovalPreview {
     pub workspace: Option<String>,
     pub stream: Option<String>,
     pub review: Option<String>,
-    pub command: Vec<String>,
-    pub request: Value,
+    pub command: Option<Vec<String>>,
+    pub request: Option<HttpPreview>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct HttpPreview {
     pub method: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct ApprovalRequest {
+    pub tool: String,
+    pub action: String,
+    pub params: Value,
     pub preview: ApprovalPreview,
-    pub http: Option<HttpPreview>,
-    pub approval_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalDecision {
     Approved,
-    ApprovalRequired {
-        preview: ApprovalPreview,
-        digest: String,
-        approval_token: String,
-        ttl_seconds: u64,
-        instruction: String,
-    },
-    Rejected {
-        reason: String,
-    },
+    Response(ToolResponse),
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +59,12 @@ pub enum ApprovalChannel {
 
 #[async_trait]
 pub trait WriteApprovalGate: Send + Sync {
-    async fn check(&self, request: ApprovalRequest, channel: ApprovalChannel) -> ApprovalDecision;
+    async fn approve(
+        &self,
+        channel: ApprovalChannel,
+        request: ApprovalRequest,
+        approval_token: Option<&str>,
+    ) -> Result<ApprovalDecision>;
 }
 
 pub struct DefaultWriteApprovalGate {
@@ -94,33 +96,39 @@ impl DefaultWriteApprovalGate {
 
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
-        hex_encode(&hasher.finalize())
+        format!("sha256:{}", hex_encode(&hasher.finalize()))
     }
 
-    fn check_fallback(&self, request: ApprovalRequest) -> ApprovalDecision {
+    fn approve_fallback(
+        &self,
+        request: ApprovalRequest,
+        approval_token: Option<&str>,
+    ) -> Result<ApprovalDecision> {
         let digest = self.digest(&request);
 
-        if let Some(token) = request.approval_token.as_deref() {
-            return self.consume_token(token, &digest);
+        if let Some(token) = approval_token {
+            return self.consume_token(token, &digest, &request.action);
         }
 
-        self.require_approval(request.preview, digest)
+        self.require_approval(request.action, request.preview, digest)
     }
 
-    fn require_approval(&self, preview: ApprovalPreview, digest: String) -> ApprovalDecision {
-        let approval_token = match generate_token() {
-            Ok(token) => token,
-            Err(error) => {
-                return ApprovalDecision::Rejected {
-                    reason: format!("failed to generate approval token: {error}"),
-                };
-            }
-        };
+    fn require_approval(
+        &self,
+        action: String,
+        preview: ApprovalPreview,
+        digest: String,
+    ) -> Result<ApprovalDecision> {
+        let approval_token = generate_token().map_err(|error| P4McpError::InvalidInput {
+            message: format!("failed to generate approval token: {error}"),
+        })?;
 
         let expires_at = Instant::now() + self.ttl;
         self.tokens
             .lock()
-            .expect("approval token store mutex poisoned")
+            .map_err(|_| P4McpError::InvalidInput {
+                message: "approval token store mutex poisoned".to_string(),
+            })?
             .insert(
                 approval_token.clone(),
                 ApprovalTokenRecord {
@@ -129,59 +137,78 @@ impl DefaultWriteApprovalGate {
                 },
             );
 
-        ApprovalDecision::ApprovalRequired {
-            preview,
-            digest: digest.clone(),
-            approval_token: approval_token.clone(),
-            ttl_seconds: self.ttl.as_secs(),
-            instruction: format!(
-                "Approval required. Re-run the same request with approval_token \"{approval_token}\" within {} seconds to approve digest {digest}.",
-                self.ttl.as_secs()
-            ),
-        }
+        let ttl_seconds = self.ttl.as_secs();
+        let instruction = format!(
+            "Approval required. Re-run the same request with approval_token \"{approval_token}\" within {ttl_seconds} seconds to approve digest {digest}.",
+        );
+
+        Ok(ApprovalDecision::Response(ToolResponse::approval_required(
+            action,
+            json!({
+                "preview": preview,
+                "digest": digest,
+                "approval_token": approval_token,
+                "ttl_seconds": ttl_seconds,
+                "instruction": instruction,
+            }),
+        )))
     }
 
-    fn consume_token(&self, token: &str, digest: &str) -> ApprovalDecision {
+    fn consume_token(&self, token: &str, digest: &str, action: &str) -> Result<ApprovalDecision> {
         let record = self
             .tokens
             .lock()
-            .expect("approval token store mutex poisoned")
+            .map_err(|_| P4McpError::InvalidInput {
+                message: "approval token store mutex poisoned".to_string(),
+            })?
             .remove(token);
 
         let Some(record) = record else {
-            return ApprovalDecision::Rejected {
-                reason: "approval token is unknown or already used".to_string(),
-            };
+            return Ok(cancelled(
+                action,
+                "approval token is unknown or already used",
+            ));
         };
 
         if Instant::now() >= record.expires_at {
-            return ApprovalDecision::Rejected {
-                reason: "approval token expired".to_string(),
-            };
+            return Ok(cancelled(action, "approval token expired"));
         }
 
         if record.digest != digest {
-            return ApprovalDecision::Rejected {
-                reason: "approval token does not match request digest".to_string(),
-            };
+            return Ok(cancelled(
+                action,
+                "approval token does not match request digest",
+            ));
         }
 
-        ApprovalDecision::Approved
+        Ok(ApprovalDecision::Approved)
     }
 }
 
 #[async_trait]
 impl WriteApprovalGate for DefaultWriteApprovalGate {
-    async fn check(&self, request: ApprovalRequest, channel: ApprovalChannel) -> ApprovalDecision {
+    async fn approve(
+        &self,
+        channel: ApprovalChannel,
+        request: ApprovalRequest,
+        approval_token: Option<&str>,
+    ) -> Result<ApprovalDecision> {
         match channel {
             ApprovalChannel::Elicitation(_) | ApprovalChannel::FallbackOnly => {
-                self.check_fallback(request)
+                self.approve_fallback(request, approval_token)
             }
         }
     }
 }
 
-fn generate_token() -> Result<String, getrandom::Error> {
+fn cancelled(action: &str, reason: &str) -> ApprovalDecision {
+    ApprovalDecision::Response(ToolResponse::cancelled(
+        action.to_string(),
+        json!({ "reason": reason }),
+    ))
+}
+
+fn generate_token() -> std::result::Result<String, getrandom::Error> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes)?;
     Ok(hex_encode(&bytes))
@@ -254,12 +281,20 @@ fn is_redacted_field(field: &str) -> bool {
 mod tests {
     use std::time::Duration;
 
+    use crate::tools::response::ToolResponse;
     use serde_json::json;
 
     use super::*;
 
     fn sample_request() -> ApprovalRequest {
         ApprovalRequest {
+            tool: "modify_files".to_string(),
+            action: "sync".to_string(),
+            params: json!({
+                "approval_token": null,
+                "files": ["//depot/main/a.txt", "//depot/main/b.txt"],
+                "force": true
+            }),
             preview: ApprovalPreview {
                 summary: "sync two files".to_string(),
                 tool: "modify_files".to_string(),
@@ -272,22 +307,17 @@ mod tests {
                 workspace: Some("ws-main".to_string()),
                 stream: Some("//stream/main".to_string()),
                 review: Some("review-7".to_string()),
-                command: vec![
+                command: Some(vec![
                     "p4".to_string(),
                     "sync".to_string(),
                     "//depot/main/a.txt".to_string(),
                     "//depot/main/b.txt".to_string(),
-                ],
-                request: json!({
-                    "files": ["//depot/main/a.txt", "//depot/main/b.txt"],
-                    "force": true
+                ]),
+                request: Some(HttpPreview {
+                    method: "POST".to_string(),
+                    path: "/mcp/tools/modify_files".to_string(),
                 }),
             },
-            http: Some(HttpPreview {
-                method: "POST".to_string(),
-                path: "/mcp/tools/modify_files".to_string(),
-            }),
-            approval_token: None,
         }
     }
 
@@ -295,37 +325,66 @@ mod tests {
         gate: &DefaultWriteApprovalGate,
         request: ApprovalRequest,
     ) -> (String, String) {
-        match gate.check(request, ApprovalChannel::FallbackOnly).await {
-            ApprovalDecision::ApprovalRequired {
-                digest,
-                approval_token,
-                ..
-            } => (digest, approval_token),
+        match gate
+            .approve(ApprovalChannel::FallbackOnly, request, None)
+            .await
+            .expect("approval check succeeds")
+        {
+            ApprovalDecision::Response(response) => {
+                assert_eq!(response.status, "approval_required");
+                approval_fields(&response)
+            }
             other => panic!("expected approval required, got {other:?}"),
         }
     }
 
+    fn approval_fields(response: &ToolResponse) -> (String, String) {
+        let digest = response.message["digest"]
+            .as_str()
+            .expect("approval response includes digest")
+            .to_string();
+        let approval_token = response.message["approval_token"]
+            .as_str()
+            .expect("approval response includes token")
+            .to_string();
+        (digest, approval_token)
+    }
+
+    fn assert_json_schema<T: schemars::JsonSchema>() {}
+
     #[tokio::test]
     async fn fallback_without_token_returns_approval_required() {
+        assert_json_schema::<ApprovalPreview>();
+        assert_json_schema::<HttpPreview>();
+
         let gate = DefaultWriteApprovalGate::new();
         let request = sample_request();
 
         let decision = gate
-            .check(request.clone(), ApprovalChannel::FallbackOnly)
-            .await;
+            .approve(ApprovalChannel::FallbackOnly, request.clone(), None)
+            .await
+            .expect("approval check succeeds");
 
         match decision {
-            ApprovalDecision::ApprovalRequired {
-                preview,
-                digest,
-                approval_token,
-                ttl_seconds,
-                instruction,
-            } => {
-                assert_eq!(preview, request.preview);
-                assert_eq!(ttl_seconds, APPROVAL_TOKEN_TTL_SECONDS);
+            ApprovalDecision::Response(response) => {
+                assert_eq!(response.status, "approval_required");
+                assert_eq!(response.action, request.action);
+                assert_eq!(
+                    response.message["preview"],
+                    serde_json::to_value(&request.preview).expect("preview serializes")
+                );
+                assert_eq!(
+                    response.message["ttl_seconds"],
+                    json!(APPROVAL_TOKEN_TTL_SECONDS)
+                );
+                let (digest, approval_token) = approval_fields(&response);
                 assert!(!digest.is_empty());
+                assert!(digest.starts_with("sha256:"));
+                assert_eq!(digest.len(), "sha256:".len() + 64);
                 assert!(!approval_token.is_empty());
+                let instruction = response.message["instruction"]
+                    .as_str()
+                    .expect("approval response includes instruction");
                 assert!(instruction.contains(&digest));
                 assert!(instruction.contains(&approval_token));
                 assert!(instruction.contains("approval_token"));
@@ -337,11 +396,17 @@ mod tests {
     #[tokio::test]
     async fn fallback_token_approves_same_digest_once() {
         let gate = DefaultWriteApprovalGate::new();
-        let mut request = sample_request();
+        let request = sample_request();
         let (_digest, approval_token) = require_approval(&gate, request.clone()).await;
-        request.approval_token = Some(approval_token);
 
-        let decision = gate.check(request, ApprovalChannel::FallbackOnly).await;
+        let decision = gate
+            .approve(
+                ApprovalChannel::FallbackOnly,
+                request,
+                Some(approval_token.as_str()),
+            )
+            .await
+            .expect("approval check succeeds");
 
         assert_eq!(decision, ApprovalDecision::Approved);
     }
@@ -349,31 +414,53 @@ mod tests {
     #[tokio::test]
     async fn fallback_token_reuse_is_rejected() {
         let gate = DefaultWriteApprovalGate::new();
-        let mut request = sample_request();
+        let request = sample_request();
         let (_digest, approval_token) = require_approval(&gate, request.clone()).await;
-        request.approval_token = Some(approval_token.clone());
         assert_eq!(
-            gate.check(request.clone(), ApprovalChannel::FallbackOnly)
-                .await,
+            gate.approve(
+                ApprovalChannel::FallbackOnly,
+                request.clone(),
+                Some(approval_token.as_str()),
+            )
+            .await
+            .expect("approval check succeeds"),
             ApprovalDecision::Approved
         );
 
-        request.approval_token = Some(approval_token);
-        let decision = gate.check(request, ApprovalChannel::FallbackOnly).await;
+        let decision = gate
+            .approve(
+                ApprovalChannel::FallbackOnly,
+                request,
+                Some(approval_token.as_str()),
+            )
+            .await
+            .expect("approval check succeeds");
 
-        assert!(matches!(decision, ApprovalDecision::Rejected { .. }));
+        match decision {
+            ApprovalDecision::Response(response) => assert_eq!(response.status, "cancelled"),
+            other => panic!("expected cancelled response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn fallback_token_expires() {
         let gate = DefaultWriteApprovalGate::with_ttl(Duration::ZERO);
-        let mut request = sample_request();
+        let request = sample_request();
         let (_digest, approval_token) = require_approval(&gate, request.clone()).await;
-        request.approval_token = Some(approval_token);
 
-        let decision = gate.check(request, ApprovalChannel::FallbackOnly).await;
+        let decision = gate
+            .approve(
+                ApprovalChannel::FallbackOnly,
+                request,
+                Some(approval_token.as_str()),
+            )
+            .await
+            .expect("approval check succeeds");
 
-        assert!(matches!(decision, ApprovalDecision::Rejected { .. }));
+        match decision {
+            ApprovalDecision::Response(response) => assert_eq!(response.status, "cancelled"),
+            other => panic!("expected cancelled response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -381,22 +468,31 @@ mod tests {
         let gate = DefaultWriteApprovalGate::new();
         let mut request = sample_request();
         let (_digest, approval_token) = require_approval(&gate, request.clone()).await;
-        request.approval_token = Some(approval_token);
-        request.preview.request = json!({
+        request.params = json!({
             "files": ["//depot/main/a.txt", "//depot/main/c.txt"],
             "force": true
         });
 
-        let decision = gate.check(request, ApprovalChannel::FallbackOnly).await;
+        let decision = gate
+            .approve(
+                ApprovalChannel::FallbackOnly,
+                request,
+                Some(approval_token.as_str()),
+            )
+            .await
+            .expect("approval check succeeds");
 
-        assert!(matches!(decision, ApprovalDecision::Rejected { .. }));
+        match decision {
+            ApprovalDecision::Response(response) => assert_eq!(response.status, "cancelled"),
+            other => panic!("expected cancelled response, got {other:?}"),
+        }
     }
 
     #[test]
     fn digest_omits_approval_and_secret_fields() {
         let gate = DefaultWriteApprovalGate::new();
         let mut redacted = sample_request();
-        redacted.preview.request = json!({
+        redacted.params = json!({
             "array": [{"path": "//depot/main/a.txt"}],
             "nested": {
                 "keep": "stable"
@@ -404,8 +500,8 @@ mod tests {
         });
 
         let mut with_secrets = redacted.clone();
-        with_secrets.approval_token = Some("approval-token".to_string());
-        with_secrets.preview.request = json!({
+        with_secrets.params = json!({
+            "approval_token": "top-level-token",
             "array": [{
                 "approval_token": "nested-token",
                 "path": "//depot/main/a.txt"
@@ -422,9 +518,10 @@ mod tests {
             }
         });
 
+        assert!(gate.digest(&with_secrets).starts_with("sha256:"));
         assert_eq!(gate.digest(&with_secrets), gate.digest(&redacted));
 
-        redacted.preview.request["nested"]["keep"] = json!("changed");
+        redacted.params["nested"]["keep"] = json!("changed");
         assert_ne!(gate.digest(&with_secrets), gate.digest(&redacted));
     }
 }

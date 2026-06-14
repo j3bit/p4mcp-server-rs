@@ -26,4 +26,20 @@ impl ToolResponse {
             message,
         }
     }
+
+    pub fn approval_required(action: impl Into<String>, message: Value) -> Self {
+        Self {
+            status: "approval_required".to_string(),
+            action: action.into(),
+            message,
+        }
+    }
+
+    pub fn cancelled(action: impl Into<String>, message: Value) -> Self {
+        Self {
+            status: "cancelled".to_string(),
+            action: action.into(),
+            message,
+        }
+    }
 }
