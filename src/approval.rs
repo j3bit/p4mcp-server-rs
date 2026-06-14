@@ -99,6 +99,14 @@ impl DefaultWriteApprovalGate {
         format!("sha256:{}", hex_encode(&hasher.finalize()))
     }
 
+    #[cfg(test)]
+    fn token_count(&self) -> usize {
+        self.tokens
+            .lock()
+            .expect("approval token store mutex poisoned")
+            .len()
+    }
+
     fn approve_fallback(
         &self,
         request: ApprovalRequest,
@@ -123,19 +131,19 @@ impl DefaultWriteApprovalGate {
             message: format!("failed to generate approval token: {error}"),
         })?;
 
-        let expires_at = Instant::now() + self.ttl;
-        self.tokens
-            .lock()
-            .map_err(|_| P4McpError::InvalidInput {
-                message: "approval token store mutex poisoned".to_string(),
-            })?
-            .insert(
-                approval_token.clone(),
-                ApprovalTokenRecord {
-                    digest: digest.clone(),
-                    expires_at,
-                },
-            );
+        let now = Instant::now();
+        let expires_at = now + self.ttl;
+        let mut tokens = self.tokens.lock().map_err(|_| P4McpError::InvalidInput {
+            message: "approval token store mutex poisoned".to_string(),
+        })?;
+        prune_expired_tokens(&mut tokens, now);
+        tokens.insert(
+            approval_token.clone(),
+            ApprovalTokenRecord {
+                digest: digest.clone(),
+                expires_at,
+            },
+        );
 
         let ttl_seconds = self.ttl.as_secs();
         let instruction = format!(
@@ -155,13 +163,11 @@ impl DefaultWriteApprovalGate {
     }
 
     fn consume_token(&self, token: &str, digest: &str, action: &str) -> Result<ApprovalDecision> {
-        let record = self
-            .tokens
-            .lock()
-            .map_err(|_| P4McpError::InvalidInput {
-                message: "approval token store mutex poisoned".to_string(),
-            })?
-            .remove(token);
+        let mut tokens = self.tokens.lock().map_err(|_| P4McpError::InvalidInput {
+            message: "approval token store mutex poisoned".to_string(),
+        })?;
+        prune_expired_tokens(&mut tokens, Instant::now());
+        let record = tokens.remove(token);
 
         let Some(record) = record else {
             return Ok(cancelled(
@@ -182,6 +188,12 @@ impl DefaultWriteApprovalGate {
         }
 
         Ok(ApprovalDecision::Approved)
+    }
+}
+
+impl Default for DefaultWriteApprovalGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -206,6 +218,10 @@ fn cancelled(action: &str, reason: &str) -> ApprovalDecision {
         action.to_string(),
         json!({ "reason": reason }),
     ))
+}
+
+fn prune_expired_tokens(tokens: &mut HashMap<String, ApprovalTokenRecord>, now: Instant) {
+    tokens.retain(|_, record| now < record.expires_at);
 }
 
 fn generate_token() -> std::result::Result<String, getrandom::Error> {
@@ -461,6 +477,18 @@ mod tests {
             ApprovalDecision::Response(response) => assert_eq!(response.status, "cancelled"),
             other => panic!("expected cancelled response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fallback_prunes_expired_unused_tokens() {
+        let gate = DefaultWriteApprovalGate::with_ttl(Duration::ZERO);
+        let request = sample_request();
+
+        let (_digest, _approval_token) = require_approval(&gate, request.clone()).await;
+        assert_eq!(gate.token_count(), 1);
+
+        let (_digest, _approval_token) = require_approval(&gate, request).await;
+        assert_eq!(gate.token_count(), 1);
     }
 
     #[tokio::test]
