@@ -6,19 +6,22 @@ use crate::{
 pub fn build_workspace_query_invocation(
     action: &str,
     workspace_name: Option<&str>,
-    file_path: Option<&str>,
+    user: Option<&str>,
     max_results: u16,
 ) -> Result<P4Invocation> {
     let args = match action {
-        "list" => vec!["clients".into(), "-m".into(), max_results.to_string()],
+        "list" => {
+            let mut args = vec!["clients".into(), "-m".into(), max_results.to_string()];
+            if let Some(user) = non_blank(user) {
+                args.extend(["-u".into(), user.into()]);
+            }
+            args
+        }
         "get" => vec![
             "client".into(),
             "-o".into(),
             required(workspace_name, "workspace_name")?,
         ],
-        "where" => vec!["where".into(), required(file_path, "file_path")?],
-        "opened" => vec!["opened".into()],
-        "changes" => vec!["changes".into(), "-m".into(), max_results.to_string()],
         other => {
             return Err(P4McpError::InvalidInput {
                 message: format!("unknown action: {other}"),
@@ -30,6 +33,10 @@ pub fn build_workspace_query_invocation(
         stdin: None,
         mode: OutputMode::JsonLines,
     })
+}
+
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn required(value: Option<&str>, name: &str) -> Result<String> {

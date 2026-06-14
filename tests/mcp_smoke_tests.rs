@@ -177,6 +177,43 @@ async fn query_changelists_calls_injected_executor() {
 }
 
 #[tokio::test]
+async fn query_workspaces_list_by_user_calls_injected_executor() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: vec![json!({"client": "ws-main", "Owner": "alice"})],
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_workspaces(Parameters(CommonQueryParams {
+            action: "list".to_string(),
+            changelist_id: None,
+            workspace_name: None,
+            file_path: None,
+            user: Some("alice".to_string()),
+            status: None,
+            job_id: None,
+            stream: None,
+            owner: None,
+            max_results: 7,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "list");
+    assert_eq!(
+        response.0.message,
+        json!([{"client": "ws-main", "Owner": "alice"}])
+    );
+    assert_eq!(executor.invocations().len(), 1);
+    assert_eq!(
+        executor.invocations()[0].args,
+        ["clients", "-m", "7", "-u", "alice"]
+    );
+}
+
+#[tokio::test]
 async fn query_reviews_returns_dry_run_request_metadata() {
     let server = P4McpServer::new(test_config());
 

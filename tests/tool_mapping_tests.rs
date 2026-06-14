@@ -520,10 +520,18 @@ fn shelf_diff_blank_changelist_errors() {
 }
 
 #[test]
-fn workspace_where_maps_file_argument() {
-    let invocation =
-        build_workspace_query_invocation("where", None, Some("//depot/main/file.rs"), 10).unwrap();
-    assert_eq!(invocation.args, vec!["where", "//depot/main/file.rs"]);
+fn workspace_where_errors() {
+    let error = build_workspace_query_invocation("where", None, Some("//depot/main/file.rs"), 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown action: where"));
+}
+
+#[test]
+fn workspace_list_by_user_uses_user_filter() {
+    let invocation = build_workspace_query_invocation("list", None, Some("alice"), 7).unwrap();
+    assert_eq!(invocation.args, vec!["clients", "-m", "7", "-u", "alice"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
 }
 
 #[test]

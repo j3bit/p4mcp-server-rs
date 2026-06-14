@@ -648,7 +648,7 @@ impl P4McpServer {
     }
 
     #[tool(
-        description = "List, get, map, or inspect workspaces",
+        description = "List or get workspaces",
         annotations(read_only_hint = true)
     )]
     pub async fn query_workspaces(
@@ -661,7 +661,7 @@ impl P4McpServer {
         let invocation = build_workspace_query_invocation(
             &params.action,
             params.workspace_name.as_deref(),
-            params.file_path.as_deref(),
+            params.user.as_deref(),
             params.max_results,
         )
         .map_err(to_mcp_error)?;
