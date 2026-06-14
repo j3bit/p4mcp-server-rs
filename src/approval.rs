@@ -9,9 +9,9 @@ use crate::{
     tools::response::ToolResponse,
 };
 use async_trait::async_trait;
-use rmcp::{Peer, RoleServer};
+use rmcp::{Peer, RoleServer, ServiceError, service::ElicitationError};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -45,6 +45,20 @@ pub struct ApprovalRequest {
     pub preview: ApprovalPreview,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WriteApprovalChoice {
+    pub decision: WriteApprovalDecision,
+}
+
+rmcp::elicit_safe!(WriteApprovalChoice);
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WriteApprovalDecision {
+    Proceed,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalDecision {
     Approved,
@@ -75,6 +89,25 @@ pub struct DefaultWriteApprovalGate {
 struct ApprovalTokenRecord {
     digest: String,
     expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum WriteApprovalElicitationDecision {
+    Approved,
+    Response(ToolResponse),
+    FallbackRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WriteApprovalElicitationOutcome {
+    Accepted(WriteApprovalChoice),
+    Declined,
+    Cancelled,
+    Timeout,
+    NoContent,
+    InvalidContent,
+    TransportError,
+    CapabilityNotSupported,
 }
 
 impl DefaultWriteApprovalGate {
@@ -189,6 +222,33 @@ impl DefaultWriteApprovalGate {
 
         Ok(ApprovalDecision::Approved)
     }
+
+    async fn approve_elicitation(
+        &self,
+        peer: Peer<RoleServer>,
+        request: ApprovalRequest,
+        approval_token: Option<&str>,
+    ) -> Result<ApprovalDecision> {
+        let action = request.action.clone();
+        let message = format_elicitation_message(&request.preview);
+        let result = peer
+            .elicit_with_timeout::<WriteApprovalChoice>(
+                message,
+                Some(Duration::from_secs(APPROVAL_TOKEN_TTL_SECONDS)),
+            )
+            .await;
+        let decision = decide_write_approval_from_elicitation(&action, elicitation_outcome(result));
+
+        match decision {
+            WriteApprovalElicitationDecision::Approved => Ok(ApprovalDecision::Approved),
+            WriteApprovalElicitationDecision::Response(response) => {
+                Ok(ApprovalDecision::Response(response))
+            }
+            WriteApprovalElicitationDecision::FallbackRequired => {
+                self.approve_fallback(request, approval_token)
+            }
+        }
+    }
 }
 
 impl Default for DefaultWriteApprovalGate {
@@ -206,9 +266,122 @@ impl WriteApprovalGate for DefaultWriteApprovalGate {
         approval_token: Option<&str>,
     ) -> Result<ApprovalDecision> {
         match channel {
-            ApprovalChannel::Elicitation(_) | ApprovalChannel::FallbackOnly => {
-                self.approve_fallback(request, approval_token)
+            ApprovalChannel::Elicitation(peer) => {
+                self.approve_elicitation(peer, request, approval_token)
+                    .await
             }
+            ApprovalChannel::FallbackOnly => self.approve_fallback(request, approval_token),
+        }
+    }
+}
+
+fn format_elicitation_message(preview: &ApprovalPreview) -> String {
+    let mut lines = vec![
+        "Approve this Perforce write?".to_string(),
+        format!("Summary: {}", preview.summary),
+        format!("Tool: {}", preview.tool),
+        format!("Action: {}", preview.action),
+    ];
+
+    if !preview.targets.is_empty() {
+        lines.push(format!("Targets: {}", preview.targets.join(", ")));
+    }
+    if let Some(changelist) = &preview.changelist {
+        lines.push(format!("Changelist: {changelist}"));
+    }
+    if let Some(workspace) = &preview.workspace {
+        lines.push(format!("Workspace: {workspace}"));
+    }
+    if let Some(stream) = &preview.stream {
+        lines.push(format!("Stream: {stream}"));
+    }
+    if let Some(review) = &preview.review {
+        lines.push(format!("Review: {review}"));
+    }
+    if let Some(command) = &preview.command {
+        lines.push(format!("Command: {}", command.join(" ")));
+    }
+    if let Some(request) = &preview.request {
+        lines.push(format!("Request: {} {}", request.method, request.path));
+    }
+
+    lines.push("Choose PROCEED to execute this write or CANCEL to leave it unchanged.".to_string());
+    lines.join("\n")
+}
+
+fn elicitation_outcome(
+    result: std::result::Result<Option<WriteApprovalChoice>, ElicitationError>,
+) -> WriteApprovalElicitationOutcome {
+    match result {
+        Ok(Some(choice)) => WriteApprovalElicitationOutcome::Accepted(choice),
+        Ok(None) | Err(ElicitationError::NoContent) => WriteApprovalElicitationOutcome::NoContent,
+        Err(ElicitationError::UserDeclined) => WriteApprovalElicitationOutcome::Declined,
+        Err(ElicitationError::UserCancelled) => WriteApprovalElicitationOutcome::Cancelled,
+        Err(ElicitationError::ParseError { .. }) => WriteApprovalElicitationOutcome::InvalidContent,
+        Err(ElicitationError::CapabilityNotSupported) => {
+            WriteApprovalElicitationOutcome::CapabilityNotSupported
+        }
+        Err(ElicitationError::Service(ServiceError::Timeout { .. })) => {
+            WriteApprovalElicitationOutcome::Timeout
+        }
+        Err(ElicitationError::Service(_)) | Err(_) => {
+            WriteApprovalElicitationOutcome::TransportError
+        }
+    }
+}
+
+fn decide_write_approval_from_elicitation(
+    action: &str,
+    outcome: WriteApprovalElicitationOutcome,
+) -> WriteApprovalElicitationDecision {
+    match outcome {
+        WriteApprovalElicitationOutcome::Accepted(WriteApprovalChoice {
+            decision: WriteApprovalDecision::Proceed,
+        }) => WriteApprovalElicitationDecision::Approved,
+        WriteApprovalElicitationOutcome::Accepted(WriteApprovalChoice {
+            decision: WriteApprovalDecision::Cancel,
+        }) => WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+            action.to_string(),
+            json!({ "reason": "write approval cancelled by user" }),
+        )),
+        WriteApprovalElicitationOutcome::Declined => {
+            WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+                action.to_string(),
+                json!({ "reason": "write approval declined by user" }),
+            ))
+        }
+        WriteApprovalElicitationOutcome::Cancelled => {
+            WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+                action.to_string(),
+                json!({ "reason": "write approval cancelled by user" }),
+            ))
+        }
+        WriteApprovalElicitationOutcome::Timeout => {
+            WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+                action.to_string(),
+                json!({ "reason": "write approval timed out" }),
+            ))
+        }
+        WriteApprovalElicitationOutcome::NoContent => {
+            WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+                action.to_string(),
+                json!({ "reason": "write approval returned no content" }),
+            ))
+        }
+        WriteApprovalElicitationOutcome::InvalidContent => {
+            WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+                action.to_string(),
+                json!({ "reason": "write approval response was invalid" }),
+            ))
+        }
+        WriteApprovalElicitationOutcome::TransportError => {
+            WriteApprovalElicitationDecision::Response(ToolResponse::cancelled(
+                action.to_string(),
+                json!({ "reason": "write approval request failed" }),
+            ))
+        }
+        WriteApprovalElicitationOutcome::CapabilityNotSupported => {
+            WriteApprovalElicitationDecision::FallbackRequired
         }
     }
 }
@@ -367,6 +540,74 @@ mod tests {
     }
 
     fn assert_json_schema<T: schemars::JsonSchema>() {}
+
+    fn accepted_choice(decision: WriteApprovalDecision) -> WriteApprovalElicitationOutcome {
+        WriteApprovalElicitationOutcome::Accepted(WriteApprovalChoice { decision })
+    }
+
+    fn assert_cancelled_response(decision: WriteApprovalElicitationDecision) {
+        match decision {
+            WriteApprovalElicitationDecision::Response(response) => {
+                assert_eq!(response.status, "cancelled");
+                assert_eq!(response.action, "sync");
+            }
+            other => panic!("expected cancelled response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepted_proceed_approves() {
+        assert_eq!(
+            decide_write_approval_from_elicitation(
+                "sync",
+                accepted_choice(WriteApprovalDecision::Proceed)
+            ),
+            WriteApprovalElicitationDecision::Approved
+        );
+    }
+
+    #[test]
+    fn accepted_cancel_returns_cancelled() {
+        assert_cancelled_response(decide_write_approval_from_elicitation(
+            "sync",
+            accepted_choice(WriteApprovalDecision::Cancel),
+        ));
+    }
+
+    #[test]
+    fn decline_returns_cancelled() {
+        assert_cancelled_response(decide_write_approval_from_elicitation(
+            "sync",
+            WriteApprovalElicitationOutcome::Declined,
+        ));
+    }
+
+    #[test]
+    fn cancel_returns_cancelled() {
+        assert_cancelled_response(decide_write_approval_from_elicitation(
+            "sync",
+            WriteApprovalElicitationOutcome::Cancelled,
+        ));
+    }
+
+    #[test]
+    fn timeout_returns_cancelled() {
+        assert_cancelled_response(decide_write_approval_from_elicitation(
+            "sync",
+            WriteApprovalElicitationOutcome::Timeout,
+        ));
+    }
+
+    #[test]
+    fn capability_not_supported_returns_fallback_required() {
+        assert_eq!(
+            decide_write_approval_from_elicitation(
+                "sync",
+                WriteApprovalElicitationOutcome::CapabilityNotSupported,
+            ),
+            WriteApprovalElicitationDecision::FallbackRequired
+        );
+    }
 
     #[tokio::test]
     async fn fallback_without_token_returns_approval_required() {
