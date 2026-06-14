@@ -16,6 +16,10 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    approval::{
+        ApprovalChannel, ApprovalDecision, ApprovalPreview, ApprovalRequest,
+        DefaultWriteApprovalGate, WriteApprovalGate,
+    },
     config::{AppConfig, Cli, Toolset, TransportMode},
     error::P4McpError,
     p4::{
@@ -40,20 +44,36 @@ use crate::{
 pub struct P4McpServer {
     config: Arc<AppConfig>,
     executor: Arc<dyn P4Executor>,
+    approval_gate: Arc<dyn WriteApprovalGate>,
 }
 
 impl P4McpServer {
     pub fn new(config: AppConfig) -> Self {
-        Self {
-            executor: Arc::new(TokioP4Executor::new(config.p4_bin.clone())),
-            config: Arc::new(config),
-        }
+        let executor = Arc::new(TokioP4Executor::new(config.p4_bin.clone()));
+        Self::with_executor_and_approval(
+            config,
+            executor,
+            Arc::new(DefaultWriteApprovalGate::new()),
+        )
     }
 
     pub fn with_executor(config: AppConfig, executor: Arc<dyn P4Executor>) -> Self {
+        Self::with_executor_and_approval(
+            config,
+            executor,
+            Arc::new(DefaultWriteApprovalGate::new()),
+        )
+    }
+
+    pub fn with_executor_and_approval(
+        config: AppConfig,
+        executor: Arc<dyn P4Executor>,
+        approval_gate: Arc<dyn WriteApprovalGate>,
+    ) -> Self {
         Self {
             config: Arc::new(config),
             executor,
+            approval_gate,
         }
     }
 
@@ -87,6 +107,73 @@ impl P4McpServer {
     ) -> McpResult<Json<ToolResponse>> {
         let output = self.run_p4(invocation).await?;
         Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn require_write_approval(
+        &self,
+        channel: ApprovalChannel,
+        request: ApprovalRequest,
+        approval_token: Option<&str>,
+    ) -> McpResult<Option<Json<ToolResponse>>> {
+        match self
+            .approval_gate
+            .approve(channel, request, approval_token)
+            .await
+            .map_err(to_mcp_error)?
+        {
+            ApprovalDecision::Approved => Ok(None),
+            ApprovalDecision::Response(response) => Ok(Some(Json(response))),
+        }
+    }
+
+    async fn modify_files_inner(
+        &self,
+        params: ModifyFilesParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Files, "modify_files")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        let invocation = build_file_modify_invocation(&params).map_err(to_mcp_error)?;
+        let request = self.modify_files_approval_request(&params, &invocation);
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(action, invocation).await
+    }
+
+    fn modify_files_approval_request(
+        &self,
+        params: &ModifyFilesParams,
+        invocation: &P4Invocation,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let targets = modify_files_targets(params);
+        let action = params.action.as_str().to_string();
+
+        ApprovalRequest {
+            tool: "modify_files".to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify files params serialize to JSON"),
+            preview: ApprovalPreview {
+                summary: approval_summary(&action, &targets),
+                tool: "modify_files".to_string(),
+                action,
+                targets,
+                changelist: Some(params.changelist.clone()),
+                workspace: None,
+                stream: None,
+                review: None,
+                command: Some(command_preview(&self.config.p4_bin, invocation)),
+                request: None,
+            },
+        }
     }
 }
 
@@ -125,12 +212,8 @@ impl P4McpServer {
         &self,
         Parameters(params): Parameters<ModifyFilesParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Files, "modify_files")
-            .map_err(to_mcp_error)?;
-        let action = params.action.as_str();
-        let invocation = build_file_modify_invocation(&params).map_err(to_mcp_error)?;
-        self.call_p4_tool(action, invocation).await
+        self.modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
     }
 
     #[tool(description = "Get changelist information or list changelists")]
@@ -468,6 +551,34 @@ fn json_invocation(args: Vec<String>, stdin: Option<String>) -> P4Invocation {
     }
 }
 
+fn modify_files_targets(params: &ModifyFilesParams) -> Vec<String> {
+    let mut targets = Vec::new();
+    if let Some(file_paths) = &params.file_paths {
+        targets.extend(file_paths.iter().cloned());
+    }
+    if let Some(source_paths) = &params.source_paths {
+        targets.extend(source_paths.iter().cloned());
+    }
+    if let Some(target_paths) = &params.target_paths {
+        targets.extend(target_paths.iter().cloned());
+    }
+    targets
+}
+
+fn approval_summary(action: &str, targets: &[String]) -> String {
+    if targets.is_empty() {
+        format!("Run p4 {action}")
+    } else {
+        format!("Run p4 {action} on {}", targets.join(", "))
+    }
+}
+
+fn command_preview(p4_bin: &std::path::Path, invocation: &P4Invocation) -> Vec<String> {
+    let mut command = vec![p4_bin.to_string_lossy().into_owned()];
+    command.extend(invocation.args.iter().cloned());
+    command
+}
+
 fn review_message(built: crate::tools::reviews::BuiltReviewRequest) -> Value {
     serde_json::json!({
         "method": built.method,
@@ -522,4 +633,248 @@ fn init_logging() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Mutex},
+    };
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use crate::{
+        approval::{ApprovalChannel, ApprovalDecision, ApprovalRequest, WriteApprovalGate},
+        config::{SslVerify, TransportMode},
+        p4::runner::{P4CommandOutput, P4Env},
+        tools::params::FileModifyAction,
+    };
+
+    use super::*;
+
+    fn test_config(readonly: bool) -> AppConfig {
+        AppConfig {
+            readonly,
+            allow_usage: false,
+            toolsets: Toolset::default_set(),
+            transport: TransportMode::Stdio,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8000,
+            p4_bin: "p4".into(),
+            log_dir: None,
+            ssl_verify: SslVerify::Enabled,
+        }
+    }
+
+    fn modify_files_params(approval_token: Option<&str>) -> ModifyFilesParams {
+        ModifyFilesParams {
+            action: FileModifyAction::Sync,
+            file_paths: Some(vec!["//depot/main/file.txt".to_string()]),
+            changelist: "default".to_string(),
+            source_paths: None,
+            target_paths: None,
+            mode: "auto".to_string(),
+            force: true,
+            approval_token: approval_token.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_files_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_files_inner(modify_files_params(None), ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert_eq!(response.0.action, "sync");
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].approval_token, None);
+        assert_eq!(calls[0].request.tool, "modify_files");
+        assert_eq!(calls[0].request.action, "sync");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.tool, "modify_files");
+        assert_eq!(calls[0].request.preview.action, "sync");
+        assert_eq!(calls[0].request.preview.targets, ["//depot/main/file.txt"]);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "sync".to_string(),
+                "-f".to_string(),
+                "//depot/main/file.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_files_after_approval_calls_executor_once() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_files_inner(
+                modify_files_params(Some("approved-token")),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+            .expect("approved write should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "sync");
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["sync", "-f", "//depot/main/file.txt"]);
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_before_approval_gate() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(true),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let err = match server
+            .modify_files_inner(modify_files_params(None), ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("readonly mode should reject the write"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("read-only mode"));
+        assert!(approval_gate.calls().is_empty());
+        assert!(executor.invocations().is_empty());
+    }
+
+    #[derive(Clone)]
+    struct FakeApprovalCall {
+        fallback_only: bool,
+        request: ApprovalRequest,
+        approval_token: Option<String>,
+    }
+
+    struct FakeApprovalGate {
+        decision: ApprovalDecision,
+        calls: Mutex<Vec<FakeApprovalCall>>,
+    }
+
+    impl FakeApprovalGate {
+        fn approval_required() -> Self {
+            Self {
+                decision: ApprovalDecision::Response(ToolResponse::approval_required(
+                    "sync",
+                    json!({"reason": "approval required"}),
+                )),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn approved() -> Self {
+            Self {
+                decision: ApprovalDecision::Approved,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<FakeApprovalCall> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl WriteApprovalGate for FakeApprovalGate {
+        async fn approve(
+            &self,
+            channel: ApprovalChannel,
+            request: ApprovalRequest,
+            approval_token: Option<&str>,
+        ) -> crate::error::Result<ApprovalDecision> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(FakeApprovalCall {
+                    fallback_only: matches!(channel, ApprovalChannel::FallbackOnly),
+                    request,
+                    approval_token: approval_token.map(str::to_string),
+                });
+            Ok(self.decision.clone())
+        }
+    }
+
+    struct FakeExecutor {
+        output: P4CommandOutput,
+        invocations: Mutex<Vec<P4Invocation>>,
+    }
+
+    impl FakeExecutor {
+        fn success(output: P4CommandOutput) -> Self {
+            Self {
+                output,
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> Vec<P4Invocation> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl P4Executor for FakeExecutor {
+        async fn run(
+            &self,
+            invocation: P4Invocation,
+            _env: P4Env,
+        ) -> crate::error::Result<P4CommandOutput> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(invocation);
+            Ok(self.output.clone())
+        }
+    }
 }

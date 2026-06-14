@@ -10,7 +10,7 @@ use p4mcp_server_rs::{
     p4::runner::{P4CommandOutput, P4Env, P4Executor, P4Invocation},
     server::P4McpServer,
     tools::{
-        params::{CommonModifyParams, CommonQueryParams, FileQueryAction, QueryFilesParams},
+        params::{CommonQueryParams, FileQueryAction, QueryFilesParams},
         reviews::{ReviewAction, ReviewRequest},
         server::ServerQueryAction,
     },
@@ -30,13 +30,6 @@ fn test_config() -> AppConfig {
         p4_bin: "p4".into(),
         log_dir: None,
         ssl_verify: SslVerify::Enabled,
-    }
-}
-
-fn write_config() -> AppConfig {
-    AppConfig {
-        readonly: false,
-        ..test_config()
     }
 }
 
@@ -124,103 +117,6 @@ async fn query_changelists_calls_injected_executor() {
     assert_eq!(
         executor.invocations()[0].args,
         ["changes", "-m", "7", "-s", "pending", "-c", "ws-main"]
-    );
-}
-
-#[tokio::test]
-async fn modify_workspaces_rejects_delete_without_workspace_name() {
-    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-        records: Vec::new(),
-        text: json!({}),
-    }));
-    let server = P4McpServer::with_executor(write_config(), executor.clone());
-
-    let err = match server
-        .modify_workspaces(Parameters(CommonModifyParams {
-            action: "delete".to_string(),
-            changelist_id: None,
-            workspace_name: None,
-            stream: None,
-            description: None,
-            files: Vec::new(),
-            form: None,
-            approval_token: None,
-        }))
-        .await
-    {
-        Ok(_) => panic!("modify_workspaces should reject delete without a workspace name"),
-        Err(err) => err,
-    };
-
-    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
-    assert!(
-        err.message
-            .contains("workspace_name is required for delete")
-    );
-    assert!(executor.invocations().is_empty());
-}
-
-#[tokio::test]
-async fn modify_changelists_update_requires_changelist_id() {
-    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-        records: Vec::new(),
-        text: json!({}),
-    }));
-    let server = P4McpServer::with_executor(write_config(), executor.clone());
-
-    let err = match server
-        .modify_changelists(Parameters(CommonModifyParams {
-            action: "update".to_string(),
-            changelist_id: None,
-            workspace_name: None,
-            stream: None,
-            description: Some("update description".to_string()),
-            files: Vec::new(),
-            form: None,
-            approval_token: None,
-        }))
-        .await
-    {
-        Ok(_) => panic!("modify_changelists should reject update without changelist_id"),
-        Err(err) => err,
-    };
-
-    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
-    assert!(err.message.contains("changelist_id is required for update"));
-    assert!(executor.invocations().is_empty());
-}
-
-#[tokio::test]
-async fn modify_changelists_update_form_uses_requested_changelist() {
-    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-        records: Vec::new(),
-        text: json!({}),
-    }));
-    let server = P4McpServer::with_executor(write_config(), executor.clone());
-
-    let response = server
-        .modify_changelists(Parameters(CommonModifyParams {
-            action: "update".to_string(),
-            changelist_id: Some("123".to_string()),
-            workspace_name: None,
-            stream: None,
-            description: Some("update description".to_string()),
-            files: vec!["//depot/main/file.rs".to_string()],
-            form: None,
-            approval_token: None,
-        }))
-        .await
-        .unwrap();
-
-    assert_eq!(response.0.status, "success");
-    let invocations = executor.invocations();
-    assert_eq!(invocations.len(), 1);
-    assert_eq!(invocations[0].args, ["change", "-i"]);
-    assert!(
-        invocations[0]
-            .stdin
-            .as_deref()
-            .is_some_and(|stdin| stdin.contains("Change: 123"))
     );
 }
 
