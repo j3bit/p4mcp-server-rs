@@ -46,6 +46,7 @@ pub fn build_changelist_modify_invocation(
     action: &str,
     changelist_id: &str,
     stdin: Option<String>,
+    files: &[String],
 ) -> Result<P4Invocation> {
     let (args, stdin) = match action {
         "create" => (
@@ -72,6 +73,13 @@ pub fn build_changelist_modify_invocation(
             ],
             None,
         ),
+        "move_files" => {
+            let change = required_value(changelist_id, "changelist_id", "move_files")?;
+            required_files(files, "move_files")?;
+            let mut args = vec!["reopen".into(), "-c".into(), change];
+            args.extend(files.iter().cloned());
+            (args, None)
+        }
         other => return unknown(other),
     };
     Ok(P4Invocation {
@@ -97,6 +105,16 @@ fn required_value(value: &str, name: &str, action: &str) -> Result<String> {
         })
     } else {
         Ok(value.to_string())
+    }
+}
+
+fn required_files(files: &[String], action: &str) -> Result<()> {
+    if files.is_empty() {
+        Err(P4McpError::InvalidInput {
+            message: format!("files is required for {action}"),
+        })
+    } else {
+        Ok(())
     }
 }
 

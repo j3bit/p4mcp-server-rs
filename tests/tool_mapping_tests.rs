@@ -468,13 +468,55 @@ fn changelist_get_blank_id_errors() {
 
 #[test]
 fn changelist_submit_uses_numbered_change() {
-    let invocation = build_changelist_modify_invocation("submit", "123", None).unwrap();
+    let invocation = build_changelist_modify_invocation("submit", "123", None, &[]).unwrap();
     assert_eq!(invocation.args, vec!["submit", "-c", "123"]);
 }
 
 #[test]
+fn changelist_move_files_uses_reopen() {
+    let files = vec![
+        "//depot/main/a.rs".to_string(),
+        "//depot/main/b.rs".to_string(),
+    ];
+
+    let invocation = build_changelist_modify_invocation("move_files", "123", None, &files).unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "reopen",
+            "-c",
+            "123",
+            "//depot/main/a.rs",
+            "//depot/main/b.rs",
+        ]
+    );
+    assert_eq!(invocation.stdin, None);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn changelist_move_files_requires_files() {
+    let error = build_changelist_modify_invocation("move_files", "123", None, &[])
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("files is required for move_files"));
+}
+
+#[test]
+fn changelist_move_files_empty_id_errors() {
+    let files = vec!["//depot/main/a.rs".to_string()];
+    let error = build_changelist_modify_invocation("move_files", " ", None, &files)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("changelist_id is required for move_files"));
+}
+
+#[test]
 fn changelist_create_without_stdin_errors() {
-    let error = build_changelist_modify_invocation("create", "", None)
+    let error = build_changelist_modify_invocation("create", "", None, &[])
         .unwrap_err()
         .to_string();
     assert!(error.contains("stdin is required for create"));
@@ -482,7 +524,7 @@ fn changelist_create_without_stdin_errors() {
 
 #[test]
 fn changelist_update_without_stdin_errors() {
-    let error = build_changelist_modify_invocation("update", "123", None)
+    let error = build_changelist_modify_invocation("update", "123", None, &[])
         .unwrap_err()
         .to_string();
     assert!(error.contains("stdin is required for update"));
@@ -490,7 +532,7 @@ fn changelist_update_without_stdin_errors() {
 
 #[test]
 fn changelist_submit_empty_id_errors() {
-    let error = build_changelist_modify_invocation("submit", " ", None)
+    let error = build_changelist_modify_invocation("submit", " ", None, &[])
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required for submit"));
@@ -498,7 +540,7 @@ fn changelist_submit_empty_id_errors() {
 
 #[test]
 fn changelist_delete_empty_id_errors() {
-    let error = build_changelist_modify_invocation("delete", "", None)
+    let error = build_changelist_modify_invocation("delete", "", None, &[])
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required for delete"));

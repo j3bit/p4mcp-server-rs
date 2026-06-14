@@ -216,8 +216,13 @@ impl P4McpServer {
                 }
             })
         });
-        let invocation = build_changelist_modify_invocation(&params.action, &changelist_id, stdin)
-            .map_err(to_mcp_error)?;
+        let invocation = build_changelist_modify_invocation(
+            &params.action,
+            &changelist_id,
+            stdin,
+            &params.files,
+        )
+        .map_err(to_mcp_error)?;
         let request = self.common_modify_approval_request(
             &params,
             P4ApprovalContext {
