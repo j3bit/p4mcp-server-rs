@@ -555,6 +555,85 @@ mod tests {
         }
     }
 
+    fn invalid_choice_parse_error() -> ElicitationError {
+        let data = json!({ "decision": "INVALID" });
+        let error = serde_json::from_value::<WriteApprovalChoice>(data.clone())
+            .expect_err("invalid choice should fail to parse");
+        ElicitationError::ParseError { error, data }
+    }
+
+    #[test]
+    fn elicitation_outcome_maps_accepted_choice() {
+        assert_eq!(
+            elicitation_outcome(Ok(Some(WriteApprovalChoice {
+                decision: WriteApprovalDecision::Proceed,
+            }))),
+            accepted_choice(WriteApprovalDecision::Proceed)
+        );
+    }
+
+    #[test]
+    fn elicitation_outcome_maps_no_content() {
+        assert_eq!(
+            elicitation_outcome(Ok(None)),
+            WriteApprovalElicitationOutcome::NoContent
+        );
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::NoContent)),
+            WriteApprovalElicitationOutcome::NoContent
+        );
+    }
+
+    #[test]
+    fn elicitation_outcome_maps_parse_error_to_invalid_content() {
+        assert_eq!(
+            elicitation_outcome(Err(invalid_choice_parse_error())),
+            WriteApprovalElicitationOutcome::InvalidContent
+        );
+    }
+
+    #[test]
+    fn elicitation_outcome_maps_timeout() {
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::Service(ServiceError::Timeout {
+                timeout: Duration::from_secs(300),
+            }))),
+            WriteApprovalElicitationOutcome::Timeout
+        );
+    }
+
+    #[test]
+    fn elicitation_outcome_maps_generic_service_errors_to_transport_error() {
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::Service(
+                ServiceError::UnexpectedResponse,
+            ))),
+            WriteApprovalElicitationOutcome::TransportError
+        );
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::Service(
+                ServiceError::TransportClosed
+            ))),
+            WriteApprovalElicitationOutcome::TransportError
+        );
+    }
+
+    #[test]
+    fn elicitation_outcome_maps_user_and_capability_errors() {
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::UserDeclined)),
+            WriteApprovalElicitationOutcome::Declined
+        );
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::UserCancelled)),
+            WriteApprovalElicitationOutcome::Cancelled
+        );
+        assert_eq!(
+            elicitation_outcome(Err(ElicitationError::CapabilityNotSupported)),
+            WriteApprovalElicitationOutcome::CapabilityNotSupported
+        );
+    }
+
     #[test]
     fn accepted_proceed_approves() {
         assert_eq!(
