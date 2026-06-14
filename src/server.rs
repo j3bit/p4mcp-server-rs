@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     approval::{
         ApprovalChannel, ApprovalDecision, ApprovalPreview, ApprovalRequest,
-        DefaultWriteApprovalGate, WriteApprovalGate,
+        DefaultWriteApprovalGate, HttpPreview, WriteApprovalGate,
     },
     config::{AppConfig, Cli, Toolset, TransportMode},
     error::P4McpError,
@@ -33,7 +33,7 @@ use crate::{
         jobs::build_job_query_invocation,
         params::{CommonModifyParams, CommonQueryParams, ModifyFilesParams, QueryFilesParams},
         response::ToolResponse,
-        reviews::ReviewRequest,
+        reviews::{BuiltReviewRequest, ReviewRequest},
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
         streams::build_stream_query_invocation,
@@ -463,6 +463,64 @@ impl P4McpServer {
             request: None,
         }
     }
+
+    async fn modify_reviews_inner(
+        &self,
+        params: ReviewRequest,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Reviews, "modify_reviews")
+            .map_err(to_mcp_error)?;
+        let built = params.to_http("unused").map_err(to_mcp_error)?;
+        let request = self.modify_reviews_approval_request(&params, &built);
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        Ok(Json(ToolResponse::dry_run(
+            "modify_reviews",
+            review_message(built),
+        )))
+    }
+
+    fn modify_reviews_approval_request(
+        &self,
+        params: &ReviewRequest,
+        built: &BuiltReviewRequest,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let action = review_action_name(params);
+        let review = params.review_id.map(|review_id| review_id.to_string());
+        let targets = review
+            .as_ref()
+            .map(|review| vec![format!("review:{review}")])
+            .unwrap_or_else(|| vec![review_target_from_path(&built.path)]);
+
+        ApprovalRequest {
+            tool: "modify_reviews".to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params).expect("review params serialize to JSON"),
+            preview: ApprovalPreview {
+                summary: format!("Review API {} {}", built.method, built.path),
+                tool: "modify_reviews".to_string(),
+                action,
+                targets,
+                changelist: None,
+                workspace: None,
+                stream: None,
+                review,
+                command: None,
+                request: Some(HttpPreview {
+                    method: built.method.clone(),
+                    path: built.path.clone(),
+                }),
+            },
+        }
+    }
 }
 
 type McpResult<T> = std::result::Result<T, ErrorData>;
@@ -666,16 +724,11 @@ impl P4McpServer {
     #[tool(description = "Modify P4 Code Review / Swarm reviews")]
     pub async fn modify_reviews(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ReviewRequest>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Reviews, "modify_reviews")
-            .map_err(to_mcp_error)?;
-        let built = params.to_http("unused").map_err(to_mcp_error)?;
-        Ok(Json(ToolResponse::dry_run(
-            "modify_reviews",
-            review_message(built),
-        )))
+        self.modify_reviews_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
     }
 }
 
@@ -782,6 +835,18 @@ fn approval_summary(action: &str, targets: &[String]) -> String {
     }
 }
 
+fn review_action_name(params: &ReviewRequest) -> String {
+    serde_json::to_value(&params.action)
+        .expect("review action serializes to JSON")
+        .as_str()
+        .expect("review action serializes to a string")
+        .to_string()
+}
+
+fn review_target_from_path(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
 fn command_preview(p4_bin: &std::path::Path, invocation: &P4Invocation) -> Vec<String> {
     let mut command = vec![p4_bin.to_string_lossy().into_owned()];
     command.extend(invocation.args.iter().cloned());
@@ -859,6 +924,7 @@ mod tests {
         config::{SslVerify, TransportMode},
         p4::runner::{P4CommandOutput, P4Env},
         tools::params::FileModifyAction,
+        tools::reviews::ReviewAction,
     };
 
     use super::*;
@@ -900,6 +966,16 @@ mod tests {
             files: Vec::new(),
             form: None,
             approval_token: None,
+        }
+    }
+
+    fn review_modify_params(approval_token: Option<&str>) -> ReviewRequest {
+        ReviewRequest {
+            action: ReviewAction::Vote,
+            review_id: Some(123),
+            max_results: 10,
+            body: json!({"vote": "up", "version": 2}),
+            approval_token: approval_token.map(str::to_string),
         }
     }
 
@@ -1287,6 +1363,114 @@ mod tests {
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].request.preview.targets, ["stream form"]);
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_without_approval_does_not_return_write_dry_run() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(review_modify_params(None), ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert_ne!(response.0.status, "dry_run");
+        assert!(response.0.message.get("method").is_none());
+        assert!(response.0.message.get("path").is_none());
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].approval_token, None);
+        assert_eq!(calls[0].request.tool, "modify_reviews");
+        assert_eq!(calls[0].request.action, "vote");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_after_approval_returns_request_metadata() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(
+                review_modify_params(Some("approved-token")),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+            .expect("approved review write should return dry-run metadata");
+
+        assert_eq!(response.0.status, "dry_run");
+        assert_eq!(response.0.action, "modify_reviews");
+        assert_eq!(response.0.message["method"], "POST");
+        assert_eq!(response.0.message["path"], "/reviews/123/vote");
+        assert_eq!(
+            response.0.message["body"],
+            json!({"vote": "up", "version": 2})
+        );
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_approval_preview_uses_method_and_path() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(review_modify_params(None), ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.preview.tool, "modify_reviews");
+        assert_eq!(calls[0].request.preview.action, "vote");
+        assert_eq!(calls[0].request.preview.targets, ["review:123"]);
+        assert_eq!(calls[0].request.preview.review.as_deref(), Some("123"));
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0]
+                .request
+                .preview
+                .request
+                .as_ref()
+                .map(|request| (request.method.as_str(), request.path.as_str(),)),
+            Some(("POST", "/reviews/123/vote"))
+        );
     }
 
     #[tokio::test]
