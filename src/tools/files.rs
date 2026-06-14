@@ -102,8 +102,6 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
 }
 
 pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invocation> {
-    params.confirmed()?;
-
     let files = params.file_paths.clone().unwrap_or_default();
     let invocation = match params.action {
         FileModifyAction::Add => {
@@ -169,14 +167,8 @@ pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invo
                 "safe" => "-as",
                 "preview" => "-n",
                 "yours" => "-ay",
-                "force" => {
-                    require_proceed_confirmation(params)?;
-                    "-af"
-                }
-                "theirs" => {
-                    require_proceed_confirmation(params)?;
-                    "-at"
-                }
+                "force" => "-af",
+                "theirs" => "-at",
                 other => {
                     return Err(P4McpError::InvalidInput {
                         message: format!("invalid resolve mode: {other}"),
@@ -205,13 +197,6 @@ fn require_files(files: &[String], action: &str) -> Result<()> {
         });
     }
     Ok(())
-}
-
-fn require_proceed_confirmation(params: &ModifyFilesParams) -> Result<()> {
-    if params.confirmation.as_deref() == Some("PROCEED") {
-        return Ok(());
-    }
-    Err(P4McpError::ConfirmationRequired)
 }
 
 fn with_files(prefix: Vec<&str>, files: Vec<String>) -> P4Invocation {

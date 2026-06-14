@@ -283,7 +283,6 @@ fn is_redacted_field(field: &str) -> bool {
     matches!(
         field,
         "approval_token"
-            | "confirmation"
             | "password"
             | "ticket"
             | "authorization"
@@ -539,7 +538,6 @@ mod tests {
                 "P4PASSWD": "p4-password",
                 "P4TICKETS": "/tmp/tickets",
                 "authorization": "basic secret",
-                "confirmation": true,
                 "keep": "stable",
                 "password": "password",
                 "ticket": "ticket"

@@ -47,6 +47,8 @@ pub struct ReviewRequest {
     pub max_results: u16,
     #[serde(default = "default_body")]
     pub body: Value,
+    #[serde(default)]
+    pub approval_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,12 +61,6 @@ pub struct BuiltReviewRequest {
 
 impl ReviewRequest {
     pub fn to_http(&self, _api_base: &str) -> Result<BuiltReviewRequest> {
-        if self.action == ReviewAction::Obliterate
-            && self.body.get("confirmation").and_then(Value::as_str) != Some("PROCEED")
-        {
-            return Err(P4McpError::ConfirmationRequired);
-        }
-
         let id = || {
             self.review_id.ok_or_else(|| P4McpError::InvalidInput {
                 message: "review_id is required".to_string(),

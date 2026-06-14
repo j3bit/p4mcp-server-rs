@@ -1,8 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{P4McpError, Result};
-
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FileQueryAction {
@@ -91,23 +89,7 @@ pub struct ModifyFilesParams {
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
-    pub confirmation: Option<String>,
-}
-
-impl ModifyFilesParams {
-    pub fn requires_confirmation(&self) -> bool {
-        matches!(
-            self.action,
-            FileModifyAction::Delete | FileModifyAction::Revert
-        )
-    }
-
-    pub fn confirmed(&self) -> Result<()> {
-        if !self.requires_confirmation() || self.confirmation.as_deref() == Some("PROCEED") {
-            return Ok(());
-        }
-        Err(P4McpError::ConfirmationRequired)
-    }
+    pub approval_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -149,7 +131,7 @@ pub struct CommonModifyParams {
     #[serde(default)]
     pub form: Option<String>,
     #[serde(default)]
-    pub confirmation: Option<String>,
+    pub approval_token: Option<String>,
 }
 
 fn default_true() -> bool {

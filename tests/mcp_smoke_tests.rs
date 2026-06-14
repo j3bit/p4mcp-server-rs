@@ -144,7 +144,7 @@ async fn modify_workspaces_rejects_delete_without_workspace_name() {
             description: None,
             files: Vec::new(),
             form: None,
-            confirmation: Some("PROCEED".to_string()),
+            approval_token: None,
         }))
         .await
     {
@@ -177,7 +177,7 @@ async fn modify_changelists_update_requires_changelist_id() {
             description: Some("update description".to_string()),
             files: Vec::new(),
             form: None,
-            confirmation: None,
+            approval_token: None,
         }))
         .await
     {
@@ -207,7 +207,7 @@ async fn modify_changelists_update_form_uses_requested_changelist() {
             description: Some("update description".to_string()),
             files: vec!["//depot/main/file.rs".to_string()],
             form: None,
-            confirmation: None,
+            approval_token: None,
         }))
         .await
         .unwrap();
@@ -234,6 +234,7 @@ async fn query_reviews_returns_dry_run_request_metadata() {
             review_id: None,
             max_results: 5,
             body: json!({}),
+            approval_token: None,
         }))
         .await
         .unwrap();

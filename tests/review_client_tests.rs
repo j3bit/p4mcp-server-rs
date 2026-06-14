@@ -1,6 +1,13 @@
 use p4mcp_server_rs::tools::reviews::{ReviewAction, ReviewHttpClient, ReviewRequest};
+use schemars::JsonSchema;
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn schema_has_property<T: JsonSchema>(name: &str) -> bool {
+    let schema = schemars::schema_for!(T);
+    let schema = serde_json::to_value(schema).unwrap();
+    schema["properties"].as_object().unwrap().contains_key(name)
+}
 
 #[test]
 fn list_reviews_builds_v11_reviews_path() {
@@ -9,6 +16,7 @@ fn list_reviews_builds_v11_reviews_path() {
         review_id: None,
         max_results: 25,
         body: serde_json::json!({}),
+        approval_token: None,
     };
     let built = request
         .to_http("https://swarm.example.com/api/v11")
@@ -25,6 +33,7 @@ fn vote_review_builds_post_payload() {
         review_id: Some(123),
         max_results: 10,
         body: serde_json::json!({"vote": "up", "version": 2}),
+        approval_token: None,
     };
     let built = request
         .to_http("https://swarm.example.com/api/v11")
@@ -35,18 +44,30 @@ fn vote_review_builds_post_payload() {
 }
 
 #[test]
-fn obliterate_review_requires_confirmation() {
+fn review_request_schema_exposes_approval_token() {
+    assert!(schema_has_property::<ReviewRequest>("approval_token"));
+}
+
+#[test]
+fn review_request_schema_omits_confirmation() {
+    assert!(!schema_has_property::<ReviewRequest>("confirmation"));
+}
+
+#[test]
+fn obliterate_review_builds_delete_without_body_confirmation() {
     let request = ReviewRequest {
         action: ReviewAction::Obliterate,
         review_id: Some(123),
         max_results: 10,
-        body: serde_json::json!({"confirmation": "CANCEL"}),
+        body: serde_json::json!({}),
+        approval_token: None,
     };
-    assert!(
-        request
-            .to_http("https://swarm.example.com/api/v11")
-            .is_err()
-    );
+    let built = request
+        .to_http("https://swarm.example.com/api/v11")
+        .unwrap();
+    assert_eq!(built.method, "DELETE");
+    assert_eq!(built.path, "/reviews/123");
+    assert_eq!(built.body, serde_json::json!({}));
 }
 
 #[test]
@@ -58,6 +79,7 @@ fn missing_body_deserializes_to_empty_object() {
 
     assert_eq!(request.body, serde_json::json!({}));
     assert_eq!(request.max_results, 10);
+    assert_eq!(request.approval_token, None);
 }
 
 #[tokio::test]
@@ -86,6 +108,7 @@ async fn execute_list_sends_get_with_query_and_basic_auth() {
         review_id: None,
         max_results: 7,
         body: serde_json::json!({}),
+        approval_token: None,
     };
 
     let result = client.execute(&request).await.unwrap();
@@ -122,6 +145,7 @@ async fn execute_vote_sends_post_json_and_basic_auth() {
         review_id: Some(123),
         max_results: 10,
         body: serde_json::json!({"vote": "up", "version": 2}),
+        approval_token: None,
     };
 
     let result = client.execute(&request).await.unwrap();
@@ -153,6 +177,7 @@ async fn execute_non_success_returns_error_without_credentials() {
         review_id: None,
         max_results: 10,
         body: serde_json::json!({}),
+        approval_token: None,
     };
 
     let error = client.execute(&request).await.unwrap_err().to_string();

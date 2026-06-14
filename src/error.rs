@@ -17,9 +17,6 @@ pub enum P4McpError {
 
     #[error("write operation blocked by read-only mode")]
     Readonly,
-
-    #[error("destructive action requires confirmation value PROCEED")]
-    ConfirmationRequired,
 }
 
 pub type Result<T> = std::result::Result<T, P4McpError>;

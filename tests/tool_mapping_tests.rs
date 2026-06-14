@@ -1,19 +1,28 @@
 use p4mcp_server_rs::{
     config::Toolset,
-    error::P4McpError,
     p4::runner::{OutputMode, P4Invocation},
     permissions::{Access, SafetyPolicy},
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::build_job_query_invocation,
-        params::{FileModifyAction, FileQueryAction, ModifyFilesParams, QueryFilesParams},
+        params::{
+            CommonModifyParams, FileModifyAction, FileQueryAction, ModifyFilesParams,
+            QueryFilesParams,
+        },
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
         streams::build_stream_query_invocation,
         workspaces::build_workspace_query_invocation,
     },
 };
+use schemars::JsonSchema;
+
+fn schema_has_property<T: JsonSchema>(name: &str) -> bool {
+    let schema = schemars::schema_for!(T);
+    let schema = serde_json::to_value(schema).unwrap();
+    schema["properties"].as_object().unwrap().contains_key(name)
+}
 
 #[test]
 fn query_files_params_deserialize_content_action() {
@@ -42,19 +51,23 @@ fn disabled_toolset_blocks_call() {
 }
 
 #[test]
-fn delete_requires_proceed_confirmation() {
-    let params = ModifyFilesParams {
-        action: FileModifyAction::Delete,
-        file_paths: Some(vec!["//depot/main/old.txt".to_string()]),
-        changelist: "default".to_string(),
-        source_paths: None,
-        target_paths: None,
-        mode: "auto".to_string(),
-        force: false,
-        confirmation: None,
-    };
-    assert!(params.requires_confirmation());
-    assert!(params.confirmed().is_err());
+fn modify_file_params_schema_exposes_approval_token() {
+    assert!(schema_has_property::<ModifyFilesParams>("approval_token"));
+}
+
+#[test]
+fn modify_file_params_schema_omits_confirmation() {
+    assert!(!schema_has_property::<ModifyFilesParams>("confirmation"));
+}
+
+#[test]
+fn common_modify_params_schema_exposes_approval_token() {
+    assert!(schema_has_property::<CommonModifyParams>("approval_token"));
+}
+
+#[test]
+fn common_modify_params_schema_omits_confirmation() {
+    assert!(!schema_has_property::<CommonModifyParams>("confirmation"));
 }
 
 #[test]
@@ -230,7 +243,7 @@ fn modify_file_add_maps_changelist() {
         target_paths: None,
         mode: "auto".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
     let invocation = build_file_modify_invocation(&params).unwrap();
@@ -239,7 +252,7 @@ fn modify_file_add_maps_changelist() {
 }
 
 #[test]
-fn modify_file_delete_requires_confirmation_before_command() {
+fn modify_file_delete_builds_without_confirmation() {
     let params = ModifyFilesParams {
         action: FileModifyAction::Delete,
         file_paths: Some(vec!["//depot/main/old.rs".to_string()]),
@@ -248,10 +261,14 @@ fn modify_file_delete_requires_confirmation_before_command() {
         target_paths: None,
         mode: "auto".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
-    assert!(build_file_modify_invocation(&params).is_err());
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(
+        invocation.args,
+        vec!["delete", "-c", "default", "//depot/main/old.rs"]
+    );
 }
 
 #[test]
@@ -264,7 +281,7 @@ fn modify_file_resolve_safe_maps_to_as() {
         target_paths: None,
         mode: "safe".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
     let invocation = build_file_modify_invocation(&params).unwrap();
@@ -284,7 +301,7 @@ fn modify_file_add_requires_files() {
         target_paths: None,
         mode: "auto".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
     let error = build_file_modify_invocation(&params)
@@ -294,7 +311,7 @@ fn modify_file_add_requires_files() {
 }
 
 #[test]
-fn modify_file_confirmed_delete_requires_files_after_confirmation() {
+fn modify_file_delete_requires_files() {
     let params = ModifyFilesParams {
         action: FileModifyAction::Delete,
         file_paths: None,
@@ -303,7 +320,7 @@ fn modify_file_confirmed_delete_requires_files_after_confirmation() {
         target_paths: None,
         mode: "auto".to_string(),
         force: false,
-        confirmation: Some("PROCEED".to_string()),
+        approval_token: None,
     };
 
     let error = build_file_modify_invocation(&params)
@@ -313,7 +330,7 @@ fn modify_file_confirmed_delete_requires_files_after_confirmation() {
 }
 
 #[test]
-fn modify_file_confirmed_revert_maps_changelist_and_file() {
+fn modify_file_revert_maps_changelist_and_file() {
     let params = ModifyFilesParams {
         action: FileModifyAction::Revert,
         file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
@@ -322,7 +339,7 @@ fn modify_file_confirmed_revert_maps_changelist_and_file() {
         target_paths: None,
         mode: "auto".to_string(),
         force: false,
-        confirmation: Some("PROCEED".to_string()),
+        approval_token: None,
     };
 
     let invocation = build_file_modify_invocation(&params).unwrap();
@@ -342,7 +359,7 @@ fn modify_file_move_source_target_mismatch_errors() {
         target_paths: Some(vec![]),
         mode: "auto".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
     let error = build_file_modify_invocation(&params)
@@ -361,7 +378,7 @@ fn modify_file_sync_force_maps_flag_and_file() {
         target_paths: None,
         mode: "auto".to_string(),
         force: true,
-        confirmation: None,
+        approval_token: None,
     };
 
     let invocation = build_file_modify_invocation(&params).unwrap();
@@ -378,7 +395,7 @@ fn modify_file_invalid_resolve_mode_errors() {
         target_paths: None,
         mode: "bad".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
     let error = build_file_modify_invocation(&params)
@@ -388,7 +405,7 @@ fn modify_file_invalid_resolve_mode_errors() {
 }
 
 #[test]
-fn modify_file_resolve_theirs_requires_confirmation() {
+fn modify_file_resolve_theirs_builds_without_confirmation() {
     let params = ModifyFilesParams {
         action: FileModifyAction::Resolve,
         file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
@@ -397,17 +414,18 @@ fn modify_file_resolve_theirs_requires_confirmation() {
         target_paths: None,
         mode: "theirs".to_string(),
         force: false,
-        confirmation: None,
+        approval_token: None,
     };
 
-    assert!(matches!(
-        build_file_modify_invocation(&params),
-        Err(P4McpError::ConfirmationRequired)
-    ));
+    let invocation = build_file_modify_invocation(&params).unwrap();
+    assert_eq!(
+        invocation.args,
+        vec!["resolve", "-at", "//depot/main/file.rs"]
+    );
 }
 
 #[test]
-fn modify_file_resolve_force_requires_confirmation() {
+fn modify_file_resolve_force_maps_to_af() {
     let params = ModifyFilesParams {
         action: FileModifyAction::Resolve,
         file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
@@ -416,32 +434,13 @@ fn modify_file_resolve_force_requires_confirmation() {
         target_paths: None,
         mode: "force".to_string(),
         force: false,
-        confirmation: None,
-    };
-
-    assert!(matches!(
-        build_file_modify_invocation(&params),
-        Err(P4McpError::ConfirmationRequired)
-    ));
-}
-
-#[test]
-fn modify_file_resolve_theirs_confirmed_maps_to_at() {
-    let params = ModifyFilesParams {
-        action: FileModifyAction::Resolve,
-        file_paths: Some(vec!["//depot/main/file.rs".to_string()]),
-        changelist: "default".to_string(),
-        source_paths: None,
-        target_paths: None,
-        mode: "theirs".to_string(),
-        force: false,
-        confirmation: Some("PROCEED".to_string()),
+        approval_token: None,
     };
 
     let invocation = build_file_modify_invocation(&params).unwrap();
     assert_eq!(
         invocation.args,
-        vec!["resolve", "-at", "//depot/main/file.rs"]
+        vec!["resolve", "-af", "//depot/main/file.rs"]
     );
 }
 

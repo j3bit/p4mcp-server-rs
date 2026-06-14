@@ -169,9 +169,6 @@ impl P4McpServer {
             )?,
             other => return Err(to_mcp_error(unknown_action(other))),
         };
-        if params.action == "delete" {
-            require_confirmation(params.confirmation.as_deref())?;
-        }
         let stdin = params.form.clone().or_else(|| {
             params.description.as_ref().map(|description| {
                 if params.action == "create" {
@@ -221,7 +218,6 @@ impl P4McpServer {
             "shelve" => vec!["shelve".to_string(), "-c".to_string(), change],
             "unshelve" => vec!["unshelve".to_string(), "-s".to_string(), change],
             "delete" => {
-                require_confirmation(params.confirmation.as_deref())?;
                 vec![
                     "shelve".to_string(),
                     "-d".to_string(),
@@ -267,7 +263,6 @@ impl P4McpServer {
                 Some(required_form(params.form.as_deref(), &params.action)?),
             ),
             "delete" => {
-                require_confirmation(params.confirmation.as_deref())?;
                 let workspace_name =
                     required_option(params.workspace_name.as_deref(), "workspace_name", "delete")?;
                 (
@@ -367,7 +362,6 @@ impl P4McpServer {
                 Some(required_form(params.form.as_deref(), &params.action)?),
             ),
             "delete" => {
-                require_confirmation(params.confirmation.as_deref())?;
                 let stream = required_option(params.stream.as_deref(), "stream", "delete")?;
                 (vec!["stream".to_string(), "-d".to_string(), stream], None)
             }
@@ -483,13 +477,6 @@ fn review_message(built: crate::tools::reviews::BuiltReviewRequest) -> Value {
     })
 }
 
-fn require_confirmation(confirmation: Option<&str>) -> McpResult<()> {
-    if confirmation == Some("PROCEED") {
-        return Ok(());
-    }
-    Err(to_mcp_error(P4McpError::ConfirmationRequired))
-}
-
 fn required_option(value: Option<&str>, name: &str, action: &str) -> McpResult<String> {
     match value {
         Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
@@ -522,8 +509,7 @@ fn to_mcp_error(error: P4McpError) -> ErrorData {
     match error {
         P4McpError::InvalidInput { .. }
         | P4McpError::ToolsetDisabled { .. }
-        | P4McpError::Readonly
-        | P4McpError::ConfirmationRequired => ErrorData::invalid_params(error.to_string(), None),
+        | P4McpError::Readonly => ErrorData::invalid_params(error.to_string(), None),
         P4McpError::P4Command { .. } | P4McpError::P4Json { .. } => {
             ErrorData::internal_error(error.to_string(), None)
         }
