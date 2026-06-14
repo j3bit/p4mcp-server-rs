@@ -8,6 +8,7 @@ pub fn build_changelist_query_invocation(
     changelist_id: Option<&str>,
     status: Option<&str>,
     workspace_name: Option<&str>,
+    user: Option<&str>,
     max_results: u16,
 ) -> Result<P4Invocation> {
     let args = match action {
@@ -26,6 +27,9 @@ pub fn build_changelist_query_invocation(
             }
             if let Some(workspace) = workspace_name {
                 args.extend(["-c".into(), workspace.into()]);
+            }
+            if let Some(user) = user {
+                args.extend(["-u".into(), user.into()]);
             }
             args
         }

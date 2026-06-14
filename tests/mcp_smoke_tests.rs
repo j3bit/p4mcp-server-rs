@@ -154,7 +154,7 @@ async fn query_changelists_calls_injected_executor() {
             changelist_id: None,
             workspace_name: Some("ws-main".to_string()),
             file_path: None,
-            user: None,
+            user: Some("alice".to_string()),
             status: Some("pending".to_string()),
             job_id: None,
             stream: None,
@@ -170,7 +170,9 @@ async fn query_changelists_calls_injected_executor() {
     assert_eq!(executor.invocations().len(), 1);
     assert_eq!(
         executor.invocations()[0].args,
-        ["changes", "-m", "7", "-s", "pending", "-c", "ws-main"]
+        [
+            "changes", "-m", "7", "-s", "pending", "-c", "ws-main", "-u", "alice"
+        ]
     );
 }
 

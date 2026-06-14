@@ -593,6 +593,7 @@ impl P4McpServer {
             params.changelist_id.as_deref(),
             params.status.as_deref(),
             params.workspace_name.as_deref(),
+            params.user.as_deref(),
             params.max_results,
         )
         .map_err(to_mcp_error)?;

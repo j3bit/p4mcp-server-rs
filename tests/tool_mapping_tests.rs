@@ -447,19 +447,20 @@ fn modify_file_resolve_force_maps_to_af() {
 #[test]
 fn default_changelist_get_uses_opened_not_describe() {
     let invocation =
-        build_changelist_query_invocation("get", Some("default"), None, None, 10).unwrap();
+        build_changelist_query_invocation("get", Some("default"), None, None, None, 10).unwrap();
     assert_eq!(invocation.args, vec!["opened", "-c", "default"]);
 }
 
 #[test]
 fn numbered_changelist_get_uses_describe() {
-    let invocation = build_changelist_query_invocation("get", Some("123"), None, None, 10).unwrap();
+    let invocation =
+        build_changelist_query_invocation("get", Some("123"), None, None, None, 10).unwrap();
     assert_eq!(invocation.args, vec!["describe", "-s", "123"]);
 }
 
 #[test]
 fn changelist_get_blank_id_errors() {
-    let error = build_changelist_query_invocation("get", Some(" "), None, None, 10)
+    let error = build_changelist_query_invocation("get", Some(" "), None, None, None, 10)
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required"));
