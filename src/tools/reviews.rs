@@ -216,6 +216,12 @@ impl ReviewHttpClient {
 
     pub async fn execute(&self, request: &ReviewRequest) -> anyhow::Result<Value> {
         let built = request.to_http(&self.api_base)?;
+        if built.method != "GET" {
+            anyhow::bail!(
+                "review API {} request requires MCP write approval before execution",
+                built.method
+            );
+        }
         let url = format!("{}{}", self.api_base, built.path);
         let mut req = match built.method.as_str() {
             "GET" => self.client.get(url).query(&built.query),

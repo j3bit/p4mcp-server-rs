@@ -123,7 +123,7 @@ impl DefaultWriteApprovalGate {
     }
 
     pub fn digest(&self, request: &ApprovalRequest) -> String {
-        let value = serde_json::to_value(request).expect("approval request serializes to JSON");
+        let value = approval_digest_value(request);
         let mut canonical = String::new();
         write_canonical_json(&value, &mut canonical);
 
@@ -413,6 +413,67 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+fn approval_digest_value(request: &ApprovalRequest) -> Value {
+    json!({
+        "tool": request.tool,
+        "action": request.action,
+        "params": sanitize_params_for_digest(&request.params),
+        "preview": sanitize_value_for_digest(
+            &serde_json::to_value(&request.preview).expect("approval preview serializes to JSON")
+        ),
+    })
+}
+
+fn sanitize_params_for_digest(value: &Value) -> Value {
+    match value {
+        Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in values {
+                if key == "approval_token" {
+                    continue;
+                }
+                sanitized.insert(key.clone(), sanitize_field_for_digest(key, value));
+            }
+            Value::Object(sanitized)
+        }
+        other => sanitize_value_for_digest(other),
+    }
+}
+
+fn sanitize_value_for_digest(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(sanitize_value_for_digest).collect())
+        }
+        Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in values {
+                sanitized.insert(key.clone(), sanitize_field_for_digest(key, value));
+            }
+            Value::Object(sanitized)
+        }
+        other => other.clone(),
+    }
+}
+
+fn sanitize_field_for_digest(field: &str, value: &Value) -> Value {
+    if is_secret_field(field) {
+        return json!({
+            "redacted_sha256": digest_value(value),
+        });
+    }
+    sanitize_value_for_digest(value)
+}
+
+fn digest_value(value: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical_json(value, &mut canonical);
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    format!("sha256:{}", hex_encode(&hasher.finalize()))
+}
+
 fn write_canonical_json(value: &Value, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
@@ -432,10 +493,7 @@ fn write_canonical_json(value: &Value, out: &mut String) {
             out.push(']');
         }
         Value::Object(values) => {
-            let mut keys = values
-                .keys()
-                .filter(|key| !is_redacted_field(key))
-                .collect::<Vec<_>>();
+            let mut keys = values.keys().collect::<Vec<_>>();
             keys.sort_unstable();
 
             out.push('{');
@@ -452,11 +510,10 @@ fn write_canonical_json(value: &Value, out: &mut String) {
     }
 }
 
-fn is_redacted_field(field: &str) -> bool {
+fn is_secret_field(field: &str) -> bool {
     matches!(
         field,
         "approval_token"
-            | "confirmation"
             | "password"
             | "ticket"
             | "authorization"
@@ -837,11 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn digest_omits_approval_and_secret_fields() {
+    fn digest_omits_top_level_approval_token() {
         let gate = DefaultWriteApprovalGate::new();
         let mut redacted = sample_request();
         redacted.params = json!({
-            "array": [{"path": "//depot/main/a.txt"}],
+            "array": [{"approval_token": "nested-token", "path": "//depot/main/a.txt"}],
             "nested": {
                 "keep": "stable"
             }
@@ -850,10 +907,8 @@ mod tests {
         let mut with_secrets = redacted.clone();
         with_secrets.params = json!({
             "approval_token": "top-level-token",
-            "confirmation": "PROCEED",
             "array": [{
                 "approval_token": "nested-token",
-                "confirmation": "PROCEED",
                 "path": "//depot/main/a.txt"
             }],
             "nested": {
@@ -861,7 +916,6 @@ mod tests {
                 "P4PASSWD": "p4-password",
                 "P4TICKETS": "/tmp/tickets",
                 "authorization": "basic secret",
-                "confirmation": true,
                 "keep": "stable",
                 "password": "password",
                 "ticket": "ticket"
@@ -869,9 +923,47 @@ mod tests {
         });
 
         assert!(gate.digest(&with_secrets).starts_with("sha256:"));
+        assert_ne!(gate.digest(&with_secrets), gate.digest(&redacted));
+
+        redacted.params["nested"]["password"] = json!("password");
+        redacted.params["nested"]["ticket"] = json!("ticket");
+        redacted.params["nested"]["authorization"] = json!("basic secret");
+        redacted.params["nested"]["Authorization"] = json!("Bearer secret");
+        redacted.params["nested"]["P4PASSWD"] = json!("p4-password");
+        redacted.params["nested"]["P4TICKETS"] = json!("/tmp/tickets");
         assert_eq!(gate.digest(&with_secrets), gate.digest(&redacted));
 
         redacted.params["nested"]["keep"] = json!("changed");
         assert_ne!(gate.digest(&with_secrets), gate.digest(&redacted));
+    }
+
+    #[test]
+    fn digest_binds_arbitrary_body_fields_named_like_legacy_approval() {
+        let gate = DefaultWriteApprovalGate::new();
+        let mut first = sample_request();
+        first.params = json!({
+            "body": {
+                "confirmation": "first"
+            }
+        });
+        let mut second = first.clone();
+        second.params["body"]["confirmation"] = json!("second");
+
+        assert_ne!(gate.digest(&first), gate.digest(&second));
+    }
+
+    #[test]
+    fn digest_binds_secret_field_values_without_omitting_them() {
+        let gate = DefaultWriteApprovalGate::new();
+        let mut first = sample_request();
+        first.params = json!({
+            "body": {
+                "password": "first"
+            }
+        });
+        let mut second = first.clone();
+        second.params["body"]["password"] = json!("second");
+
+        assert_ne!(gate.digest(&first), gate.digest(&second));
     }
 }

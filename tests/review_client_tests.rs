@@ -1,6 +1,6 @@
 use p4mcp_server_rs::tools::reviews::{ReviewAction, ReviewHttpClient, ReviewRequest};
 use schemars::JsonSchema;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn schema_has_property<T: JsonSchema>(name: &str) -> bool {
@@ -117,24 +117,9 @@ async fn execute_list_sends_get_with_query_and_basic_auth() {
 }
 
 #[tokio::test]
-async fn execute_vote_sends_post_json_and_basic_auth() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v11/reviews/123/vote"))
-        .and(header("authorization", "Basic dXNlcjp0aWNrZXQ="))
-        .and(body_json(serde_json::json!({
-            "vote": "up",
-            "version": 2
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "ok": true
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
+async fn execute_vote_rejects_write_without_approval() {
     let client = ReviewHttpClient::new(
-        format!("{}/api/v11", server.uri()),
+        "https://swarm.example.com/api/v11".into(),
         "user".into(),
         "ticket".into(),
         false,
@@ -148,9 +133,10 @@ async fn execute_vote_sends_post_json_and_basic_auth() {
         approval_token: None,
     };
 
-    let result = client.execute(&request).await.unwrap();
+    let error = client.execute(&request).await.unwrap_err().to_string();
 
-    assert_eq!(result, serde_json::json!({ "ok": true }));
+    assert!(error.contains("requires MCP write approval"));
+    assert!(!error.contains("ticket"));
 }
 
 #[tokio::test]
