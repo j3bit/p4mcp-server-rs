@@ -4,6 +4,21 @@ Rust port of Perforce P4 MCP Server.
 
 This binary talks to the local `p4` CLI. It does not embed Python, P4Python, or a Perforce server.
 
+## Upstream Baseline
+
+This port is compared against `perforce/p4mcp-server` `v2026.2.2955897` at commit
+`a64efb07511b2a62db41aeed110ab96744c4076a`, checked on 2026-06-14.
+The functional tool surface should follow that upstream baseline unless this README
+or a file under `docs/` explicitly documents a Rust-port extension.
+
+Documented Rust-port safety extension: when write tools are enabled, every
+`modify_*` tool must pass the server-side write approval gate before any `p4`
+command or review write request is executed. The preferred path is MCP
+elicitation from the client UI; clients without elicitation support use a
+same-request one-time fallback token flow. This is intentionally stricter than
+the upstream Python server's destructive-operation prompts, and it replaces any
+model-supplied confirmation field.
+
 ## Development
 
 ```bash
