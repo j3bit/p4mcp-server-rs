@@ -214,6 +214,47 @@ async fn query_workspaces_list_by_user_calls_injected_executor() {
 }
 
 #[tokio::test]
+async fn query_files_grep_caps_records_by_max_results() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: vec![
+            json!({"depotFile": "//depot/main/a.rs", "line": "1"}),
+            json!({"depotFile": "//depot/main/b.rs", "line": "2"}),
+            json!({"depotFile": "//depot/main/c.rs", "line": "3"}),
+        ],
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_files(Parameters(QueryFilesParams {
+            action: FileQueryAction::Grep,
+            file_path: "//depot/main/...".to_string(),
+            file2: None,
+            diff2: true,
+            max_results: 2,
+            pattern: Some("needle".to_string()),
+            case_insensitive: true,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "grep");
+    assert_eq!(
+        response.0.message,
+        json!([
+            {"depotFile": "//depot/main/a.rs", "line": "1"},
+            {"depotFile": "//depot/main/b.rs", "line": "2"},
+        ])
+    );
+    assert_eq!(executor.invocations().len(), 1);
+    assert_eq!(
+        executor.invocations()[0].args,
+        ["grep", "-n", "-i", "-e", "needle", "//depot/main/..."]
+    );
+}
+
+#[tokio::test]
 async fn query_reviews_returns_dry_run_request_metadata() {
     let server = P4McpServer::new(test_config());
 

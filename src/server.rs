@@ -32,7 +32,10 @@ use crate::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::build_job_query_invocation,
-        params::{CommonModifyParams, CommonQueryParams, ModifyFilesParams, QueryFilesParams},
+        params::{
+            CommonModifyParams, CommonQueryParams, FileQueryAction, ModifyFilesParams,
+            QueryFilesParams,
+        },
         response::ToolResponse,
         reviews::{BuiltReviewRequest, ReviewRequest},
         server::{ServerQueryAction, build_server_invocation},
@@ -560,8 +563,16 @@ impl P4McpServer {
             .check(Access::Read, Toolset::Files, "query_files")
             .map_err(to_mcp_error)?;
         let action = params.action.as_str();
+        let grep_max_results =
+            (params.action == FileQueryAction::Grep).then_some(params.max_results as usize);
         let invocation = build_file_invocation(&params).map_err(to_mcp_error)?;
-        self.call_p4_tool(action, invocation).await
+        let output = self.run_p4(invocation).await?;
+        let message = if let Some(max_results) = grep_max_results {
+            output_message_with_record_limit(output, max_results)
+        } else {
+            output_message(output)
+        };
+        Ok(Json(ToolResponse::success(action, message)))
     }
 
     #[tool(
@@ -835,6 +846,15 @@ fn output_message(output: P4CommandOutput) -> Value {
     if output.records.is_empty() {
         output.text
     } else {
+        Value::Array(output.records)
+    }
+}
+
+fn output_message_with_record_limit(mut output: P4CommandOutput, max_records: usize) -> Value {
+    if output.records.is_empty() {
+        output.text
+    } else {
+        output.records.truncate(max_records);
         Value::Array(output.records)
     }
 }
