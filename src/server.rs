@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use rmcp::{
-    ErrorData, Json, ServerHandler, ServiceExt,
+    ErrorData, Json, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -161,18 +161,297 @@ impl P4McpServer {
             action: action.clone(),
             params: serde_json::to_value(approval_params)
                 .expect("modify files params serialize to JSON"),
-            preview: ApprovalPreview {
-                summary: approval_summary(&action, &targets),
-                tool: "modify_files".to_string(),
-                action,
+            preview: self.p4_approval_preview(
+                "modify_files",
+                &action,
                 targets,
-                changelist: Some(params.changelist.clone()),
-                workspace: None,
-                stream: None,
-                review: None,
-                command: Some(command_preview(&self.config.p4_bin, invocation)),
-                request: None,
-            },
+                Some(params.changelist.clone()),
+                None,
+                None,
+                invocation,
+            ),
+        }
+    }
+
+    async fn modify_changelists_inner(
+        &self,
+        params: CommonModifyParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Changelists, "modify_changelists")
+            .map_err(to_mcp_error)?;
+        let changelist_id = match params.action.as_str() {
+            "create" => "new".to_string(),
+            "update" | "submit" | "delete" => required_option(
+                params.changelist_id.as_deref(),
+                "changelist_id",
+                &params.action,
+            )?,
+            other => return Err(to_mcp_error(unknown_action(other))),
+        };
+        let stdin = params.form.clone().or_else(|| {
+            params.description.as_ref().map(|description| {
+                if params.action == "create" {
+                    change_form(description, &params.files)
+                } else {
+                    change_form_for(&changelist_id, description, &params.files)
+                }
+            })
+        });
+        let invocation = build_changelist_modify_invocation(&params.action, &changelist_id, stdin)
+            .map_err(to_mcp_error)?;
+        let request = self.common_modify_approval_request(
+            "modify_changelists",
+            &params,
+            params.files.clone(),
+            Some(changelist_id),
+            None,
+            None,
+            &invocation,
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&params.action, invocation).await
+    }
+
+    async fn modify_shelves_inner(
+        &self,
+        params: CommonModifyParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Shelves, "modify_shelves")
+            .map_err(to_mcp_error)?;
+        let change = required_option(
+            params.changelist_id.as_deref(),
+            "changelist_id",
+            &params.action,
+        )?;
+        let args = match params.action.as_str() {
+            "shelve" => vec!["shelve".to_string(), "-c".to_string(), change.clone()],
+            "unshelve" => vec!["unshelve".to_string(), "-s".to_string(), change.clone()],
+            "delete" => {
+                vec![
+                    "shelve".to_string(),
+                    "-d".to_string(),
+                    "-c".to_string(),
+                    change.clone(),
+                ]
+            }
+            other => return Err(to_mcp_error(unknown_action(other))),
+        };
+        let invocation = json_invocation(args, None);
+        let request = self.common_modify_approval_request(
+            "modify_shelves",
+            &params,
+            params.files.clone(),
+            Some(change),
+            None,
+            None,
+            &invocation,
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&params.action, invocation).await
+    }
+
+    async fn modify_workspaces_inner(
+        &self,
+        params: CommonModifyParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Workspaces, "modify_workspaces")
+            .map_err(to_mcp_error)?;
+        let (args, stdin, workspace) = match params.action.as_str() {
+            "create" | "update" => (
+                vec!["client".to_string(), "-i".to_string()],
+                Some(required_form(params.form.as_deref(), &params.action)?),
+                params.workspace_name.clone(),
+            ),
+            "delete" => {
+                let workspace_name =
+                    required_option(params.workspace_name.as_deref(), "workspace_name", "delete")?;
+                (
+                    vec![
+                        "client".to_string(),
+                        "-d".to_string(),
+                        workspace_name.clone(),
+                    ],
+                    None,
+                    Some(workspace_name),
+                )
+            }
+            other => return Err(to_mcp_error(unknown_action(other))),
+        };
+        let invocation = json_invocation(args, stdin);
+        let targets = workspace.iter().cloned().collect();
+        let request = self.common_modify_approval_request(
+            "modify_workspaces",
+            &params,
+            targets,
+            None,
+            workspace,
+            None,
+            &invocation,
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&params.action, invocation).await
+    }
+
+    async fn modify_jobs_inner(
+        &self,
+        params: CommonModifyParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Jobs, "modify_jobs")
+            .map_err(to_mcp_error)?;
+        let change = required_option(
+            params.changelist_id.as_deref(),
+            "changelist_id",
+            &params.action,
+        )?;
+        let job = params
+            .files
+            .first()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| to_mcp_error(invalid_input("files[0] must contain the job id")))?;
+        let args = match params.action.as_str() {
+            "fix" => vec!["fix".to_string(), "-c".to_string(), change.clone(), job],
+            "unfix" => vec![
+                "fix".to_string(),
+                "-d".to_string(),
+                "-c".to_string(),
+                change.clone(),
+                job,
+            ],
+            other => return Err(to_mcp_error(unknown_action(other))),
+        };
+        let invocation = json_invocation(args, None);
+        let request = self.common_modify_approval_request(
+            "modify_jobs",
+            &params,
+            params.files.clone(),
+            Some(change),
+            None,
+            None,
+            &invocation,
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&params.action, invocation).await
+    }
+
+    async fn modify_streams_inner(
+        &self,
+        params: CommonModifyParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Streams, "modify_streams")
+            .map_err(to_mcp_error)?;
+        let (args, stdin, stream) = match params.action.as_str() {
+            "create" | "update" => (
+                vec!["stream".to_string(), "-i".to_string()],
+                Some(required_form(params.form.as_deref(), &params.action)?),
+                params.stream.clone(),
+            ),
+            "delete" => {
+                let stream = required_option(params.stream.as_deref(), "stream", "delete")?;
+                (
+                    vec!["stream".to_string(), "-d".to_string(), stream.clone()],
+                    None,
+                    Some(stream),
+                )
+            }
+            other => return Err(to_mcp_error(unknown_action(other))),
+        };
+        let invocation = json_invocation(args, stdin);
+        let targets = stream.iter().cloned().collect();
+        let request = self.common_modify_approval_request(
+            "modify_streams",
+            &params,
+            targets,
+            None,
+            None,
+            stream,
+            &invocation,
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&params.action, invocation).await
+    }
+
+    fn common_modify_approval_request(
+        &self,
+        tool: &str,
+        params: &CommonModifyParams,
+        targets: Vec<String>,
+        changelist: Option<String>,
+        workspace: Option<String>,
+        stream: Option<String>,
+        invocation: &P4Invocation,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let action = params.action.clone();
+
+        ApprovalRequest {
+            tool: tool.to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params)
+                .expect("common modify params serialize to JSON"),
+            preview: self.p4_approval_preview(
+                tool, &action, targets, changelist, workspace, stream, invocation,
+            ),
+        }
+    }
+
+    fn p4_approval_preview(
+        &self,
+        tool: &str,
+        action: &str,
+        targets: Vec<String>,
+        changelist: Option<String>,
+        workspace: Option<String>,
+        stream: Option<String>,
+        invocation: &P4Invocation,
+    ) -> ApprovalPreview {
+        ApprovalPreview {
+            summary: approval_summary(action, &targets),
+            tool: tool.to_string(),
+            action: action.to_string(),
+            targets,
+            changelist,
+            workspace,
+            stream,
+            review: None,
+            command: Some(command_preview(&self.config.p4_bin, invocation)),
+            request: None,
         }
     }
 }
@@ -210,9 +489,10 @@ impl P4McpServer {
     #[tool(description = "Modify Perforce files")]
     pub async fn modify_files(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ModifyFilesParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.modify_files_inner(params, ApprovalChannel::FallbackOnly)
+        self.modify_files_inner(params, ApprovalChannel::Elicitation(peer))
             .await
     }
 
@@ -238,32 +518,11 @@ impl P4McpServer {
     #[tool(description = "Create, update, submit, or delete changelists")]
     pub async fn modify_changelists(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CommonModifyParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Changelists, "modify_changelists")
-            .map_err(to_mcp_error)?;
-        let changelist_id = match params.action.as_str() {
-            "create" => "new".to_string(),
-            "update" | "submit" | "delete" => required_option(
-                params.changelist_id.as_deref(),
-                "changelist_id",
-                &params.action,
-            )?,
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        let stdin = params.form.clone().or_else(|| {
-            params.description.as_ref().map(|description| {
-                if params.action == "create" {
-                    change_form(description, &params.files)
-                } else {
-                    change_form_for(&changelist_id, description, &params.files)
-                }
-            })
-        });
-        let invocation = build_changelist_modify_invocation(&params.action, &changelist_id, stdin)
-            .map_err(to_mcp_error)?;
-        self.call_p4_tool(&params.action, invocation).await
+        self.modify_changelists_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
     }
 
     #[tool(description = "List shelves, show shelf diff, or list shelf files")]
@@ -287,30 +546,10 @@ impl P4McpServer {
     #[tool(description = "Shelve, unshelve, or delete shelved files")]
     pub async fn modify_shelves(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CommonModifyParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Shelves, "modify_shelves")
-            .map_err(to_mcp_error)?;
-        let change = required_option(
-            params.changelist_id.as_deref(),
-            "changelist_id",
-            &params.action,
-        )?;
-        let args = match params.action.as_str() {
-            "shelve" => vec!["shelve".to_string(), "-c".to_string(), change],
-            "unshelve" => vec!["unshelve".to_string(), "-s".to_string(), change],
-            "delete" => {
-                vec![
-                    "shelve".to_string(),
-                    "-d".to_string(),
-                    "-c".to_string(),
-                    change,
-                ]
-            }
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        self.call_p4_tool(&params.action, json_invocation(args, None))
+        self.modify_shelves_inner(params, ApprovalChannel::Elicitation(peer))
             .await
     }
 
@@ -335,27 +574,10 @@ impl P4McpServer {
     #[tool(description = "Create, update, or delete workspaces using p4 client forms")]
     pub async fn modify_workspaces(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CommonModifyParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Workspaces, "modify_workspaces")
-            .map_err(to_mcp_error)?;
-        let (args, stdin) = match params.action.as_str() {
-            "create" | "update" => (
-                vec!["client".to_string(), "-i".to_string()],
-                Some(required_form(params.form.as_deref(), &params.action)?),
-            ),
-            "delete" => {
-                let workspace_name =
-                    required_option(params.workspace_name.as_deref(), "workspace_name", "delete")?;
-                (
-                    vec!["client".to_string(), "-d".to_string(), workspace_name],
-                    None,
-                )
-            }
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        self.call_p4_tool(&params.action, json_invocation(args, stdin))
+        self.modify_workspaces_inner(params, ApprovalChannel::Elicitation(peer))
             .await
     }
 
@@ -380,34 +602,10 @@ impl P4McpServer {
     #[tool(description = "Attach or detach jobs from changelists")]
     pub async fn modify_jobs(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CommonModifyParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Jobs, "modify_jobs")
-            .map_err(to_mcp_error)?;
-        let change = required_option(
-            params.changelist_id.as_deref(),
-            "changelist_id",
-            &params.action,
-        )?;
-        let job = params
-            .files
-            .first()
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .ok_or_else(|| to_mcp_error(invalid_input("files[0] must contain the job id")))?;
-        let args = match params.action.as_str() {
-            "fix" => vec!["fix".to_string(), "-c".to_string(), change, job],
-            "unfix" => vec![
-                "fix".to_string(),
-                "-d".to_string(),
-                "-c".to_string(),
-                change,
-                job,
-            ],
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        self.call_p4_tool(&params.action, json_invocation(args, None))
+        self.modify_jobs_inner(params, ApprovalChannel::Elicitation(peer))
             .await
     }
 
@@ -434,23 +632,10 @@ impl P4McpServer {
     #[tool(description = "Create, update, or delete stream specs")]
     pub async fn modify_streams(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CommonModifyParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        self.policy()
-            .check(Access::Write, Toolset::Streams, "modify_streams")
-            .map_err(to_mcp_error)?;
-        let (args, stdin) = match params.action.as_str() {
-            "create" | "update" => (
-                vec!["stream".to_string(), "-i".to_string()],
-                Some(required_form(params.form.as_deref(), &params.action)?),
-            ),
-            "delete" => {
-                let stream = required_option(params.stream.as_deref(), "stream", "delete")?;
-                (vec!["stream".to_string(), "-d".to_string(), stream], None)
-            }
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        self.call_p4_tool(&params.action, json_invocation(args, stdin))
+        self.modify_streams_inner(params, ApprovalChannel::Elicitation(peer))
             .await
     }
 
@@ -681,6 +866,19 @@ mod tests {
         }
     }
 
+    fn common_modify_params(action: &str) -> CommonModifyParams {
+        CommonModifyParams {
+            action: action.to_string(),
+            changelist_id: None,
+            workspace_name: None,
+            stream: None,
+            description: None,
+            files: Vec::new(),
+            form: None,
+            approval_token: None,
+        }
+    }
+
     #[tokio::test]
     async fn modify_files_without_approval_does_not_call_executor() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
@@ -755,6 +953,262 @@ mod tests {
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_files_edit_preview_includes_p4_edit() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_files_params(None);
+        params.action = FileModifyAction::Edit;
+        params.force = false;
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "edit".to_string(),
+                "-c".to_string(),
+                "default".to_string(),
+                "//depot/main/file.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("submit");
+        params.changelist_id = Some("123".to_string());
+        params.files = vec!["//depot/main/file.txt".to_string()];
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_changelists");
+        assert_eq!(calls[0].request.action, "submit");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.tool, "modify_changelists");
+        assert_eq!(calls[0].request.preview.action, "submit");
+        assert_eq!(calls[0].request.preview.targets, ["//depot/main/file.txt"]);
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "submit".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_shelves_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("delete");
+        params.changelist_id = Some("123".to_string());
+        params.files = vec!["//depot/main/file.txt".to_string()];
+
+        let response = server
+            .modify_shelves_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_shelves");
+        assert_eq!(calls[0].request.action, "delete");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//depot/main/file.txt"]);
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "shelve".to_string(),
+                "-d".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("delete");
+        params.workspace_name = Some("ws-main".to_string());
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_workspaces");
+        assert_eq!(calls[0].request.action, "delete");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+        assert_eq!(
+            calls[0].request.preview.workspace.as_deref(),
+            Some("ws-main")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "client".to_string(),
+                "-d".to_string(),
+                "ws-main".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_jobs_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Job": "job000001"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("fix");
+        params.changelist_id = Some("123".to_string());
+        params.files = vec!["job000001".to_string()];
+
+        let response = server
+            .modify_jobs_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_jobs");
+        assert_eq!(calls[0].request.action, "fix");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["job000001"]);
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "fix".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "job000001".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("delete");
+        params.stream = Some("//streams/dev".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "delete");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//streams/dev"]);
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/dev")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "stream".to_string(),
+                "-d".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]
