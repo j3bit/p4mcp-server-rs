@@ -520,11 +520,27 @@ fn shelf_diff_blank_changelist_errors() {
 }
 
 #[test]
-fn workspace_where_errors() {
-    let error = build_workspace_query_invocation("where", None, Some("//depot/main/file.rs"), 10)
+fn workspace_where_is_rejected_as_deferred_extension() {
+    let error = build_workspace_query_invocation("where", None, None, 10)
         .unwrap_err()
         .to_string();
     assert!(error.contains("unknown action: where"));
+}
+
+#[test]
+fn workspace_opened_is_rejected_as_deferred_extension() {
+    let error = build_workspace_query_invocation("opened", Some("ws-main"), None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown action: opened"));
+}
+
+#[test]
+fn workspace_changes_is_rejected_as_deferred_extension() {
+    let error = build_workspace_query_invocation("changes", Some("ws-main"), None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown action: changes"));
 }
 
 #[test]
