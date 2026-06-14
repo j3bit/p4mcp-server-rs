@@ -249,7 +249,7 @@ impl P4McpServer {
             "changelist_id",
             &params.action,
         )?;
-        let args = match params.action.as_str() {
+        let mut args = match params.action.as_str() {
             "shelve" => vec!["shelve".to_string(), "-c".to_string(), change.clone()],
             "unshelve" => vec!["unshelve".to_string(), "-s".to_string(), change.clone()],
             "delete" => {
@@ -262,6 +262,7 @@ impl P4McpServer {
             }
             other => return Err(to_mcp_error(unknown_action(other))),
         };
+        args.extend(params.files.iter().cloned());
         let invocation = json_invocation(args, None);
         let request = self.common_modify_approval_request(
             &params,
@@ -1223,6 +1224,64 @@ mod tests {
                 "-d".to_string(),
                 "-c".to_string(),
                 "123".to_string(),
+                "//depot/main/file.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_shelves_delete_after_approval_passes_file_paths_to_p4() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("delete");
+        params.changelist_id = Some("123".to_string());
+        params.files = vec![
+            "//depot/main/file.txt".to_string(),
+            "//depot/main/other.txt".to_string(),
+        ];
+
+        let response = server
+            .modify_shelves_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved shelf delete should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "delete");
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            [
+                "shelve",
+                "-d",
+                "-c",
+                "123",
+                "//depot/main/file.txt",
+                "//depot/main/other.txt",
+            ]
+        );
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "shelve".to_string(),
+                "-d".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/file.txt".to_string(),
+                "//depot/main/other.txt".to_string(),
             ])
         );
     }
