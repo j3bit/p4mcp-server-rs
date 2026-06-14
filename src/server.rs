@@ -200,7 +200,7 @@ impl P4McpServer {
             .map_err(to_mcp_error)?;
         let changelist_id = match params.action.as_str() {
             "create" => "new".to_string(),
-            "update" | "submit" | "delete" => required_option(
+            "update" | "submit" | "delete" | "move_files" => required_option(
                 params.changelist_id.as_deref(),
                 "changelist_id",
                 &params.action,
@@ -228,7 +228,7 @@ impl P4McpServer {
             P4ApprovalContext {
                 tool: "modify_changelists",
                 action: &params.action,
-                targets: changelist_targets(&changelist_id),
+                targets: changelist_modify_targets(&params.action, &changelist_id, &params.files),
                 changelist: Some(changelist_id),
                 workspace: None,
                 stream: None,
@@ -890,6 +890,14 @@ fn changelist_targets(changelist_id: &str) -> Vec<String> {
     vec![format!("changelist:{changelist_id}")]
 }
 
+fn changelist_modify_targets(action: &str, changelist_id: &str, files: &[String]) -> Vec<String> {
+    let mut targets = changelist_targets(changelist_id);
+    if action == "move_files" {
+        targets.extend(files.iter().cloned());
+    }
+    targets
+}
+
 fn shelf_targets(changelist_id: &str) -> Vec<String> {
     vec![format!("shelf:{changelist_id}")]
 }
@@ -1209,6 +1217,107 @@ mod tests {
                 "123".to_string(),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_move_files_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/a.rs"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("move_files");
+        params.changelist_id = Some("123".to_string());
+        params.files = vec![
+            "//depot/main/a.rs".to_string(),
+            "//depot/main/b.rs".to_string(),
+        ];
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_changelists");
+        assert_eq!(calls[0].request.action, "move_files");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(
+            calls[0].request.preview.targets,
+            ["changelist:123", "//depot/main/a.rs", "//depot/main/b.rs",]
+        );
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "reopen".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/a.rs".to_string(),
+                "//depot/main/b.rs".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_move_files_after_approval_reopens_files() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/a.rs"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = common_modify_params("move_files");
+        params.changelist_id = Some("123".to_string());
+        params.files = vec![
+            "//depot/main/a.rs".to_string(),
+            "//depot/main/b.rs".to_string(),
+        ];
+        params.approval_token = Some("approved-token".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved write should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "move_files");
+        assert_eq!(
+            response.0.message,
+            json!([{"depotFile": "//depot/main/a.rs"}])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            [
+                "reopen",
+                "-c",
+                "123",
+                "//depot/main/a.rs",
+                "//depot/main/b.rs",
+            ]
+        );
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
     }
 
     #[tokio::test]
