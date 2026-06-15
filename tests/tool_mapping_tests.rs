@@ -1047,6 +1047,31 @@ AltRoots:
 }
 
 #[test]
+fn patch_stream_workspace_form_clears_explicit_empty_alt_roots() {
+    let existing = "\
+Client: old-client
+Root: /old/root
+
+AltRoots:
+\t/old/alt
+";
+    let patch = StreamWorkspaceFormPatch {
+        client: None,
+        root: None,
+        stream: None,
+        description: None,
+        options: None,
+        host: None,
+        alt_roots: Some(Vec::new()),
+    };
+
+    let patched = patch_stream_workspace_form(existing, &patch).unwrap();
+
+    assert!(patched.contains("AltRoots:\n\t\n"));
+    assert!(!patched.contains("/old/alt"));
+}
+
+#[test]
 fn workspace_where_is_rejected_as_deferred_extension() {
     let error = build_workspace_query_invocation("where", None, None, 10)
         .unwrap_err()

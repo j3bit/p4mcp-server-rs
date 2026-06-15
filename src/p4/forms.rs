@@ -115,9 +115,7 @@ pub fn patch_stream_workspace_form(
     if let Some(host) = &patch.host {
         patched = replace_single_line_field(&patched, "Host", host);
     }
-    if let Some(alt_roots) = &patch.alt_roots
-        && !alt_roots.is_empty()
-    {
+    if let Some(alt_roots) = &patch.alt_roots {
         patched = replace_list_block(&patched, "AltRoots", alt_roots);
     }
     Ok(patched)

@@ -2851,6 +2851,68 @@ Files:
     }
 
     #[tokio::test]
+    async fn modify_streams_update_fetches_and_saves_stream_form_after_approval() {
+        let existing_form = "\
+Stream: //streams/dev
+Name: old name
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.name = Some("Dev".to_string());
+        params.description = Some("new description".to_string());
+        params.options = Some("ownersubmit unlocked toparent fromparent".to_string());
+        params.paths = Some(vec![
+            "share ...".to_string(),
+            "isolate generated/...".to_string(),
+        ]);
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved stream update should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[0].mode, OutputMode::Text);
+        assert_eq!(invocations[1].args, ["stream", "-i"]);
+        let saved_form = invocations[1]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(saved_form.contains("Stream: //streams/dev"));
+        assert!(saved_form.contains("Name: Dev"));
+        assert!(saved_form.contains("Description:\n\tnew description"));
+        assert!(saved_form.contains("Options: ownersubmit unlocked toparent fromparent"));
+        assert!(saved_form.contains("Paths:\n\tshare ...\n\tisolate generated/..."));
+    }
+
+    #[tokio::test]
     async fn modify_streams_create_workspace_previews_client_i_without_fetching_form() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"Client": "ws-main"})],
