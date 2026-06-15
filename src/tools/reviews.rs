@@ -59,6 +59,116 @@ pub struct BuiltReviewRequest {
     pub body: Value,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReviewApiConfig {
+    pub api_base: String,
+    pub username: String,
+    pub ticket: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TicketEntry {
+    server: String,
+    user: String,
+    ticket: String,
+}
+
+impl ReviewApiConfig {
+    pub fn from_p4(
+        info_records: &[Value],
+        property_records: &[Value],
+        tickets_stdout: &str,
+    ) -> Result<Self> {
+        let username = first_non_empty_field(info_records, &["userName", "User", "user"])
+            .ok_or_else(|| P4McpError::P4Command {
+                message: "failed to determine current P4 user".to_string(),
+            })?;
+        let server = first_non_empty_field(info_records, &["serverAddress", "serverUri"]);
+        let swarm_url = first_non_empty_field(property_records, &["value"]).ok_or_else(|| {
+            P4McpError::P4Command {
+                message: "Swarm URL not configured on the server".to_string(),
+            }
+        })?;
+        let ticket = ticket_for_user(tickets_stdout, &username, server.as_deref())?;
+
+        Ok(Self {
+            api_base: format!("{}/api/v11", swarm_url.trim_end_matches('/')),
+            username,
+            ticket,
+        })
+    }
+}
+
+fn first_non_empty_field(records: &[Value], fields: &[&str]) -> Option<String> {
+    records.iter().find_map(|record| {
+        fields.iter().find_map(|field| {
+            record
+                .get(*field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn ticket_for_user(stdout: &str, username: &str, server: Option<&str>) -> Result<String> {
+    let entries: Vec<TicketEntry> = stdout
+        .lines()
+        .filter_map(parse_ticket_line)
+        .filter(|entry| entry.user == username)
+        .collect();
+
+    if let Some(server) = server {
+        let exact_matches: Vec<&TicketEntry> = entries
+            .iter()
+            .filter(|entry| entry.server == server)
+            .collect();
+        match exact_matches.as_slice() {
+            [entry] => return Ok(entry.ticket.clone()),
+            [_, ..] => {
+                return Err(P4McpError::P4Command {
+                    message: format!(
+                        "multiple P4 tickets found for user {username}; configure a matching P4PORT or run p4 login for the active server"
+                    ),
+                });
+            }
+            [] => {}
+        }
+    }
+
+    match entries.as_slice() {
+        [entry] => Ok(entry.ticket.clone()),
+        [] => Err(P4McpError::P4Command {
+            message: format!("No P4 ticket found for user {username}. Please run p4 login first."),
+        }),
+        _ => Err(P4McpError::P4Command {
+            message: format!(
+                "multiple P4 tickets found for user {username}; configure a matching P4PORT or run p4 login for the active server"
+            ),
+        }),
+    }
+}
+
+fn parse_ticket_line(line: &str) -> Option<TicketEntry> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (server, rest) = line.split_once(" (")?;
+    let (user, ticket_and_suffix) = rest.split_once(") ")?;
+    let ticket = ticket_and_suffix.split_whitespace().next()?;
+    if server.is_empty() || user.is_empty() || ticket.is_empty() {
+        return None;
+    }
+
+    Some(TicketEntry {
+        server: server.to_string(),
+        user: user.to_string(),
+        ticket: ticket.to_string(),
+    })
+}
+
 impl ReviewRequest {
     pub fn to_http(&self, _api_base: &str) -> Result<BuiltReviewRequest> {
         let id = || {
