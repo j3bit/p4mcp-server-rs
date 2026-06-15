@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
@@ -11,10 +11,10 @@ use rmcp::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     approval::{
@@ -806,7 +806,7 @@ impl ServerHandler for P4McpServer {}
 
 pub async fn run_from_cli() -> Result<()> {
     let config = Cli::parse().into_config()?;
-    init_logging();
+    let _logging_guard = init_logging(config.log_dir.as_deref())?;
 
     match config.transport {
         TransportMode::Stdio => run_stdio(config).await,
@@ -936,7 +936,7 @@ fn command_preview(p4_bin: &std::path::Path, invocation: &P4Invocation) -> Vec<S
 }
 
 fn review_message(built: crate::tools::reviews::BuiltReviewRequest) -> Value {
-    serde_json::json!({
+    json!({
         "method": built.method,
         "path": built.path,
         "query": built.query,
@@ -983,17 +983,50 @@ fn to_mcp_error(error: P4McpError) -> ErrorData {
     }
 }
 
-fn init_logging() {
+#[must_use]
+struct LoggingGuard {
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+fn init_logging(log_dir: Option<&Path>) -> Result<LoggingGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    if let Some(log_dir) = log_dir {
+        let file_appender = configured_log_file(log_dir)?;
+        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer);
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .with(file_layer)
+            .try_init();
+
+        Ok(LoggingGuard {
+            _file_guard: Some(file_guard),
+        })
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .try_init();
+
+        Ok(LoggingGuard { _file_guard: None })
+    }
+}
+
+fn configured_log_file(log_dir: &Path) -> Result<tracing_appender::rolling::RollingFileAppender> {
+    std::fs::create_dir_all(log_dir)?;
+    Ok(tracing_appender::rolling::never(log_dir, "p4mcp.log"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Write,
         net::{IpAddr, Ipv4Addr},
         sync::{Arc, Mutex},
     };
@@ -1010,6 +1043,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn configured_log_file_writes_to_p4mcp_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = configured_log_file(dir.path()).unwrap();
+
+        writeln!(writer, "log-dir smoke").unwrap();
+        drop(writer);
+
+        let contents = std::fs::read_to_string(dir.path().join("p4mcp.log")).unwrap();
+        assert!(contents.contains("log-dir smoke"));
+    }
 
     fn test_config(readonly: bool) -> AppConfig {
         AppConfig {
