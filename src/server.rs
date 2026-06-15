@@ -139,6 +139,70 @@ impl P4McpServer {
         )))
     }
 
+    async fn query_workspace_status(
+        &self,
+        workspace_name: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_name =
+            require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+
+        let workspace_spec = self
+            .run_workspace_status_command(
+                json_invocation(vec!["client".into(), "-o".into(), workspace_name], None),
+                None,
+            )
+            .await?;
+        let opened = self
+            .run_workspace_status_command(json_invocation(vec!["opened".into()], None), None)
+            .await?;
+        let out_of_sync = self
+            .run_workspace_status_command(
+                json_invocation(vec!["sync".into(), "-n".into()], None),
+                Some("File(s) up-to-date"),
+            )
+            .await?;
+        let pending_resolves = self
+            .run_workspace_status_command(
+                json_invocation(vec!["resolve".into(), "-n".into()], None),
+                Some("No file(s) to resolve"),
+            )
+            .await?;
+        let synced_changes = self
+            .run_workspace_status_command(
+                json_invocation(vec!["changes".into(), "-m1".into(), "#have".into()], None),
+                None,
+            )
+            .await?;
+
+        Ok(Json(ToolResponse::success(
+            "status",
+            workspace_status_message(
+                &workspace_spec.records,
+                &opened.records,
+                &out_of_sync.records,
+                &pending_resolves.records,
+                &synced_changes.records,
+            ),
+        )))
+    }
+
+    async fn run_workspace_status_command(
+        &self,
+        invocation: P4Invocation,
+        benign_empty_message: Option<&str>,
+    ) -> McpResult<P4CommandOutput> {
+        match self.executor.run(invocation, P4Env::new()).await {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                if benign_empty_message.is_some_and(|message| error.to_string().contains(message)) {
+                    Ok(empty_p4_output())
+                } else {
+                    Err(to_mcp_error(error))
+                }
+            }
+        }
+    }
+
     async fn require_write_approval(
         &self,
         channel: ApprovalChannel,
@@ -677,7 +741,7 @@ impl P4McpServer {
     }
 
     #[tool(
-        description = "List, get, or classify workspaces",
+        description = "List, get, classify, or inspect workspace status",
         annotations(read_only_hint = true)
     )]
     pub async fn query_workspaces(
@@ -690,6 +754,11 @@ impl P4McpServer {
         if params.action == "type" {
             return self
                 .query_workspace_type(params.workspace_name.as_deref())
+                .await;
+        }
+        if params.action == "status" {
+            return self
+                .query_workspace_status(params.workspace_name.as_deref())
                 .await;
         }
         let invocation = build_workspace_query_invocation(
@@ -886,6 +955,55 @@ fn workspace_type_from_records(records: &[Value]) -> &'static str {
     }
 
     "custom"
+}
+
+fn workspace_status_message(
+    _workspace_spec: &[Value],
+    opened: &[Value],
+    out_of_sync: &[Value],
+    pending_resolves: &[Value],
+    synced_changes: &[Value],
+) -> Value {
+    json!({
+        "opened_files": collect_string_field(opened, "depotFile"),
+        "out_of_sync_files": collect_string_field(out_of_sync, "depotFile"),
+        "sync_warnings": collect_string_values(out_of_sync),
+        "pending_resolves": collect_string_field(pending_resolves, "fromFile"),
+        "last_synced_cl": synced_changes
+            .first()
+            .and_then(|record| non_empty_string_field(record, "change")),
+    })
+}
+
+fn collect_string_field(records: &[Value], field: &str) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|record| non_empty_string_field(record, field))
+        .collect()
+}
+
+fn collect_string_values(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn empty_p4_output() -> P4CommandOutput {
+    P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }
+}
+
+fn require_non_blank(value: Option<&str>, name: &str) -> std::result::Result<String, P4McpError> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => Err(invalid_input(format!("{name} is required"))),
+    }
 }
 
 fn record_has_depot_view(record: &Value) -> bool {

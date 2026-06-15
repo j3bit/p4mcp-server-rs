@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     net::{IpAddr, Ipv4Addr},
     sync::{Arc, Mutex},
 };
@@ -251,6 +252,102 @@ async fn query_workspaces_type_classifies_stream_workspace() {
 }
 
 #[tokio::test]
+async fn query_workspaces_status_runs_upstream_status_commands() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"Client": "ws-main", "View0": "//depot/... //ws-main/..."})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/open.rs"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/out-of-sync.rs"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"fromFile": "//depot/main/base.rs"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"change": "42"})],
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_workspaces(Parameters(CommonQueryParams {
+            action: "status".to_string(),
+            changelist_id: None,
+            workspace_name: Some("ws-main".to_string()),
+            file_path: None,
+            user: None,
+            status: None,
+            job_id: None,
+            stream: None,
+            owner: None,
+            max_results: 10,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "status");
+    assert_eq!(
+        response.0.message,
+        json!({
+            "opened_files": ["//depot/main/open.rs"],
+            "out_of_sync_files": ["//depot/main/out-of-sync.rs"],
+            "sync_warnings": [],
+            "pending_resolves": ["//depot/main/base.rs"],
+            "last_synced_cl": "42"
+        })
+    );
+
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 5);
+    assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
+    assert_eq!(invocations[1].args, ["opened"]);
+    assert_eq!(invocations[2].args, ["sync", "-n"]);
+    assert_eq!(invocations[3].args, ["resolve", "-n"]);
+    assert_eq!(invocations[4].args, ["changes", "-m1", "#have"]);
+}
+
+#[tokio::test]
+async fn query_workspaces_status_requires_workspace_name() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_workspaces(Parameters(CommonQueryParams {
+            action: "status".to_string(),
+            changelist_id: None,
+            workspace_name: None,
+            file_path: None,
+            user: None,
+            status: None,
+            job_id: None,
+            stream: None,
+            owner: None,
+            max_results: 10,
+        }))
+        .await
+    {
+        Ok(_) => panic!("query_workspaces status should require workspace_name"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("workspace_name is required"));
+    assert!(executor.invocations().is_empty());
+}
+
+#[tokio::test]
 async fn query_files_grep_caps_records_by_max_results() {
     let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
         records: vec![
@@ -416,5 +513,50 @@ impl P4Executor for FakeExecutor {
             }),
             FakeResult::Failure(_) => unreachable!("fake executor only emits p4 command failures"),
         }
+    }
+}
+
+struct QueuedExecutor {
+    outputs: Mutex<VecDeque<Result<P4CommandOutput, P4McpError>>>,
+    invocations: Mutex<Vec<P4Invocation>>,
+}
+
+impl QueuedExecutor {
+    fn success(outputs: Vec<P4CommandOutput>) -> Self {
+        Self {
+            outputs: Mutex::new(outputs.into_iter().map(Ok).collect()),
+            invocations: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn invocations(&self) -> Vec<P4Invocation> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait]
+impl P4Executor for QueuedExecutor {
+    async fn run(
+        &self,
+        invocation: P4Invocation,
+        _env: P4Env,
+    ) -> Result<P4CommandOutput, P4McpError> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(invocation);
+
+        self.outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+            .unwrap_or_else(|| {
+                Err(P4McpError::P4Command {
+                    message: "queued executor exhausted".to_string(),
+                })
+            })
     }
 }
