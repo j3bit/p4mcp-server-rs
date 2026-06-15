@@ -599,6 +599,11 @@ impl P4McpServer {
             .check(Access::Write, Toolset::Reviews, "modify_reviews")
             .map_err(to_mcp_error)?;
         let built = params.to_http("unused").map_err(to_mcp_error)?;
+        if built.method == "GET" {
+            return Err(to_mcp_error(invalid_input(
+                "modify_reviews only supports write review actions",
+            )));
+        }
         let request = self.modify_reviews_approval_request(&params, &built);
         if let Some(response) = self
             .require_write_approval(channel, request, params.approval_token.as_deref())
@@ -606,10 +611,13 @@ impl P4McpServer {
         {
             return Ok(response);
         }
-        Ok(Json(ToolResponse::dry_run(
-            "modify_reviews",
-            review_message(built),
-        )))
+        let action = review_action_name(&params);
+        let client = self.review_http_client_from_p4().await?;
+        let message = client
+            .execute_approved(&params)
+            .await
+            .map_err(review_api_error)?;
+        Ok(Json(ToolResponse::success(&action, message)))
     }
 
     fn modify_reviews_approval_request(
@@ -1155,15 +1163,6 @@ fn command_preview(p4_bin: &std::path::Path, invocation: &P4Invocation) -> Vec<S
     command
 }
 
-fn review_message(built: crate::tools::reviews::BuiltReviewRequest) -> Value {
-    json!({
-        "method": built.method,
-        "path": built.path,
-        "query": built.query,
-        "body": built.body,
-    })
-}
-
 fn required_option(value: Option<&str>, name: &str, action: &str) -> McpResult<String> {
     match value {
         Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
@@ -1250,6 +1249,7 @@ fn configured_log_file(log_dir: &Path) -> Result<tracing_appender::rolling::Roll
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         io::Write,
         net::{IpAddr, Ipv4Addr},
         sync::{Arc, Mutex},
@@ -1257,6 +1257,8 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::{
         approval::{ApprovalChannel, ApprovalDecision, ApprovalRequest, WriteApprovalGate},
@@ -1929,11 +1931,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modify_reviews_after_approval_returns_request_metadata() {
-        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-            records: Vec::new(),
-            text: json!({}),
-        }));
+    async fn modify_reviews_after_approval_executes_review_api_request() {
+        let swarm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v11/reviews/123/vote"))
+            .and(header("authorization", "Basic YWxpY2U6dGlja2V0LTEyMw=="))
+            .and(body_json(json!({"vote": "up", "version": 2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "vote": "recorded"
+            })))
+            .expect(1)
+            .mount(&swarm)
+            .await;
+
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "userName": "alice",
+                    "serverAddress": "perforce:1666"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({
+                    "value": swarm.uri()
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "perforce:1666 (alice) ticket-123\n",
+                    "stderr": ""
+                }),
+            },
+        ]));
         let approval_gate = Arc::new(FakeApprovalGate::approved());
         let server = P4McpServer::with_executor_and_approval(
             test_config(false),
@@ -1947,17 +1979,20 @@ mod tests {
                 ApprovalChannel::FallbackOnly,
             )
             .await
-            .expect("approved review write should return dry-run metadata");
+            .expect("approved review write should execute");
 
-        assert_eq!(response.0.status, "dry_run");
-        assert_eq!(response.0.action, "modify_reviews");
-        assert_eq!(response.0.message["method"], "POST");
-        assert_eq!(response.0.message["path"], "/reviews/123/vote");
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "vote");
+        assert_eq!(response.0.message, json!({"vote": "recorded"}));
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].args, ["info"]);
         assert_eq!(
-            response.0.message["body"],
-            json!({"vote": "up", "version": 2})
+            invocations[1].args,
+            ["property", "-l", "-n", "P4.Swarm.URL"]
         );
-        assert!(executor.invocations().is_empty());
+        assert_eq!(invocations[2].args, ["tickets"]);
 
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
@@ -2001,6 +2036,45 @@ mod tests {
                 .map(|request| (request.method.as_str(), request.path.as_str(),)),
             Some(("POST", "/reviews/123/vote"))
         );
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_rejects_read_actions_after_policy_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let err = match server
+            .modify_reviews_inner(
+                ReviewRequest {
+                    action: ReviewAction::List,
+                    review_id: None,
+                    max_results: 10,
+                    body: json!({}),
+                    approval_token: Some("approved-token".to_string()),
+                },
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+        {
+            Ok(_) => panic!("modify_reviews should reject read review actions"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("modify_reviews only supports write review actions")
+        );
+        assert!(approval_gate.calls().is_empty());
+        assert!(executor.invocations().is_empty());
     }
 
     #[tokio::test]
@@ -2085,6 +2159,51 @@ mod tests {
                     approval_token: approval_token.map(str::to_string),
                 });
             Ok(self.decision.clone())
+        }
+    }
+
+    struct QueuedExecutor {
+        outputs: Mutex<VecDeque<crate::error::Result<P4CommandOutput>>>,
+        invocations: Mutex<Vec<P4Invocation>>,
+    }
+
+    impl QueuedExecutor {
+        fn success(outputs: Vec<P4CommandOutput>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().map(Ok).collect()),
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> Vec<P4Invocation> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl P4Executor for QueuedExecutor {
+        async fn run(
+            &self,
+            invocation: P4Invocation,
+            _env: P4Env,
+        ) -> crate::error::Result<P4CommandOutput> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(invocation);
+
+            self.outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(P4McpError::P4Command {
+                        message: "queued executor exhausted".to_string(),
+                    })
+                })
         }
     }
 
