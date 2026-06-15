@@ -10,6 +10,17 @@ pub struct WorkspaceFormPatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamWorkspaceFormPatch {
+    pub client: Option<String>,
+    pub root: Option<String>,
+    pub stream: Option<String>,
+    pub description: Option<String>,
+    pub options: Option<String>,
+    pub host: Option<String>,
+    pub alt_roots: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamFormPatch {
     pub stream: Option<String>,
     pub stream_type: Option<String>,
@@ -77,6 +88,37 @@ pub fn patch_workspace_form(existing: &str, patch: &WorkspaceFormPatch) -> Resul
     }
     if let Some(view) = &patch.view {
         patched = upsert_indented_block(&patched, "View", &indent_lines(&view.join("\n")));
+    }
+    Ok(patched)
+}
+
+pub fn patch_stream_workspace_form(
+    existing: &str,
+    patch: &StreamWorkspaceFormPatch,
+) -> Result<String> {
+    let mut patched = existing.to_string();
+    if let Some(client) = &patch.client {
+        patched = replace_single_line_field(&patched, "Client", client);
+    }
+    if let Some(root) = &patch.root {
+        patched = replace_single_line_field(&patched, "Root", root);
+    }
+    if let Some(stream) = &patch.stream {
+        patched = replace_single_line_field(&patched, "Stream", stream);
+    }
+    if let Some(description) = &patch.description {
+        patched = upsert_indented_block(&patched, "Description", &indent_lines(description));
+    }
+    if let Some(options) = &patch.options {
+        patched = replace_single_line_field(&patched, "Options", options);
+    }
+    if let Some(host) = &patch.host {
+        patched = replace_single_line_field(&patched, "Host", host);
+    }
+    if let Some(alt_roots) = &patch.alt_roots
+        && !alt_roots.is_empty()
+    {
+        patched = replace_list_block(&patched, "AltRoots", alt_roots);
     }
     Ok(patched)
 }

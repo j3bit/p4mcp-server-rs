@@ -1,6 +1,9 @@
 use p4mcp_server_rs::{
     config::Toolset,
-    p4::forms::{WorkspaceFormPatch, patch_change_description_form, patch_workspace_form},
+    p4::forms::{
+        StreamWorkspaceFormPatch, WorkspaceFormPatch, patch_change_description_form,
+        patch_stream_workspace_form, patch_workspace_form,
+    },
     p4::runner::{OutputMode, P4Invocation},
     permissions::{Access, SafetyPolicy},
     tools::{
@@ -1005,6 +1008,42 @@ View:
     );
     assert!(patched.contains("LineEnd: local"));
     assert!(patched.contains("View:\n\t//depot/main/... //ws-main/main/..."));
+}
+
+#[test]
+fn patch_stream_workspace_form_sets_client_stream_root_and_optional_fields() {
+    let existing = "\
+Client: old-client
+Root: /old/root
+Options: noallwrite noclobber nocompress unlocked nomodtime normdir
+
+Stream: //streams/old
+
+AltRoots:
+\t/old/alt
+";
+    let patch = StreamWorkspaceFormPatch {
+        client: Some("ws-main".to_string()),
+        root: Some("/work/ws-main".to_string()),
+        stream: Some("//streams/main".to_string()),
+        description: Some("stream workspace".to_string()),
+        options: Some("allwrite noclobber nocompress unlocked nomodtime normdir".to_string()),
+        host: Some("build-host".to_string()),
+        alt_roots: Some(vec![
+            "/mnt/ws-main".to_string(),
+            "/Volumes/ws-main".to_string(),
+        ]),
+    };
+
+    let patched = patch_stream_workspace_form(existing, &patch).unwrap();
+
+    assert!(patched.contains("Client: ws-main"));
+    assert!(patched.contains("Root: /work/ws-main"));
+    assert!(patched.contains("Stream: //streams/main"));
+    assert!(patched.contains("Description:\n\tstream workspace"));
+    assert!(patched.contains("Options: allwrite noclobber nocompress unlocked nomodtime normdir"));
+    assert!(patched.contains("Host: build-host"));
+    assert!(patched.contains("AltRoots:\n\t/mnt/ws-main\n\t/Volumes/ws-main"));
 }
 
 #[test]

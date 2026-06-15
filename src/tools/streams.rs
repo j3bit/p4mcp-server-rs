@@ -47,14 +47,21 @@ impl StreamQueryCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamModifyCommand {
     Single(P4Invocation),
-    CreateOrUpdate,
+    CreateOrUpdate {
+        stream_name: String,
+    },
+    CreateWorkspace {
+        stream_name: String,
+        workspace_name: String,
+        root: String,
+    },
 }
 
 impl StreamModifyCommand {
     pub fn into_single_invocation(self) -> Option<P4Invocation> {
         match self {
             Self::Single(invocation) => Some(invocation),
-            Self::CreateOrUpdate => None,
+            Self::CreateOrUpdate { .. } | Self::CreateWorkspace { .. } => None,
         }
     }
 }
@@ -104,9 +111,30 @@ pub fn build_stream_query_command(params: &QueryStreamsParams) -> Result<StreamQ
 
 pub fn build_stream_modify_command(params: &ModifyStreamsParams) -> Result<StreamModifyCommand> {
     let invocation = match &params.action {
-        StreamModifyAction::Create
-        | StreamModifyAction::Update
-        | StreamModifyAction::CreateWorkspace => return Ok(StreamModifyCommand::CreateOrUpdate),
+        StreamModifyAction::Create | StreamModifyAction::Update => {
+            return Ok(StreamModifyCommand::CreateOrUpdate {
+                stream_name: required_for_action(
+                    params.stream_name.as_deref(),
+                    "stream_name",
+                    &params.action,
+                )?,
+            });
+        }
+        StreamModifyAction::CreateWorkspace => {
+            return Ok(StreamModifyCommand::CreateWorkspace {
+                stream_name: required_for_action(
+                    params.stream_name.as_deref(),
+                    "stream_name",
+                    &params.action,
+                )?,
+                workspace_name: required_for_action(
+                    params.workspace_name.as_deref(),
+                    "workspace_name",
+                    &params.action,
+                )?,
+                root: required_for_action(params.root.as_deref(), "root", &params.action)?,
+            });
+        }
         StreamModifyAction::Delete => json_invocation(vec![
             "stream".into(),
             "-d".into(),
@@ -423,6 +451,19 @@ fn required(value: Option<&str>, name: &str) -> Result<String> {
         Some(value) => Ok(value.to_string()),
         None => Err(P4McpError::InvalidInput {
             message: format!("{name} is required"),
+        }),
+    }
+}
+
+fn required_for_action(
+    value: Option<&str>,
+    name: &str,
+    action: &StreamModifyAction,
+) -> Result<String> {
+    match non_blank(value) {
+        Some(value) => Ok(value.to_string()),
+        None => Err(P4McpError::InvalidInput {
+            message: format!("{name} is required for {}", action.as_str()),
         }),
     }
 }

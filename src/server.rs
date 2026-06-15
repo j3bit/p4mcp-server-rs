@@ -25,8 +25,9 @@ use crate::{
     error::P4McpError,
     p4::{
         forms::{
-            StreamFormPatch, WorkspaceFormPatch, change_form, patch_change_description_form,
-            patch_stream_form, patch_workspace_form,
+            StreamFormPatch, StreamWorkspaceFormPatch, WorkspaceFormPatch, change_form,
+            patch_change_description_form, patch_stream_form, patch_stream_workspace_form,
+            patch_workspace_form,
         },
         runner::{OutputMode, P4CommandOutput, P4Env, P4Executor, P4Invocation, TokioP4Executor},
     },
@@ -39,7 +40,7 @@ use crate::{
             ChangelistModifyAction, FileQueryAction, ModifyChangelistsParams, ModifyFilesParams,
             ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams, ModifyWorkspacesParams,
             QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
-            QueryStreamsParams, QueryWorkspacesParams, WorkspaceModifyAction,
+            QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction, WorkspaceModifyAction,
         },
         response::ToolResponse,
         reviews::{
@@ -781,11 +782,20 @@ impl P4McpServer {
         let command = build_stream_modify_command(&params).map_err(to_mcp_error)?;
         let preview_invocation = match &command {
             StreamModifyCommand::Single(invocation) => invocation.clone(),
-            StreamModifyCommand::CreateOrUpdate => json_invocation(
+            StreamModifyCommand::CreateOrUpdate { stream_name } => json_invocation(
                 vec!["stream".to_string(), "-i".to_string()],
                 Some(format!(
-                    "Stream: {}\n\n<patched after approval>\n",
-                    params.stream_name.as_deref().unwrap_or("<required>")
+                    "Stream: {stream_name}\n\n<patched after approval>\n"
+                )),
+            ),
+            StreamModifyCommand::CreateWorkspace {
+                stream_name,
+                workspace_name,
+                root,
+            } => json_invocation(
+                vec!["client".to_string(), "-i".to_string()],
+                Some(format!(
+                    "Client: {workspace_name}\nStream: {stream_name}\nRoot: {root}\n\n<patched after approval>\n"
                 )),
             ),
         };
@@ -798,9 +808,7 @@ impl P4McpServer {
         }
         match command {
             StreamModifyCommand::Single(invocation) => self.call_p4_tool(&action, invocation).await,
-            StreamModifyCommand::CreateOrUpdate => {
-                let stream_name =
-                    required_option(params.stream_name.as_deref(), "stream_name", &action)?;
+            StreamModifyCommand::CreateOrUpdate { stream_name } => {
                 let current = self
                     .run_p4(text_invocation(vec![
                         "stream".to_string(),
@@ -831,6 +839,64 @@ impl P4McpServer {
                 self.call_p4_tool(
                     &action,
                     json_invocation(vec!["stream".to_string(), "-i".to_string()], Some(patched)),
+                )
+                .await
+            }
+            StreamModifyCommand::CreateWorkspace {
+                stream_name,
+                workspace_name,
+                root,
+            } => {
+                let existing = self
+                    .run_p4(text_invocation(vec![
+                        "client".to_string(),
+                        "-o".to_string(),
+                        workspace_name.clone(),
+                    ]))
+                    .await?;
+                let existing_form = existing
+                    .text
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        to_mcp_error(invalid_input("p4 client -o did not return stdout"))
+                    })?;
+                if form_has_non_empty_field(existing_form, "Update") {
+                    return Err(to_mcp_error(invalid_input(format!(
+                        "Workspace '{workspace_name}' already exists. Use a different name."
+                    ))));
+                }
+
+                let current = self
+                    .run_p4(text_invocation(vec![
+                        "client".to_string(),
+                        "-o".to_string(),
+                        "-S".to_string(),
+                        stream_name.clone(),
+                        workspace_name.clone(),
+                    ]))
+                    .await?;
+                let current_form = current
+                    .text
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        to_mcp_error(invalid_input("p4 client -o did not return stdout"))
+                    })?;
+                let patch = StreamWorkspaceFormPatch {
+                    client: Some(workspace_name),
+                    root: Some(root),
+                    stream: Some(stream_name),
+                    description: params.description.clone(),
+                    options: params.options.clone(),
+                    host: params.host.clone(),
+                    alt_roots: params.alt_roots.clone(),
+                };
+                let patched =
+                    patch_stream_workspace_form(current_form, &patch).map_err(to_mcp_error)?;
+                self.call_p4_tool(
+                    &action,
+                    json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched)),
                 )
                 .await
             }
@@ -922,7 +988,11 @@ impl P4McpServer {
             preview: self.p4_approval_preview(P4ApprovalContext {
                 tool: "modify_streams",
                 action: &action,
-                targets: named_scope_targets(params.stream_name.as_deref(), "stream operation"),
+                targets: if matches!(params.action, StreamModifyAction::CreateWorkspace) {
+                    named_scope_targets(params.workspace_name.as_deref(), "stream workspace")
+                } else {
+                    named_scope_targets(params.stream_name.as_deref(), "stream operation")
+                },
                 changelist: params.changelist.clone(),
                 workspace: params
                     .workspace
@@ -1740,6 +1810,14 @@ fn named_scope_targets(name: Option<&str>, fallback: &str) -> Vec<String> {
         Some(name) => vec![name.to_string()],
         None => vec![fallback.to_string()],
     }
+}
+
+fn form_has_non_empty_field(form: &str, field: &str) -> bool {
+    let prefix = format!("{field}:");
+    form.lines().any(|line| {
+        line.strip_prefix(&prefix)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 fn approval_summary(action: &str, targets: &[String]) -> String {
@@ -2725,7 +2803,7 @@ Files:
     }
 
     #[tokio::test]
-    async fn modify_streams_update_preview_uses_form_scope_when_stream_absent() {
+    async fn modify_streams_create_and_update_require_stream_name_before_approval() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"Stream": "//streams/dev"})],
             text: json!({}),
@@ -2736,7 +2814,58 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let params = modify_streams_params(StreamModifyAction::Update);
+
+        let create_result = server
+            .modify_streams_inner(
+                modify_streams_params(StreamModifyAction::Create),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await;
+        let create_error = match create_result {
+            Ok(_) => panic!("create without stream_name should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            create_error
+                .message
+                .contains("stream_name is required for create")
+        );
+
+        let update_result = server
+            .modify_streams_inner(
+                modify_streams_params(StreamModifyAction::Update),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await;
+        let update_error = match update_result {
+            Ok(_) => panic!("update without stream_name should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            update_error
+                .message
+                .contains("stream_name is required for update")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_workspace_previews_client_i_without_fetching_form() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::CreateWorkspace);
+        params.stream_name = Some("//streams/main".to_string());
+        params.workspace_name = Some("ws-main".to_string());
+        params.root = Some("/work/ws-main".to_string());
 
         let response = server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
@@ -2747,7 +2876,126 @@ Files:
         assert!(executor.invocations().is_empty());
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].request.preview.targets, ["stream operation"]);
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+        assert_eq!(
+            calls[0].request.preview.workspace.as_deref(),
+            Some("ws-main")
+        );
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/main")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "client".to_string(),
+                "-i".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_workspace_fetches_and_saves_client_form_after_approval() {
+        let existing_form = "\
+Client: old-client
+Root: /old/root
+Options: noallwrite noclobber nocompress unlocked nomodtime normdir
+
+Stream: //streams/old
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": "Client: ws-main\n", "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::CreateWorkspace);
+        params.stream_name = Some("//streams/main".to_string());
+        params.workspace_name = Some("ws-main".to_string());
+        params.root = Some("/work/ws-main".to_string());
+        params.description = Some("stream workspace".to_string());
+        params.options =
+            Some("allwrite noclobber nocompress unlocked nomodtime normdir".to_string());
+        params.host = Some("build-host".to_string());
+        params.alt_roots = Some(vec!["/mnt/ws-main".to_string()]);
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved create_workspace should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create_workspace");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
+        assert_eq!(invocations[0].mode, OutputMode::Text);
+        assert_eq!(
+            invocations[1].args,
+            ["client", "-o", "-S", "//streams/main", "ws-main"]
+        );
+        assert_eq!(invocations[1].mode, OutputMode::Text);
+        assert_eq!(invocations[2].args, ["client", "-i"]);
+        let saved_form = invocations[2]
+            .stdin
+            .as_deref()
+            .expect("client -i should receive patched form");
+        assert!(saved_form.contains("Client: ws-main"));
+        assert!(saved_form.contains("Root: /work/ws-main"));
+        assert!(saved_form.contains("Stream: //streams/main"));
+        assert!(saved_form.contains("Description:\n\tstream workspace"));
+        assert!(
+            saved_form
+                .contains("Options: allwrite noclobber nocompress unlocked nomodtime normdir")
+        );
+        assert!(saved_form.contains("Host: build-host"));
+        assert!(saved_form.contains("AltRoots:\n\t/mnt/ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_workspace_rejects_existing_client_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+            records: Vec::new(),
+            text: json!({"stdout": "Client: ws-main\nUpdate: 2026/06/15 10:00:00\n", "stderr": ""}),
+        }]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::CreateWorkspace);
+        params.stream_name = Some("//streams/main".to_string());
+        params.workspace_name = Some("ws-main".to_string());
+        params.root = Some("/work/ws-main".to_string());
+
+        let result = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("existing workspace should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("Workspace 'ws-main' already exists"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
     }
 
     #[tokio::test]
