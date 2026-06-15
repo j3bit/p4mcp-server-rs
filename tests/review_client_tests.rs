@@ -372,6 +372,40 @@ async fn execute_approved_vote_sends_post_with_body_and_basic_auth() {
 }
 
 #[tokio::test]
+async fn execute_approved_add_comment_sends_post_with_query_body_and_basic_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v11/reviews/123/comments"))
+        .and(query_param("notify", "delayed"))
+        .and(header("authorization", "Basic dXNlcjp0aWNrZXQ="))
+        .and(body_json(serde_json::json!({"body": "Looks good."})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "comment": "created"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ReviewHttpClient::new(
+        format!("{}/api/v11", server.uri()),
+        "user".into(),
+        "ticket".into(),
+        false,
+    )
+    .unwrap();
+    let request = ModifyReviewsParams {
+        body: Some("Looks good.".to_string()),
+        notify: Some("delayed".to_string()),
+        ..modify_review_request(ReviewModifyAction::AddComment)
+    };
+    let built = request.to_http(Some("user")).unwrap();
+
+    let result = client.execute_approved(built).await.unwrap();
+
+    assert_eq!(result, serde_json::json!({ "comment": "created" }));
+}
+
+#[tokio::test]
 async fn execute_non_success_returns_error_without_credentials() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

@@ -811,12 +811,15 @@ impl ReviewHttpClient {
     async fn send(&self, built: BuiltReviewRequest) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.api_base, built.path);
         let mut req = match built.method.as_str() {
-            "GET" => self.client.get(url).query(&built.query),
+            "GET" => self.client.get(url),
             "POST" => self.client.post(url).json(&built.body),
             "PUT" => self.client.put(url).json(&built.body),
             "DELETE" => self.client.delete(url).json(&built.body),
             method => anyhow::bail!("unsupported review HTTP method: {method}"),
         };
+        if !built.query.is_empty() {
+            req = req.query(&built.query);
+        }
         req = req.basic_auth(&self.username, Some(&self.ticket));
         let response = req.send().await?;
         let status = response.status();
