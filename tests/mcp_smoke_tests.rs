@@ -16,7 +16,7 @@ use p4mcp_server_rs::{
             QueryStreamsParams, QueryWorkspacesParams, StreamQueryAction, WorkspaceQueryAction,
         },
         reviews::{ReviewAction, ReviewRequest},
-        server::ServerQueryAction,
+        server::{QueryServerParams, ServerQueryAction},
     },
 };
 use rmcp::ErrorData;
@@ -161,7 +161,9 @@ async fn query_server_calls_injected_executor() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
-        .query_server(Parameters(ServerQueryAction::ServerInfo))
+        .query_server(Parameters(QueryServerParams {
+            action: ServerQueryAction::ServerInfo,
+        }))
         .await
         .unwrap();
 
@@ -764,7 +766,9 @@ async fn executor_failures_return_internal_error() {
     let server = P4McpServer::with_executor(test_config(), executor);
 
     let err = match server
-        .query_server(Parameters(ServerQueryAction::ServerInfo))
+        .query_server(Parameters(QueryServerParams {
+            action: ServerQueryAction::ServerInfo,
+        }))
         .await
     {
         Ok(_) => panic!("query_server should surface fake executor failure"),

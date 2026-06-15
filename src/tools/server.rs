@@ -10,8 +10,13 @@ pub enum ServerQueryAction {
     CurrentUser,
 }
 
-pub fn build_server_invocation(action: ServerQueryAction) -> P4Invocation {
-    let args = match action {
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct QueryServerParams {
+    pub action: ServerQueryAction,
+}
+
+pub fn build_server_invocation(params: &QueryServerParams) -> P4Invocation {
+    let args = match params.action {
         ServerQueryAction::ServerInfo => vec!["info".to_string()],
         ServerQueryAction::CurrentUser => vec!["user".to_string(), "-o".to_string()],
     };

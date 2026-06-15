@@ -12,7 +12,7 @@ use p4mcp_server_rs::{
             QueryJobsParams, QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams,
             ShelfQueryAction, StreamQueryAction, WorkspaceQueryAction,
         },
-        server::{ServerQueryAction, build_server_invocation},
+        server::{QueryServerParams, ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
         streams::build_stream_query_command,
         workspaces::build_workspace_query_invocation,
@@ -244,14 +244,18 @@ fn common_modify_params_schema_omits_confirmation() {
 
 #[test]
 fn query_server_info_maps_to_info() {
-    let invocation = build_server_invocation(ServerQueryAction::ServerInfo);
+    let invocation = build_server_invocation(&QueryServerParams {
+        action: ServerQueryAction::ServerInfo,
+    });
     assert_eq!(invocation.args, vec!["info"]);
     assert_eq!(invocation.mode, OutputMode::JsonLines);
 }
 
 #[test]
 fn query_current_user_maps_to_user_output() {
-    let invocation = build_server_invocation(ServerQueryAction::CurrentUser);
+    let invocation = build_server_invocation(&QueryServerParams {
+        action: ServerQueryAction::CurrentUser,
+    });
     assert_eq!(invocation.args, vec!["user", "-o"]);
     assert_eq!(invocation.mode, OutputMode::JsonLines);
 }

@@ -39,7 +39,7 @@ use crate::{
         },
         response::ToolResponse,
         reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
-        server::{ServerQueryAction, build_server_invocation},
+        server::{QueryServerParams, build_server_invocation},
         shelves::build_shelf_query_invocation,
         streams::{
             StreamQueryCommand, build_stream_query_command, client_spec_invocation,
@@ -899,9 +899,9 @@ impl P4McpServer {
     )]
     pub async fn query_server(
         &self,
-        Parameters(action): Parameters<ServerQueryAction>,
+        Parameters(params): Parameters<QueryServerParams>,
     ) -> McpResult<Json<ToolResponse>> {
-        let invocation = build_server_invocation(action);
+        let invocation = build_server_invocation(&params);
         let output = self.run_p4(invocation).await?;
         Ok(Json(ToolResponse::success(
             "query_server",
