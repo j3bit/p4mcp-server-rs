@@ -411,9 +411,9 @@ pub struct ModifyWorkspacesParams {
     pub workspace_root: Option<String>,
     #[serde(default)]
     pub workspace_description: Option<String>,
-    #[serde(default = "default_workspace_options")]
+    #[serde(default)]
     pub workspace_options: Option<String>,
-    #[serde(default = "default_workspace_line_end")]
+    #[serde(default)]
     pub workspace_line_end: Option<String>,
     #[serde(default)]
     pub workspace_view: Option<Vec<String>>,
@@ -573,14 +573,6 @@ fn default_stream_max_results() -> u16 {
 
 fn default_changelist() -> String {
     "default".to_string()
-}
-
-fn default_workspace_options() -> Option<String> {
-    Some("noallwrite noclobber nocompress unlocked nomodtime normdir".to_string())
-}
-
-fn default_workspace_line_end() -> Option<String> {
-    Some("local".to_string())
 }
 
 fn default_resolve_mode() -> String {

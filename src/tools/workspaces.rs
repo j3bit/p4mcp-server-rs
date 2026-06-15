@@ -1,7 +1,21 @@
 use crate::{
     error::{P4McpError, Result},
     p4::runner::{OutputMode, P4Invocation},
+    tools::params::{ModifyWorkspacesParams, WorkspaceModifyAction},
 };
+
+pub fn build_workspace_delete_invocation(params: &ModifyWorkspacesParams) -> Result<P4Invocation> {
+    if params.action != WorkspaceModifyAction::Delete {
+        return Err(P4McpError::InvalidInput {
+            message: format!("unknown action: {}", params.action.as_str()),
+        });
+    }
+    Ok(P4Invocation {
+        args: vec!["client".into(), "-d".into(), params.workspace_name.clone()],
+        stdin: None,
+        mode: OutputMode::JsonLines,
+    })
+}
 
 pub fn build_workspace_query_invocation(
     action: &str,

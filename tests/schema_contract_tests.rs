@@ -118,12 +118,14 @@ fn modify_workspaces_schema_matches_upstream_fields() {
     }
 
     let params: ModifyWorkspacesParams = serde_json::from_value(serde_json::json!({
-        "action": "switch",
+        "action": "update",
         "workspace_name": "ws-main"
     }))
     .unwrap();
 
-    assert_eq!(params.action, WorkspaceModifyAction::Switch);
+    assert_eq!(params.action, WorkspaceModifyAction::Update);
+    assert_eq!(params.workspace_options, None);
+    assert_eq!(params.workspace_line_end, None);
 }
 
 #[test]

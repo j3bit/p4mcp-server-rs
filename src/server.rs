@@ -24,7 +24,9 @@ use crate::{
     config::{AppConfig, Cli, Toolset, TransportMode},
     error::P4McpError,
     p4::{
-        forms::{change_form, patch_change_description_form},
+        forms::{
+            WorkspaceFormPatch, change_form, patch_change_description_form, patch_workspace_form,
+        },
         runner::{OutputMode, P4CommandOutput, P4Env, P4Executor, P4Invocation, TokioP4Executor},
     },
     permissions::{Access, SafetyPolicy},
@@ -34,19 +36,20 @@ use crate::{
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
             ChangelistModifyAction, CommonModifyParams, FileQueryAction, ModifyChangelistsParams,
-            ModifyFilesParams, ModifyJobsParams, QueryChangelistsParams, QueryFilesParams,
-            QueryJobsParams, QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams,
+            ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyWorkspacesParams,
+            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
+            QueryStreamsParams, QueryWorkspacesParams, WorkspaceModifyAction,
         },
         response::ToolResponse,
         reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
         server::{QueryServerParams, build_server_invocation},
-        shelves::build_shelf_query_invocation,
+        shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
         streams::{
             StreamQueryCommand, build_stream_query_command, client_spec_invocation,
             interchanges_invocation, opened_for_stream_validation_invocation,
             stream_resolve_preview_invocation, stream_spec_with_view_invocation,
         },
-        workspaces::build_workspace_query_invocation,
+        workspaces::{build_workspace_delete_invocation, build_workspace_query_invocation},
     },
 };
 
@@ -617,39 +620,21 @@ impl P4McpServer {
 
     async fn modify_shelves_inner(
         &self,
-        params: CommonModifyParams,
+        params: ModifyShelvesParams,
         channel: ApprovalChannel,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Write, Toolset::Shelves, "modify_shelves")
             .map_err(to_mcp_error)?;
-        let change = required_option(
-            params.changelist_id.as_deref(),
-            "changelist_id",
-            &params.action,
-        )?;
-        let mut args = match params.action.as_str() {
-            "shelve" => vec!["shelve".to_string(), "-c".to_string(), change.clone()],
-            "unshelve" => vec!["unshelve".to_string(), "-s".to_string(), change.clone()],
-            "delete" => {
-                vec![
-                    "shelve".to_string(),
-                    "-d".to_string(),
-                    "-c".to_string(),
-                    change.clone(),
-                ]
-            }
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        args.extend(params.files.iter().cloned());
-        let invocation = json_invocation(args, None);
-        let request = self.common_modify_approval_request(
+        let invocation = build_shelf_modify_invocation(&params).map_err(to_mcp_error)?;
+        let action = params.action.as_str().to_string();
+        let request = self.modify_shelves_approval_request(
             &params,
             P4ApprovalContext {
                 tool: "modify_shelves",
-                action: &params.action,
-                targets: shelf_targets(&change),
-                changelist: Some(change),
+                action: &action,
+                targets: shelf_modify_targets(&params),
+                changelist: Some(params.changelist_id.clone()),
                 workspace: None,
                 stream: None,
                 invocation: &invocation,
@@ -661,48 +646,43 @@ impl P4McpServer {
         {
             return Ok(response);
         }
-        self.call_p4_tool(&params.action, invocation).await
+        self.call_p4_tool(&action, invocation).await
     }
 
     async fn modify_workspaces_inner(
         &self,
-        params: CommonModifyParams,
+        params: ModifyWorkspacesParams,
         channel: ApprovalChannel,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Write, Toolset::Workspaces, "modify_workspaces")
             .map_err(to_mcp_error)?;
-        let (args, stdin, workspace) = match params.action.as_str() {
-            "create" | "update" => (
+        let action = params.action.as_str().to_string();
+        let invocation = match params.action {
+            WorkspaceModifyAction::Create | WorkspaceModifyAction::Update => json_invocation(
                 vec!["client".to_string(), "-i".to_string()],
-                Some(required_form(params.form.as_deref(), &params.action)?),
-                params.workspace_name.clone(),
+                Some("workspace form will be fetched and patched after approval\n".to_string()),
             ),
-            "delete" => {
-                let workspace_name =
-                    required_option(params.workspace_name.as_deref(), "workspace_name", "delete")?;
-                (
-                    vec![
-                        "client".to_string(),
-                        "-d".to_string(),
-                        workspace_name.clone(),
-                    ],
-                    None,
-                    Some(workspace_name),
-                )
+            WorkspaceModifyAction::Delete => {
+                build_workspace_delete_invocation(&params).map_err(to_mcp_error)?
             }
-            other => return Err(to_mcp_error(unknown_action(other))),
+            WorkspaceModifyAction::Switch => json_invocation(
+                vec![
+                    "client".to_string(),
+                    "-s".to_string(),
+                    params.workspace_name.clone(),
+                ],
+                None,
+            ),
         };
-        let invocation = json_invocation(args, stdin);
-        let targets = named_scope_targets(workspace.as_deref(), "workspace form");
-        let request = self.common_modify_approval_request(
+        let request = self.modify_workspaces_approval_request(
             &params,
             P4ApprovalContext {
                 tool: "modify_workspaces",
-                action: &params.action,
-                targets,
+                action: &action,
+                targets: vec![params.workspace_name.clone()],
                 changelist: None,
-                workspace,
+                workspace: Some(params.workspace_name.clone()),
                 stream: None,
                 invocation: &invocation,
             },
@@ -713,7 +693,35 @@ impl P4McpServer {
         {
             return Ok(response);
         }
-        self.call_p4_tool(&params.action, invocation).await
+        let invocation = match params.action {
+            WorkspaceModifyAction::Create | WorkspaceModifyAction::Update => {
+                let output = self
+                    .run_p4(text_invocation(vec![
+                        "client".to_string(),
+                        "-o".to_string(),
+                        params.workspace_name.clone(),
+                    ]))
+                    .await?;
+                let existing = output
+                    .text
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        to_mcp_error(invalid_input("p4 client -o did not return stdout"))
+                    })?;
+                let patch = WorkspaceFormPatch {
+                    root: params.workspace_root.clone(),
+                    description: params.workspace_description.clone(),
+                    options: params.workspace_options.clone(),
+                    line_end: params.workspace_line_end.clone(),
+                    view: params.workspace_view.clone(),
+                };
+                let patched = patch_workspace_form(existing, &patch).map_err(to_mcp_error)?;
+                json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched))
+            }
+            WorkspaceModifyAction::Delete | WorkspaceModifyAction::Switch => invocation,
+        };
+        self.call_p4_tool(&action, invocation).await
     }
 
     async fn modify_jobs_inner(
@@ -827,6 +835,40 @@ impl P4McpServer {
             action: context.action.to_string(),
             params: serde_json::to_value(approval_params)
                 .expect("modify changelists params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_shelves_approval_request(
+        &self,
+        params: &ModifyShelvesParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify shelves params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_workspaces_approval_request(
+        &self,
+        params: &ModifyWorkspacesParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify workspaces params serialize to JSON"),
             preview: self.p4_approval_preview(context),
         }
     }
@@ -1055,7 +1097,7 @@ impl P4McpServer {
     pub async fn modify_shelves(
         &self,
         peer: Peer<RoleServer>,
-        Parameters(params): Parameters<CommonModifyParams>,
+        Parameters(params): Parameters<ModifyShelvesParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.modify_shelves_inner(params, ApprovalChannel::Elicitation(peer))
             .await
@@ -1100,7 +1142,7 @@ impl P4McpServer {
     pub async fn modify_workspaces(
         &self,
         peer: Peer<RoleServer>,
-        Parameters(params): Parameters<CommonModifyParams>,
+        Parameters(params): Parameters<ModifyWorkspacesParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.modify_workspaces_inner(params, ApprovalChannel::Elicitation(peer))
             .await
@@ -1648,6 +1690,14 @@ fn shelf_targets(changelist_id: &str) -> Vec<String> {
     vec![format!("shelf:{changelist_id}")]
 }
 
+fn shelf_modify_targets(params: &ModifyShelvesParams) -> Vec<String> {
+    let mut targets = shelf_targets(&params.changelist_id);
+    if let Some(file_paths) = &params.file_paths {
+        targets.extend(file_paths.iter().cloned());
+    }
+    targets
+}
+
 fn named_scope_targets(name: Option<&str>, fallback: &str) -> Vec<String> {
     match name.filter(|value| !value.trim().is_empty()) {
         Some(name) => vec![name.to_string()],
@@ -1782,7 +1832,10 @@ mod tests {
         approval::{ApprovalChannel, ApprovalDecision, ApprovalRequest, WriteApprovalGate},
         config::{SslVerify, TransportMode},
         p4::runner::{P4CommandOutput, P4Env},
-        tools::params::{ChangelistModifyAction, FileModifyAction, JobModifyAction},
+        tools::params::{
+            ChangelistModifyAction, FileModifyAction, JobModifyAction, ShelfModifyAction,
+            WorkspaceModifyAction,
+        },
         tools::reviews::ReviewAction,
     };
 
@@ -1866,6 +1919,30 @@ mod tests {
             changelist_id: None,
             description: None,
             file_paths: None,
+            approval_token: None,
+        }
+    }
+
+    fn modify_shelves_params(action: ShelfModifyAction) -> ModifyShelvesParams {
+        ModifyShelvesParams {
+            action,
+            changelist_id: "123".to_string(),
+            file_paths: None,
+            target_changelist: "default".to_string(),
+            force: false,
+            approval_token: None,
+        }
+    }
+
+    fn modify_workspaces_params(action: WorkspaceModifyAction) -> ModifyWorkspacesParams {
+        ModifyWorkspacesParams {
+            action,
+            workspace_name: "ws-main".to_string(),
+            workspace_root: None,
+            workspace_description: None,
+            workspace_options: None,
+            workspace_line_end: None,
+            workspace_view: None,
             approval_token: None,
         }
     }
@@ -2282,9 +2359,8 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("delete");
-        params.changelist_id = Some("123".to_string());
-        params.files = vec!["//depot/main/file.txt".to_string()];
+        let mut params = modify_shelves_params(ShelfModifyAction::Delete);
+        params.file_paths = Some(vec!["//depot/main/file.txt".to_string()]);
 
         let response = server
             .modify_shelves_inner(params, ApprovalChannel::FallbackOnly)
@@ -2299,7 +2375,10 @@ Files:
         assert_eq!(calls[0].request.tool, "modify_shelves");
         assert_eq!(calls[0].request.action, "delete");
         assert_eq!(calls[0].request.params["approval_token"], json!(null));
-        assert_eq!(calls[0].request.preview.targets, ["shelf:123"]);
+        assert_eq!(
+            calls[0].request.preview.targets,
+            ["shelf:123", "//depot/main/file.txt"]
+        );
         assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
         assert_eq!(
             calls[0].request.preview.command,
@@ -2326,12 +2405,11 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("delete");
-        params.changelist_id = Some("123".to_string());
-        params.files = vec![
+        let mut params = modify_shelves_params(ShelfModifyAction::Delete);
+        params.file_paths = Some(vec![
             "//depot/main/file.txt".to_string(),
             "//depot/main/other.txt".to_string(),
-        ];
+        ]);
 
         let response = server
             .modify_shelves_inner(params, ApprovalChannel::FallbackOnly)
@@ -2383,8 +2461,7 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("delete");
-        params.workspace_name = Some("ws-main".to_string());
+        let params = modify_workspaces_params(WorkspaceModifyAction::Delete);
 
         let response = server
             .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
@@ -2416,7 +2493,7 @@ Files:
     }
 
     #[tokio::test]
-    async fn modify_workspaces_update_preview_uses_form_scope_when_name_absent() {
+    async fn modify_workspaces_update_preview_uses_workspace_name() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"client": "ws-main"})],
             text: json!({}),
@@ -2427,8 +2504,8 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("update");
-        params.form = Some("Client: ws-main\n".to_string());
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Update);
+        params.workspace_root = Some("/workspace/root".to_string());
 
         let response = server
             .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
@@ -2439,7 +2516,7 @@ Files:
         assert!(executor.invocations().is_empty());
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].request.preview.targets, ["workspace form"]);
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
     }
 
     #[tokio::test]

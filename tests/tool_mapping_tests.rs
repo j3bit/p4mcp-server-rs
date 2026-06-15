@@ -1,6 +1,6 @@
 use p4mcp_server_rs::{
     config::Toolset,
-    p4::forms::patch_change_description_form,
+    p4::forms::{WorkspaceFormPatch, patch_change_description_form, patch_workspace_form},
     p4::runner::{OutputMode, P4Invocation},
     permissions::{Access, SafetyPolicy},
     tools::{
@@ -10,14 +10,15 @@ use p4mcp_server_rs::{
         params::{
             ChangelistModifyAction, ChangelistQueryAction, FileModifyAction, FileQueryAction,
             JobModifyAction, JobQueryAction, ModifyChangelistsParams, ModifyFilesParams,
-            ModifyJobsParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
-            QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, ShelfQueryAction,
-            StreamQueryAction, WorkspaceQueryAction,
+            ModifyJobsParams, ModifyShelvesParams, ModifyWorkspacesParams, QueryChangelistsParams,
+            QueryFilesParams, QueryJobsParams, QueryShelvesParams, QueryStreamsParams,
+            QueryWorkspacesParams, ShelfModifyAction, ShelfQueryAction, StreamQueryAction,
+            WorkspaceModifyAction, WorkspaceQueryAction,
         },
         server::{QueryServerParams, ServerQueryAction, build_server_invocation},
-        shelves::build_shelf_query_invocation,
+        shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
         streams::build_stream_query_command,
-        workspaces::build_workspace_query_invocation,
+        workspaces::{build_workspace_delete_invocation, build_workspace_query_invocation},
     },
 };
 use schemars::JsonSchema;
@@ -859,6 +860,95 @@ fn shelf_diff_blank_changelist_errors() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required"));
+}
+
+#[test]
+fn modify_shelves_unshelve_to_changelist_uses_target_changelist() {
+    let params = ModifyShelvesParams {
+        action: ShelfModifyAction::UnshelveToChangelist,
+        changelist_id: "12345".to_string(),
+        file_paths: None,
+        target_changelist: "54321".to_string(),
+        force: false,
+        approval_token: None,
+    };
+
+    let invocation = build_shelf_modify_invocation(&params).unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec!["unshelve", "-s", "12345", "-c", "54321"]
+    );
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn modify_shelves_force_shelve_uses_file_paths() {
+    let params = ModifyShelvesParams {
+        action: ShelfModifyAction::Shelve,
+        changelist_id: "12345".to_string(),
+        file_paths: Some(vec!["//depot/main/a.txt".to_string()]),
+        target_changelist: "default".to_string(),
+        force: true,
+        approval_token: None,
+    };
+
+    let invocation = build_shelf_modify_invocation(&params).unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec!["shelve", "-f", "-c", "12345", "//depot/main/a.txt"]
+    );
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn modify_workspaces_delete_maps_to_client_delete() {
+    let params = ModifyWorkspacesParams {
+        action: WorkspaceModifyAction::Delete,
+        workspace_name: "ws-main".to_string(),
+        workspace_root: None,
+        workspace_description: None,
+        workspace_options: None,
+        workspace_line_end: None,
+        workspace_view: None,
+        approval_token: None,
+    };
+
+    let invocation = build_workspace_delete_invocation(&params).unwrap();
+
+    assert_eq!(invocation.args, vec!["client", "-d", "ws-main"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn patch_workspace_form_preserves_view_when_view_is_not_supplied() {
+    let existing = "\
+Client: ws-main
+Root: /old/root
+Options: noallwrite noclobber nocompress unlocked nomodtime normdir
+LineEnd: local
+
+View:
+\t//depot/main/... //ws-main/main/...
+";
+    let patch = WorkspaceFormPatch {
+        root: Some("/new/root".to_string()),
+        description: Some("new description".to_string()),
+        options: None,
+        line_end: None,
+        view: None,
+    };
+
+    let patched = patch_workspace_form(existing, &patch).unwrap();
+
+    assert!(patched.contains("Root: /new/root"));
+    assert!(patched.contains("Description:\n\tnew description"));
+    assert!(
+        patched.contains("Options: noallwrite noclobber nocompress unlocked nomodtime normdir")
+    );
+    assert!(patched.contains("LineEnd: local"));
+    assert!(patched.contains("View:\n\t//depot/main/... //ws-main/main/..."));
 }
 
 #[test]
