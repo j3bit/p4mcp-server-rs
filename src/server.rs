@@ -962,7 +962,7 @@ impl P4McpServer {
             action: action.clone(),
             params: serde_json::to_value(approval_params).expect("review params serialize to JSON"),
             preview: ApprovalPreview {
-                summary: format!("Review API {} {}", built.method, built.path),
+                summary: review_approval_summary(&action, built),
                 tool: "modify_reviews".to_string(),
                 action,
                 targets,
@@ -1721,6 +1721,14 @@ fn review_query_action_name(params: &QueryReviewsParams) -> String {
 
 fn review_modify_action_name(params: &ModifyReviewsParams) -> String {
     params.action.as_str().to_string()
+}
+
+fn review_approval_summary(action: &str, built: &BuiltReviewRequest) -> String {
+    let mut summary = format!("Review API {} {}", built.method, built.path);
+    if matches!(action, "join" | "leave") {
+        summary.push_str("; current P4 user resolved after approval");
+    }
+    summary
 }
 
 fn review_target_from_path(path: &str) -> String {
@@ -2900,6 +2908,77 @@ Files:
                 .as_ref()
                 .map(|request| (request.method.as_str(), request.path.as_str(),)),
             Some(("POST", "/reviews/123/vote"))
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_join_approval_preview_mentions_current_user_after_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        for action in [ReviewModifyAction::Join, ReviewModifyAction::Leave] {
+            let response = server
+                .modify_reviews_inner(
+                    ModifyReviewsParams {
+                        action,
+                        vote_value: None,
+                        version: None,
+                        ..review_modify_params(None)
+                    },
+                    ApprovalChannel::FallbackOnly,
+                )
+                .await
+                .expect("approval response should be returned");
+
+            assert_eq!(response.0.status, "approval_required");
+        }
+
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].request.preview.action, "join");
+        assert!(calls[0].request.preview.summary.contains("current P4 user"));
+        assert!(
+            calls[0]
+                .request
+                .preview
+                .summary
+                .contains("resolved after approval")
+        );
+        assert_eq!(
+            calls[0]
+                .request
+                .preview
+                .request
+                .as_ref()
+                .map(|request| (request.method.as_str(), request.path.as_str())),
+            Some(("POST", "/reviews/123/join"))
+        );
+        assert_eq!(calls[1].request.preview.action, "leave");
+        assert!(calls[1].request.preview.summary.contains("current P4 user"));
+        assert!(
+            calls[1]
+                .request
+                .preview
+                .summary
+                .contains("resolved after approval")
+        );
+        assert_eq!(
+            calls[1]
+                .request
+                .preview
+                .request
+                .as_ref()
+                .map(|request| (request.method.as_str(), request.path.as_str())),
+            Some(("DELETE", "/reviews/123/leave"))
         );
     }
 
