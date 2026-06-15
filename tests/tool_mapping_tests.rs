@@ -14,7 +14,7 @@ use p4mcp_server_rs::{
         },
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
-        streams::{build_stream_query_command, build_stream_query_invocation},
+        streams::build_stream_query_command,
         workspaces::build_workspace_query_invocation,
     },
 };
@@ -931,35 +931,6 @@ fn stream_integration_status_uses_upstream_flags() {
     let command = build_stream_query_command(&params).unwrap();
     let invocation = command.into_single_invocation().unwrap();
     assert_eq!(invocation.args, vec!["istat", "-a", "-c", "//streams/dev"]);
-}
-
-#[test]
-fn stream_legacy_parent_maps_to_stream_spec() {
-    let invocation =
-        build_stream_query_invocation("parent", Some("//streams/dev"), None, 10).unwrap();
-
-    assert_eq!(invocation.args, vec!["stream", "-o", "//streams/dev"]);
-    assert_eq!(invocation.mode, OutputMode::JsonLines);
-}
-
-#[test]
-fn stream_legacy_parent_missing_stream_uses_legacy_error_name() {
-    let error = build_stream_query_invocation("parent", None, None, 10)
-        .unwrap_err()
-        .to_string();
-
-    assert!(error.contains("stream is required"));
-}
-
-#[test]
-fn stream_legacy_graph_maps_to_streams_graph_fields() {
-    let invocation = build_stream_query_invocation("graph", None, None, 10).unwrap();
-
-    assert_eq!(
-        invocation.args,
-        vec!["streams", "-T", "Stream,Parent,Type,Name,Owner"]
-    );
-    assert_eq!(invocation.mode, OutputMode::JsonLines);
 }
 
 #[test]
