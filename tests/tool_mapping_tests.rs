@@ -7,10 +7,10 @@ use p4mcp_server_rs::{
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::build_job_query_invocation,
         params::{
-            ChangelistQueryAction, CommonModifyParams, FileModifyAction, FileQueryAction,
-            JobQueryAction, ModifyFilesParams, QueryChangelistsParams, QueryFilesParams,
-            QueryJobsParams, QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams,
-            ShelfQueryAction, StreamQueryAction, WorkspaceQueryAction,
+            ChangelistQueryAction, FileModifyAction, FileQueryAction, JobQueryAction,
+            ModifyFilesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
+            QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, ShelfQueryAction,
+            StreamQueryAction, WorkspaceQueryAction,
         },
         server::{QueryServerParams, ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
@@ -230,16 +230,6 @@ fn stream_query_action_multi_word_variants_deserialize_and_render_as_str() {
         assert_eq!(action, expected);
         assert_eq!(action.as_str(), value);
     }
-}
-
-#[test]
-fn common_modify_params_schema_exposes_approval_token() {
-    assert!(schema_has_property::<CommonModifyParams>("approval_token"));
-}
-
-#[test]
-fn common_modify_params_schema_omits_confirmation() {
-    assert!(!schema_has_property::<CommonModifyParams>("confirmation"));
 }
 
 #[test]

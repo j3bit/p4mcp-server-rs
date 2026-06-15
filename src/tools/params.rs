@@ -312,6 +312,253 @@ pub struct CommonModifyParams {
     pub approval_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangelistModifyAction {
+    Create,
+    Update,
+    Submit,
+    Delete,
+    MoveFiles,
+}
+
+impl ChangelistModifyAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Submit => "submit",
+            Self::Delete => "delete",
+            Self::MoveFiles => "move_files",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ModifyChangelistsParams {
+    pub action: ChangelistModifyAction,
+    #[serde(default)]
+    pub changelist_id: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub file_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub approval_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShelfModifyAction {
+    Shelve,
+    Unshelve,
+    Update,
+    Delete,
+    UnshelveToChangelist,
+}
+
+impl ShelfModifyAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shelve => "shelve",
+            Self::Unshelve => "unshelve",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::UnshelveToChangelist => "unshelve_to_changelist",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ModifyShelvesParams {
+    pub action: ShelfModifyAction,
+    pub changelist_id: String,
+    #[serde(default)]
+    pub file_paths: Option<Vec<String>>,
+    #[serde(default = "default_changelist")]
+    pub target_changelist: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub approval_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceModifyAction {
+    Create,
+    Delete,
+    Update,
+    Switch,
+}
+
+impl WorkspaceModifyAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+            Self::Update => "update",
+            Self::Switch => "switch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ModifyWorkspacesParams {
+    pub action: WorkspaceModifyAction,
+    pub workspace_name: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub workspace_description: Option<String>,
+    #[serde(default = "default_workspace_options")]
+    pub workspace_options: Option<String>,
+    #[serde(default = "default_workspace_line_end")]
+    pub workspace_line_end: Option<String>,
+    #[serde(default)]
+    pub workspace_view: Option<Vec<String>>,
+    #[serde(default)]
+    pub approval_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobModifyAction {
+    LinkJob,
+    UnlinkJob,
+}
+
+impl JobModifyAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LinkJob => "link_job",
+            Self::UnlinkJob => "unlink_job",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ModifyJobsParams {
+    pub action: JobModifyAction,
+    pub changelist_id: String,
+    pub job_id: String,
+    #[serde(default)]
+    pub approval_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamModifyAction {
+    Create,
+    Update,
+    Delete,
+    EditSpec,
+    ResolveSpec,
+    RevertSpec,
+    ShelveSpec,
+    UnshelveSpec,
+    Copy,
+    Merge,
+    Integrate,
+    Populate,
+    Switch,
+    CreateWorkspace,
+}
+
+impl StreamModifyAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::EditSpec => "edit_spec",
+            Self::ResolveSpec => "resolve_spec",
+            Self::RevertSpec => "revert_spec",
+            Self::ShelveSpec => "shelve_spec",
+            Self::UnshelveSpec => "unshelve_spec",
+            Self::Copy => "copy",
+            Self::Merge => "merge",
+            Self::Integrate => "integrate",
+            Self::Populate => "populate",
+            Self::Switch => "switch",
+            Self::CreateWorkspace => "create_workspace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ModifyStreamsParams {
+    pub action: StreamModifyAction,
+    #[serde(default)]
+    pub stream_name: Option<String>,
+    #[serde(default)]
+    pub stream_type: Option<String>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub options: Option<String>,
+    #[serde(default)]
+    pub parent_view: Option<String>,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub remapped: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignored: Option<Vec<String>>,
+    #[serde(default)]
+    pub changelist: Option<String>,
+    #[serde(default)]
+    pub resolve_mode: Option<String>,
+    #[serde(default)]
+    pub target_changelist: Option<String>,
+    #[serde(default)]
+    pub parent_stream: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub file_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub preview: bool,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub reverse: bool,
+    #[serde(default)]
+    pub quiet: bool,
+    #[serde(default)]
+    pub max_files: Option<u16>,
+    #[serde(default)]
+    pub output_base: bool,
+    #[serde(default, rename = "virtual")]
+    pub virtual_stream: bool,
+    #[serde(default)]
+    pub schedule_branch_resolve: bool,
+    #[serde(default)]
+    pub integrate_around_deleted: bool,
+    #[serde(default)]
+    pub skip_cherry_picked: bool,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub target_path: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub workspace_name: Option<String>,
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub alt_roots: Option<Vec<String>>,
+    #[serde(default)]
+    pub approval_token: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -326,6 +573,14 @@ fn default_stream_max_results() -> u16 {
 
 fn default_changelist() -> String {
     "default".to_string()
+}
+
+fn default_workspace_options() -> Option<String> {
+    Some("noallwrite noclobber nocompress unlocked nomodtime normdir".to_string())
+}
+
+fn default_workspace_line_end() -> Option<String> {
+    Some("local".to_string())
 }
 
 fn default_resolve_mode() -> String {
