@@ -10,11 +10,21 @@ pub fn build_workspace_delete_invocation(params: &ModifyWorkspacesParams) -> Res
             message: format!("unknown action: {}", params.action.as_str()),
         });
     }
+    let workspace_name = required_workspace_name(&params.workspace_name, params.action.as_str())?;
     Ok(P4Invocation {
-        args: vec!["client".into(), "-d".into(), params.workspace_name.clone()],
+        args: vec!["client".into(), "-d".into(), workspace_name],
         stdin: None,
         mode: OutputMode::JsonLines,
     })
+}
+
+pub fn required_workspace_name(value: &str, action: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(P4McpError::InvalidInput {
+            message: format!("workspace_name is required for {action}"),
+        });
+    }
+    Ok(value.to_string())
 }
 
 pub fn build_workspace_query_invocation(

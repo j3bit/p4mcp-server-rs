@@ -5,13 +5,18 @@ use crate::{
 };
 
 pub fn build_shelf_modify_invocation(params: &ModifyShelvesParams) -> Result<P4Invocation> {
+    let changelist_id = required_value(
+        &params.changelist_id,
+        "changelist_id",
+        params.action.as_str(),
+    )?;
     let mut args = match params.action {
         ShelfModifyAction::Shelve => {
             let mut args = vec!["shelve".into()];
             if params.force {
                 args.push("-f".into());
             }
-            args.extend(["-c".into(), params.changelist_id.clone()]);
+            args.extend(["-c".into(), changelist_id.clone()]);
             args.extend(required_files(params, params.action.as_str())?);
             args
         }
@@ -20,7 +25,7 @@ pub fn build_shelf_modify_invocation(params: &ModifyShelvesParams) -> Result<P4I
             if params.force {
                 args.push("-f".into());
             }
-            args.extend(["-s".into(), params.changelist_id.clone()]);
+            args.extend(["-s".into(), changelist_id.clone()]);
             if let Some(file_paths) = &params.file_paths {
                 args.extend(file_paths.iter().cloned());
             }
@@ -31,25 +36,30 @@ pub fn build_shelf_modify_invocation(params: &ModifyShelvesParams) -> Result<P4I
             if params.force {
                 args.push("-f".into());
             }
-            args.extend(["-c".into(), params.changelist_id.clone()]);
+            args.extend(["-c".into(), changelist_id.clone()]);
             args.extend(required_files(params, params.action.as_str())?);
             args
         }
         ShelfModifyAction::Delete => {
             let mut args = vec!["shelve".into(), "-d".into(), "-c".into()];
-            args.push(params.changelist_id.clone());
+            args.push(changelist_id.clone());
             if let Some(file_paths) = &params.file_paths {
                 args.extend(file_paths.iter().cloned());
             }
             args
         }
         ShelfModifyAction::UnshelveToChangelist => {
+            let target_changelist = required_value(
+                &params.target_changelist,
+                "target_changelist",
+                params.action.as_str(),
+            )?;
             let mut args = vec![
                 "unshelve".into(),
                 "-s".into(),
-                params.changelist_id.clone(),
+                changelist_id.clone(),
                 "-c".into(),
-                params.target_changelist.clone(),
+                target_changelist,
             ];
             if let Some(file_paths) = &params.file_paths {
                 args.extend(file_paths.iter().cloned());
@@ -132,4 +142,13 @@ fn required_files(params: &ModifyShelvesParams, action: &str) -> Result<Vec<Stri
             message: format!("file_paths is required for {action}"),
         }),
     }
+}
+
+fn required_value(value: &str, name: &str, action: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(P4McpError::InvalidInput {
+            message: format!("{name} is required for {action}"),
+        });
+    }
+    Ok(value.to_string())
 }

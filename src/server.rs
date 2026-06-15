@@ -52,7 +52,10 @@ use crate::{
             interchanges_invocation, opened_for_stream_validation_invocation,
             stream_resolve_preview_invocation, stream_spec_with_view_invocation,
         },
-        workspaces::{build_workspace_delete_invocation, build_workspace_query_invocation},
+        workspaces::{
+            build_workspace_delete_invocation, build_workspace_query_invocation,
+            required_workspace_name,
+        },
     },
 };
 
@@ -661,6 +664,9 @@ impl P4McpServer {
             .check(Access::Write, Toolset::Workspaces, "modify_workspaces")
             .map_err(to_mcp_error)?;
         let action = params.action.as_str().to_string();
+        let workspace_name =
+            required_workspace_name(&params.workspace_name, params.action.as_str())
+                .map_err(to_mcp_error)?;
         let invocation = match params.action {
             WorkspaceModifyAction::Create | WorkspaceModifyAction::Update => json_invocation(
                 vec!["client".to_string(), "-i".to_string()],
@@ -673,7 +679,7 @@ impl P4McpServer {
                 vec![
                     "client".to_string(),
                     "-s".to_string(),
-                    params.workspace_name.clone(),
+                    workspace_name.clone(),
                 ],
                 None,
             ),
@@ -683,9 +689,9 @@ impl P4McpServer {
             P4ApprovalContext {
                 tool: "modify_workspaces",
                 action: &action,
-                targets: vec![params.workspace_name.clone()],
+                targets: vec![workspace_name.clone()],
                 changelist: None,
-                workspace: Some(params.workspace_name.clone()),
+                workspace: Some(workspace_name.clone()),
                 stream: None,
                 invocation: &invocation,
             },
@@ -702,7 +708,7 @@ impl P4McpServer {
                     .run_p4(text_invocation(vec![
                         "client".to_string(),
                         "-o".to_string(),
-                        params.workspace_name.clone(),
+                        workspace_name.clone(),
                     ]))
                     .await?;
                 let existing = output
@@ -2512,6 +2518,38 @@ Files:
                 "ws-main".to_string(),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_blank_name_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Update);
+        params.workspace_name = " ".to_string();
+
+        let err = match server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("blank workspace_name should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("workspace_name is required for update")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
     }
 
     #[tokio::test]

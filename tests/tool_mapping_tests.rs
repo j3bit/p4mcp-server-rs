@@ -903,6 +903,42 @@ fn modify_shelves_force_shelve_uses_file_paths() {
 }
 
 #[test]
+fn modify_shelves_blank_changelist_id_errors() {
+    let params = ModifyShelvesParams {
+        action: ShelfModifyAction::Delete,
+        changelist_id: " ".to_string(),
+        file_paths: None,
+        target_changelist: "default".to_string(),
+        force: false,
+        approval_token: None,
+    };
+
+    let error = build_shelf_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("changelist_id is required for delete"));
+}
+
+#[test]
+fn modify_shelves_blank_target_changelist_errors() {
+    let params = ModifyShelvesParams {
+        action: ShelfModifyAction::UnshelveToChangelist,
+        changelist_id: "12345".to_string(),
+        file_paths: None,
+        target_changelist: " ".to_string(),
+        force: false,
+        approval_token: None,
+    };
+
+    let error = build_shelf_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("target_changelist is required for unshelve_to_changelist"));
+}
+
+#[test]
 fn modify_workspaces_delete_maps_to_client_delete() {
     let params = ModifyWorkspacesParams {
         action: WorkspaceModifyAction::Delete,
@@ -919,6 +955,26 @@ fn modify_workspaces_delete_maps_to_client_delete() {
 
     assert_eq!(invocation.args, vec!["client", "-d", "ws-main"]);
     assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn modify_workspaces_blank_name_delete_errors() {
+    let params = ModifyWorkspacesParams {
+        action: WorkspaceModifyAction::Delete,
+        workspace_name: " ".to_string(),
+        workspace_root: None,
+        workspace_description: None,
+        workspace_options: None,
+        workspace_line_end: None,
+        workspace_view: None,
+        approval_token: None,
+    };
+
+    let error = build_workspace_delete_invocation(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("workspace_name is required for delete"));
 }
 
 #[test]
