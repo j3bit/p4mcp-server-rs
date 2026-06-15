@@ -1,7 +1,9 @@
 use crate::{
     error::{P4McpError, Result},
     p4::runner::{OutputMode, P4Invocation},
-    tools::params::{QueryStreamsParams, StreamQueryAction},
+    tools::params::{
+        ModifyStreamsParams, QueryStreamsParams, StreamModifyAction, StreamQueryAction,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +40,21 @@ impl StreamQueryCommand {
         match self {
             Self::Single(invocation) => Some(invocation),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamModifyCommand {
+    Single(P4Invocation),
+    CreateOrUpdate,
+}
+
+impl StreamModifyCommand {
+    pub fn into_single_invocation(self) -> Option<P4Invocation> {
+        match self {
+            Self::Single(invocation) => Some(invocation),
+            Self::CreateOrUpdate => None,
         }
     }
 }
@@ -83,6 +100,76 @@ pub fn build_stream_query_command(params: &QueryStreamsParams) -> Result<StreamQ
             limit: params.limit,
         }),
     }
+}
+
+pub fn build_stream_modify_command(params: &ModifyStreamsParams) -> Result<StreamModifyCommand> {
+    let invocation = match &params.action {
+        StreamModifyAction::Create
+        | StreamModifyAction::Update
+        | StreamModifyAction::CreateWorkspace => return Ok(StreamModifyCommand::CreateOrUpdate),
+        StreamModifyAction::Delete => json_invocation(vec![
+            "stream".into(),
+            "-d".into(),
+            required(params.stream_name.as_deref(), "stream_name")?,
+        ]),
+        StreamModifyAction::EditSpec => {
+            let mut args = vec!["edit".to_string(), "-So".to_string()];
+            if let Some(changelist) = non_blank(params.changelist.as_deref()) {
+                args.extend(["-c".to_string(), changelist.to_string()]);
+            }
+            json_invocation(args)
+        }
+        StreamModifyAction::ResolveSpec => {
+            let mode = match params.resolve_mode.as_deref().unwrap_or("auto") {
+                "auto" => "-am",
+                "accept_theirs" => "-at",
+                "accept_yours" => "-ay",
+                "accept_safe" => "-as",
+                other => {
+                    return Err(P4McpError::InvalidInput {
+                        message: format!("invalid resolve_mode: {other}"),
+                    });
+                }
+            };
+            json_invocation(vec!["resolve".into(), "-So".into(), mode.into()])
+        }
+        StreamModifyAction::RevertSpec => json_invocation(vec!["revert".into(), "-So".into()]),
+        StreamModifyAction::ShelveSpec => json_invocation(vec![
+            "shelve".into(),
+            "-As".into(),
+            "-c".into(),
+            required(params.changelist.as_deref(), "changelist")?,
+        ]),
+        StreamModifyAction::UnshelveSpec => {
+            let mut args = vec![
+                "unshelve".to_string(),
+                "-As".to_string(),
+                "-s".to_string(),
+                required(params.changelist.as_deref(), "changelist")?,
+            ];
+            if let Some(target) = non_blank(params.target_changelist.as_deref()) {
+                args.extend(["-c".to_string(), target.to_string()]);
+            }
+            json_invocation(args)
+        }
+        StreamModifyAction::Copy => propagation_invocation("copy", params)?,
+        StreamModifyAction::Merge => propagation_invocation("merge", params)?,
+        StreamModifyAction::Integrate => propagation_invocation("integrate", params)?,
+        StreamModifyAction::Populate => populate_invocation(params)?,
+        StreamModifyAction::Switch => {
+            let mut args = vec![
+                "client".to_string(),
+                "-s".to_string(),
+                "-S".to_string(),
+                required(params.stream_name.as_deref(), "stream_name")?,
+            ];
+            if let Some(workspace) = non_blank(params.workspace.as_deref()) {
+                args.push(workspace.to_string());
+            }
+            json_invocation(args)
+        }
+    };
+    Ok(StreamModifyCommand::Single(invocation))
 }
 
 fn stream_list_invocation(params: &QueryStreamsParams) -> P4Invocation {
@@ -227,6 +314,96 @@ pub fn stream_spec_with_view_invocation(stream_name: &str) -> P4Invocation {
 
 pub fn stream_resolve_preview_invocation() -> P4Invocation {
     json_invocation(vec!["stream".into(), "resolve".into(), "-n".into()])
+}
+
+fn propagation_invocation(command: &str, params: &ModifyStreamsParams) -> Result<P4Invocation> {
+    let mut args = vec![command.to_string()];
+    if params.preview {
+        args.push("-n".into());
+    }
+    if params.force {
+        args.push("-F".into());
+    }
+    if command == "copy" && params.virtual_stream {
+        args.push("-v".into());
+    }
+    if params.quiet {
+        args.push("-q".into());
+    }
+    if let Some(changelist) = non_blank(params.changelist.as_deref()) {
+        args.extend(["-c".into(), changelist.into()]);
+    }
+    if let Some(max_files) = params.max_files {
+        args.push(format!("-m{max_files}"));
+    }
+    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
+        args.extend(["-S".into(), stream_name.into()]);
+    }
+    if let Some(parent) = non_blank(params.parent_stream.as_deref()) {
+        args.extend(["-P".into(), parent.into()]);
+    }
+    if let Some(branch) = non_blank(params.branch.as_deref()) {
+        args.extend(["-b".into(), branch.into()]);
+    }
+    if params.reverse {
+        args.push("-r".into());
+    }
+    if params.output_base && matches!(command, "merge" | "integrate") {
+        args.push("-Ob".into());
+    }
+    if command == "integrate" {
+        if params.schedule_branch_resolve {
+            args.push("-Rb".into());
+        }
+        if params.integrate_around_deleted {
+            args.push("-Di".into());
+        }
+        if params.skip_cherry_picked {
+            args.push("-Rs".into());
+        }
+    }
+    if let Some(file_paths) = &params.file_paths {
+        args.extend(file_paths.iter().cloned());
+    }
+    Ok(json_invocation(args))
+}
+
+fn populate_invocation(params: &ModifyStreamsParams) -> Result<P4Invocation> {
+    let mut args = vec!["populate".to_string()];
+    if params.preview {
+        args.push("-n".into());
+    }
+    if params.force {
+        args.push("-F".into());
+    }
+    if params.reverse {
+        args.push("-r".into());
+    }
+    if params.output_base {
+        args.push("-o".into());
+    }
+    if let Some(max_files) = params.max_files {
+        args.push(format!("-m{max_files}"));
+    }
+    if let Some(description) = non_blank(params.description.as_deref()) {
+        args.extend(["-d".into(), description.into()]);
+    }
+    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
+        args.extend(["-S".into(), stream_name.into()]);
+    }
+    if let Some(parent) = non_blank(params.parent_stream.as_deref()) {
+        args.extend(["-P".into(), parent.into()]);
+    }
+    if let Some(branch) = non_blank(params.branch.as_deref()) {
+        args.extend(["-b".into(), branch.into()]);
+    }
+    if let Some(source) = non_blank(params.source_path.as_deref()) {
+        args.push(source.into());
+    }
+    if let Some(target) = non_blank(params.target_path.as_deref()) {
+        args.push(target.into());
+    }
+    Ok(json_invocation(args))
 }
 
 fn json_invocation(args: Vec<String>) -> P4Invocation {

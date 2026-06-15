@@ -9,6 +9,20 @@ pub struct WorkspaceFormPatch {
     pub view: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamFormPatch {
+    pub stream: Option<String>,
+    pub stream_type: Option<String>,
+    pub parent: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub options: Option<String>,
+    pub parent_view: Option<String>,
+    pub paths: Option<Vec<String>>,
+    pub remapped: Option<Vec<String>>,
+    pub ignored: Option<Vec<String>>,
+}
+
 pub fn change_form(description: &str, files: &[String]) -> String {
     change_form_for("new", description, files)
 }
@@ -63,6 +77,41 @@ pub fn patch_workspace_form(existing: &str, patch: &WorkspaceFormPatch) -> Resul
     }
     if let Some(view) = &patch.view {
         patched = upsert_indented_block(&patched, "View", &indent_lines(&view.join("\n")));
+    }
+    Ok(patched)
+}
+
+pub fn patch_stream_form(existing: &str, patch: &StreamFormPatch) -> Result<String> {
+    let mut patched = existing.to_string();
+    if let Some(stream) = &patch.stream {
+        patched = replace_single_line_field(&patched, "Stream", stream);
+    }
+    if let Some(stream_type) = &patch.stream_type {
+        patched = replace_single_line_field(&patched, "Type", stream_type);
+    }
+    if let Some(parent) = &patch.parent {
+        patched = replace_single_line_field(&patched, "Parent", parent);
+    }
+    if let Some(name) = &patch.name {
+        patched = replace_single_line_field(&patched, "Name", name);
+    }
+    if let Some(description) = &patch.description {
+        patched = upsert_indented_block(&patched, "Description", &indent_lines(description));
+    }
+    if let Some(options) = &patch.options {
+        patched = replace_single_line_field(&patched, "Options", options);
+    }
+    if let Some(parent_view) = &patch.parent_view {
+        patched = replace_single_line_field(&patched, "ParentView", parent_view);
+    }
+    if let Some(paths) = &patch.paths {
+        patched = replace_list_block(&patched, "Paths", paths);
+    }
+    if let Some(remapped) = &patch.remapped {
+        patched = replace_list_block(&patched, "Remapped", remapped);
+    }
+    if let Some(ignored) = &patch.ignored {
+        patched = replace_list_block(&patched, "Ignored", ignored);
     }
     Ok(patched)
 }
@@ -163,4 +212,8 @@ fn indent_lines(text: &str) -> String {
         .map(|line| format!("\t{line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn replace_list_block(existing: &str, field: &str, values: &[String]) -> String {
+    upsert_indented_block(existing, field, &indent_lines(&values.join("\n")))
 }

@@ -25,7 +25,8 @@ use crate::{
     error::P4McpError,
     p4::{
         forms::{
-            WorkspaceFormPatch, change_form, patch_change_description_form, patch_workspace_form,
+            StreamFormPatch, WorkspaceFormPatch, change_form, patch_change_description_form,
+            patch_stream_form, patch_workspace_form,
         },
         runner::{OutputMode, P4CommandOutput, P4Env, P4Executor, P4Invocation, TokioP4Executor},
     },
@@ -36,9 +37,10 @@ use crate::{
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
             ChangelistModifyAction, CommonModifyParams, FileQueryAction, ModifyChangelistsParams,
-            ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyWorkspacesParams,
-            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
-            QueryStreamsParams, QueryWorkspacesParams, WorkspaceModifyAction,
+            ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams,
+            ModifyWorkspacesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
+            QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction,
+            WorkspaceModifyAction,
         },
         response::ToolResponse,
         reviews::{
@@ -48,9 +50,10 @@ use crate::{
         server::{QueryServerParams, build_server_invocation},
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
         streams::{
-            StreamQueryCommand, build_stream_query_command, client_spec_invocation,
-            interchanges_invocation, opened_for_stream_validation_invocation,
-            stream_resolve_preview_invocation, stream_spec_with_view_invocation,
+            StreamModifyCommand, StreamQueryCommand, build_stream_modify_command,
+            build_stream_query_command, client_spec_invocation, interchanges_invocation,
+            opened_for_stream_validation_invocation, stream_resolve_preview_invocation,
+            stream_spec_with_view_invocation,
         },
         workspaces::{
             build_workspace_delete_invocation, build_workspace_query_invocation,
@@ -769,49 +772,70 @@ impl P4McpServer {
 
     async fn modify_streams_inner(
         &self,
-        params: CommonModifyParams,
+        params: ModifyStreamsParams,
         channel: ApprovalChannel,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Write, Toolset::Streams, "modify_streams")
             .map_err(to_mcp_error)?;
-        let (args, stdin, stream) = match params.action.as_str() {
-            "create" | "update" => (
+        let action = params.action.as_str().to_string();
+        let command = build_stream_modify_command(&params).map_err(to_mcp_error)?;
+        let preview_invocation = match &command {
+            StreamModifyCommand::Single(invocation) => invocation.clone(),
+            StreamModifyCommand::CreateOrUpdate => json_invocation(
                 vec!["stream".to_string(), "-i".to_string()],
-                Some(required_form(params.form.as_deref(), &params.action)?),
-                params.stream.clone(),
+                Some(format!(
+                    "Stream: {}\n\n<patched after approval>\n",
+                    params.stream_name.as_deref().unwrap_or("<required>")
+                )),
             ),
-            "delete" => {
-                let stream = required_option(params.stream.as_deref(), "stream", "delete")?;
-                (
-                    vec!["stream".to_string(), "-d".to_string(), stream.clone()],
-                    None,
-                    Some(stream),
-                )
-            }
-            other => return Err(to_mcp_error(unknown_action(other))),
         };
-        let invocation = json_invocation(args, stdin);
-        let targets = named_scope_targets(stream.as_deref(), "stream form");
-        let request = self.common_modify_approval_request(
-            &params,
-            P4ApprovalContext {
-                tool: "modify_streams",
-                action: &params.action,
-                targets,
-                changelist: None,
-                workspace: None,
-                stream,
-                invocation: &invocation,
-            },
-        );
+        let request = self.modify_streams_approval_request(&params, &preview_invocation);
         if let Some(response) = self
             .require_write_approval(channel, request, params.approval_token.as_deref())
             .await?
         {
             return Ok(response);
         }
-        self.call_p4_tool(&params.action, invocation).await
+        match command {
+            StreamModifyCommand::Single(invocation) => self.call_p4_tool(&action, invocation).await,
+            StreamModifyCommand::CreateOrUpdate => {
+                let stream_name =
+                    required_option(params.stream_name.as_deref(), "stream_name", &action)?;
+                let current = self
+                    .run_p4(text_invocation(vec![
+                        "stream".to_string(),
+                        "-o".to_string(),
+                        stream_name.clone(),
+                    ]))
+                    .await?;
+                let current_form = current
+                    .text
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        to_mcp_error(invalid_input("p4 stream -o did not return stdout"))
+                    })?;
+                let patch = StreamFormPatch {
+                    stream: Some(stream_name),
+                    stream_type: params.stream_type.clone(),
+                    parent: params.parent.clone(),
+                    name: params.name.clone(),
+                    description: params.description.clone(),
+                    options: params.options.clone(),
+                    parent_view: params.parent_view.clone(),
+                    paths: params.paths.clone(),
+                    remapped: params.remapped.clone(),
+                    ignored: params.ignored.clone(),
+                };
+                let patched = patch_stream_form(current_form, &patch).map_err(to_mcp_error)?;
+                self.call_p4_tool(
+                    &action,
+                    json_invocation(vec!["stream".to_string(), "-i".to_string()], Some(patched)),
+                )
+                .await
+            }
+        }
     }
 
     fn common_modify_approval_request(
@@ -896,6 +920,35 @@ impl P4McpServer {
             params: serde_json::to_value(approval_params)
                 .expect("modify jobs params serialize to JSON"),
             preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_streams_approval_request(
+        &self,
+        params: &ModifyStreamsParams,
+        invocation: &P4Invocation,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let action = params.action.as_str().to_string();
+
+        ApprovalRequest {
+            tool: "modify_streams".to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify streams params serialize to JSON"),
+            preview: self.p4_approval_preview(P4ApprovalContext {
+                tool: "modify_streams",
+                action: &action,
+                targets: named_scope_targets(params.stream_name.as_deref(), "stream operation"),
+                changelist: params.changelist.clone(),
+                workspace: params
+                    .workspace
+                    .clone()
+                    .or_else(|| params.workspace_name.clone()),
+                stream: params.stream_name.clone(),
+                invocation,
+            }),
         }
     }
 
@@ -1259,7 +1312,7 @@ impl P4McpServer {
     pub async fn modify_streams(
         &self,
         peer: Peer<RoleServer>,
-        Parameters(params): Parameters<CommonModifyParams>,
+        Parameters(params): Parameters<ModifyStreamsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.modify_streams_inner(params, ApprovalChannel::Elicitation(peer))
             .await
@@ -1750,19 +1803,6 @@ fn required_option(value: Option<&str>, name: &str, action: &str) -> McpResult<S
     }
 }
 
-fn required_form(value: Option<&str>, action: &str) -> McpResult<String> {
-    match value {
-        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
-        _ => Err(to_mcp_error(P4McpError::InvalidInput {
-            message: format!("form is required for {action}"),
-        })),
-    }
-}
-
-fn unknown_action(action: &str) -> P4McpError {
-    invalid_input(format!("unknown action: {action}"))
-}
-
 fn invalid_input(message: impl Into<String>) -> P4McpError {
     P4McpError::InvalidInput {
         message: message.into(),
@@ -1910,15 +1950,42 @@ mod tests {
         }
     }
 
-    fn common_modify_params(action: &str) -> CommonModifyParams {
-        CommonModifyParams {
-            action: action.to_string(),
-            changelist_id: None,
-            workspace_name: None,
-            stream: None,
+    fn modify_streams_params(action: StreamModifyAction) -> ModifyStreamsParams {
+        ModifyStreamsParams {
+            action,
+            stream_name: None,
+            stream_type: None,
+            parent: None,
+            name: None,
             description: None,
-            files: Vec::new(),
-            form: None,
+            options: None,
+            parent_view: None,
+            paths: None,
+            remapped: None,
+            ignored: None,
+            changelist: None,
+            resolve_mode: None,
+            target_changelist: None,
+            parent_stream: None,
+            branch: None,
+            file_paths: None,
+            preview: false,
+            force: false,
+            reverse: false,
+            quiet: false,
+            max_files: None,
+            output_base: false,
+            virtual_stream: false,
+            schedule_branch_resolve: false,
+            integrate_around_deleted: false,
+            skip_cherry_picked: false,
+            source_path: None,
+            target_path: None,
+            workspace: None,
+            workspace_name: None,
+            root: None,
+            host: None,
+            alt_roots: None,
             approval_token: None,
         }
     }
@@ -2643,8 +2710,8 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("delete");
-        params.stream = Some("//streams/dev".to_string());
+        let mut params = modify_streams_params(StreamModifyAction::Delete);
+        params.stream_name = Some("//streams/dev".to_string());
 
         let response = server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
@@ -2687,8 +2754,7 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("update");
-        params.form = Some("Stream: //streams/dev\n".to_string());
+        let mut params = modify_streams_params(StreamModifyAction::Update);
 
         let response = server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
@@ -2699,7 +2765,7 @@ Files:
         assert!(executor.invocations().is_empty());
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].request.preview.targets, ["stream form"]);
+        assert_eq!(calls[0].request.preview.targets, ["stream operation"]);
     }
 
     #[tokio::test]

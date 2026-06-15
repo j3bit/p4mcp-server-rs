@@ -10,14 +10,14 @@ use p4mcp_server_rs::{
         params::{
             ChangelistModifyAction, ChangelistQueryAction, FileModifyAction, FileQueryAction,
             JobModifyAction, JobQueryAction, ModifyChangelistsParams, ModifyFilesParams,
-            ModifyJobsParams, ModifyShelvesParams, ModifyWorkspacesParams, QueryChangelistsParams,
-            QueryFilesParams, QueryJobsParams, QueryShelvesParams, QueryStreamsParams,
-            QueryWorkspacesParams, ShelfModifyAction, ShelfQueryAction, StreamQueryAction,
-            WorkspaceModifyAction, WorkspaceQueryAction,
+            ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams, ModifyWorkspacesParams,
+            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
+            QueryStreamsParams, QueryWorkspacesParams, ShelfModifyAction, ShelfQueryAction,
+            StreamModifyAction, StreamQueryAction, WorkspaceModifyAction, WorkspaceQueryAction,
         },
         server::{QueryServerParams, ServerQueryAction, build_server_invocation},
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
-        streams::build_stream_query_command,
+        streams::{build_stream_modify_command, build_stream_query_command},
         workspaces::{build_workspace_delete_invocation, build_workspace_query_invocation},
     },
 };
@@ -1042,6 +1042,98 @@ fn workspace_list_by_user_uses_user_filter() {
 fn workspace_type_uses_client_spec() {
     let invocation = build_workspace_query_invocation("type", Some("ws-stream"), None, 10).unwrap();
     assert_eq!(invocation.args, vec!["client", "-o", "ws-stream"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+fn modify_streams_params(action: StreamModifyAction) -> ModifyStreamsParams {
+    ModifyStreamsParams {
+        action,
+        stream_name: None,
+        stream_type: None,
+        parent: None,
+        name: None,
+        description: None,
+        options: None,
+        parent_view: None,
+        paths: None,
+        remapped: None,
+        ignored: None,
+        changelist: None,
+        resolve_mode: None,
+        target_changelist: None,
+        parent_stream: None,
+        branch: None,
+        file_paths: None,
+        preview: false,
+        force: false,
+        reverse: false,
+        quiet: false,
+        max_files: None,
+        output_base: false,
+        virtual_stream: false,
+        schedule_branch_resolve: false,
+        integrate_around_deleted: false,
+        skip_cherry_picked: false,
+        source_path: None,
+        target_path: None,
+        workspace: None,
+        workspace_name: None,
+        root: None,
+        host: None,
+        alt_roots: None,
+        approval_token: None,
+    }
+}
+
+#[test]
+fn modify_streams_edit_spec_uses_stream_spec_edit_command() {
+    let mut params = modify_streams_params(StreamModifyAction::EditSpec);
+    params.stream_name = Some("//depot/main".to_string());
+    params.changelist = Some("12345".to_string());
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(invocation.args, vec!["edit", "-So", "-c", "12345"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn modify_streams_copy_uses_upstream_stream_flags() {
+    let mut params = modify_streams_params(StreamModifyAction::Copy);
+    params.stream_name = Some("//depot/dev".to_string());
+    params.changelist = Some("12345".to_string());
+    params.parent_stream = Some("//depot/main".to_string());
+    params.file_paths = Some(vec!["//depot/dev/...".to_string()]);
+    params.preview = true;
+    params.force = true;
+    params.reverse = true;
+    params.quiet = true;
+    params.virtual_stream = true;
+    params.max_files = Some(25);
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "copy",
+            "-n",
+            "-F",
+            "-v",
+            "-q",
+            "-c",
+            "12345",
+            "-m25",
+            "-S",
+            "//depot/dev",
+            "-P",
+            "//depot/main",
+            "-r",
+            "//depot/dev/..."
+        ]
+    );
     assert_eq!(invocation.mode, OutputMode::JsonLines);
 }
 
