@@ -7,8 +7,10 @@ use p4mcp_server_rs::{
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::build_job_query_invocation,
         params::{
-            CommonModifyParams, FileModifyAction, FileQueryAction, ModifyFilesParams,
-            QueryFilesParams,
+            ChangelistQueryAction, CommonModifyParams, FileModifyAction, FileQueryAction,
+            JobQueryAction, ModifyFilesParams, QueryChangelistsParams, QueryFilesParams,
+            QueryJobsParams, QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams,
+            ShelfQueryAction, StreamQueryAction, WorkspaceQueryAction,
         },
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
@@ -58,6 +60,176 @@ fn modify_file_params_schema_exposes_approval_token() {
 #[test]
 fn modify_file_params_schema_omits_confirmation() {
     assert!(!schema_has_property::<ModifyFilesParams>("confirmation"));
+}
+
+#[test]
+fn query_changelists_schema_matches_upstream_fields() {
+    assert!(schema_has_property::<QueryChangelistsParams>("depot_path"));
+    assert!(!schema_has_property::<QueryChangelistsParams>("file_path"));
+    assert!(!schema_has_property::<QueryChangelistsParams>("stream"));
+    assert!(!schema_has_property::<QueryChangelistsParams>("owner"));
+}
+
+#[test]
+fn query_shelves_schema_matches_upstream_fields() {
+    assert!(schema_has_property::<QueryShelvesParams>("changelist_id"));
+    assert!(schema_has_property::<QueryShelvesParams>("user"));
+    assert!(!schema_has_property::<QueryShelvesParams>("workspace_name"));
+    assert!(!schema_has_property::<QueryShelvesParams>("file_path"));
+}
+
+#[test]
+fn query_workspaces_schema_matches_upstream_fields() {
+    assert!(schema_has_property::<QueryWorkspacesParams>(
+        "workspace_name"
+    ));
+    assert!(schema_has_property::<QueryWorkspacesParams>("user"));
+    assert!(!schema_has_property::<QueryWorkspacesParams>(
+        "changelist_id"
+    ));
+    assert!(!schema_has_property::<QueryWorkspacesParams>("file_path"));
+}
+
+#[test]
+fn query_jobs_schema_matches_upstream_fields() {
+    assert!(schema_has_property::<QueryJobsParams>("changelist_id"));
+    assert!(schema_has_property::<QueryJobsParams>("job_id"));
+    assert!(!schema_has_property::<QueryJobsParams>("workspace_name"));
+    assert!(!schema_has_property::<QueryJobsParams>("file_path"));
+}
+
+#[test]
+fn upstream_query_action_enums_deserialize_and_render_as_str() {
+    let shelf: ShelfQueryAction = serde_json::from_value(serde_json::json!("diff")).unwrap();
+    let workspace: WorkspaceQueryAction =
+        serde_json::from_value(serde_json::json!("type")).unwrap();
+    let job: JobQueryAction = serde_json::from_value(serde_json::json!("get_job")).unwrap();
+
+    assert_eq!(shelf, ShelfQueryAction::Diff);
+    assert_eq!(shelf.as_str(), "diff");
+    assert_eq!(workspace, WorkspaceQueryAction::Type);
+    assert_eq!(workspace.as_str(), "type");
+    assert_eq!(job, JobQueryAction::GetJob);
+    assert_eq!(job.as_str(), "get_job");
+}
+
+#[test]
+fn query_streams_schema_matches_upstream_fields() {
+    for field in [
+        "action",
+        "stream_name",
+        "stream_path",
+        "filter",
+        "fields",
+        "unloaded",
+        "all_streams",
+        "viewmatch",
+        "view_without_edit",
+        "at_change",
+        "both_directions",
+        "force_refresh",
+        "workspace",
+        "template",
+        "user",
+        "file_paths",
+        "changelist",
+        "reverse",
+        "long_output",
+        "limit",
+        "max_results",
+    ] {
+        assert!(
+            schema_has_property::<QueryStreamsParams>(field),
+            "missing stream schema field {field}"
+        );
+    }
+
+    assert!(!schema_has_property::<QueryStreamsParams>("stream"));
+    assert!(!schema_has_property::<QueryStreamsParams>("owner"));
+}
+
+#[test]
+fn query_changelists_params_deserialize_list_action_with_depot_path() {
+    let params: QueryChangelistsParams = serde_json::from_value(serde_json::json!({
+        "action": "list",
+        "workspace_name": "ws-main",
+        "user": "alice",
+        "status": "pending",
+        "depot_path": "//depot/main/...",
+        "max_results": 7
+    }))
+    .unwrap();
+
+    assert_eq!(params.action, ChangelistQueryAction::List);
+    assert_eq!(params.action.as_str(), "list");
+    assert_eq!(params.depot_path.as_deref(), Some("//depot/main/..."));
+}
+
+#[test]
+fn query_streams_params_deserialize_upstream_list_fields() {
+    let params: QueryStreamsParams = serde_json::from_value(serde_json::json!({
+        "action": "list",
+        "stream_path": ["//depot/..."],
+        "filter": "Owner=alice",
+        "fields": ["Stream", "Owner", "Type"],
+        "unloaded": true,
+        "all_streams": true,
+        "viewmatch": "//depot/main/file.txt",
+        "template": "//streams/template",
+        "max_results": 25
+    }))
+    .unwrap();
+
+    assert_eq!(params.action, StreamQueryAction::List);
+    assert_eq!(params.action.as_str(), "list");
+    assert_eq!(
+        params.stream_path.as_deref(),
+        Some(&["//depot/...".to_string()][..])
+    );
+    assert_eq!(params.filter.as_deref(), Some("Owner=alice"));
+    assert_eq!(
+        params.fields.as_deref(),
+        Some(
+            &[
+                "Stream".to_string(),
+                "Owner".to_string(),
+                "Type".to_string()
+            ][..]
+        )
+    );
+    assert!(params.unloaded);
+    assert!(params.all_streams);
+    assert_eq!(params.viewmatch.as_deref(), Some("//depot/main/file.txt"));
+    assert_eq!(params.template.as_deref(), Some("//streams/template"));
+    assert_eq!(params.max_results, 25);
+}
+
+#[test]
+fn query_streams_params_default_max_results_and_template() {
+    let params: QueryStreamsParams = serde_json::from_value(serde_json::json!({
+        "action": "list"
+    }))
+    .unwrap();
+
+    assert_eq!(params.max_results, 50);
+    assert_eq!(params.template, None);
+}
+
+#[test]
+fn stream_query_action_multi_word_variants_deserialize_and_render_as_str() {
+    for (value, expected) in [
+        ("integration_status", StreamQueryAction::IntegrationStatus),
+        ("get_workspace", StreamQueryAction::GetWorkspace),
+        ("list_workspaces", StreamQueryAction::ListWorkspaces),
+        ("validate_file", StreamQueryAction::ValidateFile),
+        ("validate_submit", StreamQueryAction::ValidateSubmit),
+        ("check_resolve", StreamQueryAction::CheckResolve),
+    ] {
+        let action: StreamQueryAction = serde_json::from_value(serde_json::json!(value)).unwrap();
+
+        assert_eq!(action, expected);
+        assert_eq!(action.as_str(), value);
+    }
 }
 
 #[test]
