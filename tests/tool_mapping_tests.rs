@@ -14,7 +14,7 @@ use p4mcp_server_rs::{
         },
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
-        streams::build_stream_query_invocation,
+        streams::{build_stream_query_command, build_stream_query_invocation},
         workspaces::build_workspace_query_invocation,
     },
 };
@@ -852,26 +852,142 @@ fn job_query_rejects_non_upstream_list_action() {
 }
 
 #[test]
-fn stream_list_with_owner_uses_owner_filter() {
-    let invocation = build_stream_query_invocation("list", None, Some("alice"), 25).unwrap();
+fn stream_list_uses_upstream_filters() {
+    let params = QueryStreamsParams {
+        action: StreamQueryAction::List,
+        stream_name: None,
+        stream_path: Some(vec!["//depot/...".to_string()]),
+        filter: Some("Owner=alice".to_string()),
+        fields: Some(vec![
+            "Stream".to_string(),
+            "Owner".to_string(),
+            "Type".to_string(),
+        ]),
+        unloaded: true,
+        all_streams: true,
+        viewmatch: Some("//depot/main/file.txt".to_string()),
+        view_without_edit: false,
+        at_change: None,
+        both_directions: false,
+        force_refresh: false,
+        workspace: None,
+        template: None,
+        user: None,
+        file_paths: None,
+        changelist: None,
+        reverse: false,
+        long_output: false,
+        limit: None,
+        max_results: 25,
+    };
+
+    let command = build_stream_query_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
     assert_eq!(
         invocation.args,
-        vec!["streams", "-m", "25", "-F", "Owner=alice"]
+        vec![
+            "streams",
+            "-U",
+            "-a",
+            "-F",
+            "Owner=alice",
+            "-T",
+            "Stream,Owner,Type",
+            "-m",
+            "25",
+            "--viewmatch",
+            "//depot/main/file.txt",
+            "//depot/..."
+        ]
     );
 }
 
 #[test]
-fn stream_integration_status_uses_istat() {
+fn stream_integration_status_uses_upstream_flags() {
+    let params = QueryStreamsParams {
+        action: StreamQueryAction::IntegrationStatus,
+        stream_name: Some("//streams/dev".to_string()),
+        stream_path: None,
+        filter: None,
+        fields: None,
+        unloaded: false,
+        all_streams: false,
+        viewmatch: None,
+        view_without_edit: false,
+        at_change: None,
+        both_directions: true,
+        force_refresh: true,
+        workspace: None,
+        template: None,
+        user: None,
+        file_paths: None,
+        changelist: None,
+        reverse: false,
+        long_output: false,
+        limit: None,
+        max_results: 10,
+    };
+
+    let command = build_stream_query_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+    assert_eq!(invocation.args, vec!["istat", "-a", "-c", "//streams/dev"]);
+}
+
+#[test]
+fn stream_legacy_parent_maps_to_stream_spec() {
     let invocation =
-        build_stream_query_invocation("integration_status", Some("//streams/dev"), None, 10)
-            .unwrap();
-    assert_eq!(invocation.args, vec!["istat", "-s", "//streams/dev"]);
+        build_stream_query_invocation("parent", Some("//streams/dev"), None, 10).unwrap();
+
+    assert_eq!(invocation.args, vec!["stream", "-o", "//streams/dev"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn stream_legacy_parent_missing_stream_uses_legacy_error_name() {
+    let error = build_stream_query_invocation("parent", None, None, 10)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("stream is required"));
+}
+
+#[test]
+fn stream_legacy_graph_maps_to_streams_graph_fields() {
+    let invocation = build_stream_query_invocation("graph", None, None, 10).unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec!["streams", "-T", "Stream,Parent,Type,Name,Owner"]
+    );
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
 }
 
 #[test]
 fn stream_get_blank_name_errors() {
-    let error = build_stream_query_invocation("get", Some(" "), None, 10)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("stream is required"));
+    let params = QueryStreamsParams {
+        action: StreamQueryAction::Get,
+        stream_name: Some(" ".to_string()),
+        stream_path: None,
+        filter: None,
+        fields: None,
+        unloaded: false,
+        all_streams: false,
+        viewmatch: None,
+        view_without_edit: false,
+        at_change: None,
+        both_directions: false,
+        force_refresh: false,
+        workspace: None,
+        template: None,
+        user: None,
+        file_paths: None,
+        changelist: None,
+        reverse: false,
+        long_output: false,
+        limit: None,
+        max_results: 10,
+    };
+
+    let error = build_stream_query_command(&params).unwrap_err().to_string();
+    assert!(error.contains("stream_name is required"));
 }
