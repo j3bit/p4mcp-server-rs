@@ -11,7 +11,10 @@ use p4mcp_server_rs::{
     p4::runner::{P4CommandOutput, P4Env, P4Executor, P4Invocation},
     server::P4McpServer,
     tools::{
-        params::{CommonQueryParams, FileQueryAction, QueryFilesParams},
+        params::{
+            ChangelistQueryAction, FileQueryAction, QueryChangelistsParams, QueryFilesParams,
+            QueryWorkspacesParams, WorkspaceQueryAction,
+        },
         reviews::{ReviewAction, ReviewRequest},
         server::ServerQueryAction,
     },
@@ -152,16 +155,13 @@ async fn query_changelists_calls_injected_executor() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
-        .query_changelists(Parameters(CommonQueryParams {
-            action: "list".to_string(),
+        .query_changelists(Parameters(QueryChangelistsParams {
+            action: ChangelistQueryAction::List,
             changelist_id: None,
             workspace_name: Some("ws-main".to_string()),
-            file_path: None,
             user: Some("alice".to_string()),
             status: Some("pending".to_string()),
-            job_id: None,
-            stream: None,
-            owner: None,
+            depot_path: Some("//depot/main/...".to_string()),
             max_results: 7,
         }))
         .await
@@ -174,7 +174,16 @@ async fn query_changelists_calls_injected_executor() {
     assert_eq!(
         executor.invocations()[0].args,
         [
-            "changes", "-m", "7", "-s", "pending", "-c", "ws-main", "-u", "alice"
+            "changes",
+            "-m",
+            "7",
+            "-s",
+            "pending",
+            "-c",
+            "ws-main",
+            "-u",
+            "alice",
+            "//depot/main/..."
         ]
     );
 }
@@ -188,16 +197,10 @@ async fn query_workspaces_list_by_user_calls_injected_executor() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
-        .query_workspaces(Parameters(CommonQueryParams {
-            action: "list".to_string(),
-            changelist_id: None,
+        .query_workspaces(Parameters(QueryWorkspacesParams {
+            action: WorkspaceQueryAction::List,
             workspace_name: None,
-            file_path: None,
             user: Some("alice".to_string()),
-            status: None,
-            job_id: None,
-            stream: None,
-            owner: None,
             max_results: 7,
         }))
         .await
@@ -228,16 +231,10 @@ async fn query_workspaces_type_classifies_stream_workspace() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
-        .query_workspaces(Parameters(CommonQueryParams {
-            action: "type".to_string(),
-            changelist_id: None,
+        .query_workspaces(Parameters(QueryWorkspacesParams {
+            action: WorkspaceQueryAction::Type,
             workspace_name: Some("ws-stream".to_string()),
-            file_path: None,
             user: None,
-            status: None,
-            job_id: None,
-            stream: None,
-            owner: None,
             max_results: 10,
         }))
         .await
@@ -280,16 +277,10 @@ async fn query_workspaces_status_runs_upstream_status_commands() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
-        .query_workspaces(Parameters(CommonQueryParams {
-            action: "status".to_string(),
-            changelist_id: None,
+        .query_workspaces(Parameters(QueryWorkspacesParams {
+            action: WorkspaceQueryAction::Status,
             workspace_name: Some("ws-main".to_string()),
-            file_path: None,
             user: None,
-            status: None,
-            job_id: None,
-            stream: None,
-            owner: None,
             max_results: 10,
         }))
         .await
@@ -326,16 +317,10 @@ async fn query_workspaces_status_requires_workspace_name() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let err = match server
-        .query_workspaces(Parameters(CommonQueryParams {
-            action: "status".to_string(),
-            changelist_id: None,
+        .query_workspaces(Parameters(QueryWorkspacesParams {
+            action: WorkspaceQueryAction::Status,
             workspace_name: None,
-            file_path: None,
             user: None,
-            status: None,
-            job_id: None,
-            stream: None,
-            owner: None,
             max_results: 10,
         }))
         .await

@@ -9,6 +9,7 @@ pub fn build_changelist_query_invocation(
     status: Option<&str>,
     workspace_name: Option<&str>,
     user: Option<&str>,
+    depot_path: Option<&str>,
     max_results: u16,
 ) -> Result<P4Invocation> {
     let args = match action {
@@ -30,6 +31,9 @@ pub fn build_changelist_query_invocation(
             }
             if let Some(user) = user {
                 args.extend(["-u".into(), user.into()]);
+            }
+            if let Some(depot_path) = depot_path {
+                args.push(depot_path.into());
             }
             args
         }

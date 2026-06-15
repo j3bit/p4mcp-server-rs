@@ -34,7 +34,8 @@ use crate::{
         jobs::build_job_query_invocation,
         params::{
             CommonModifyParams, CommonQueryParams, FileQueryAction, ModifyFilesParams,
-            QueryFilesParams,
+            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
+            QueryWorkspacesParams,
         },
         response::ToolResponse,
         reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
@@ -720,21 +721,23 @@ impl P4McpServer {
     )]
     pub async fn query_changelists(
         &self,
-        Parameters(params): Parameters<CommonQueryParams>,
+        Parameters(params): Parameters<QueryChangelistsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Read, Toolset::Changelists, "query_changelists")
             .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
         let invocation = build_changelist_query_invocation(
-            &params.action,
+            action,
             params.changelist_id.as_deref(),
             params.status.as_deref(),
             params.workspace_name.as_deref(),
             params.user.as_deref(),
+            params.depot_path.as_deref(),
             params.max_results,
         )
         .map_err(to_mcp_error)?;
-        self.call_p4_tool(&params.action, invocation).await
+        self.call_p4_tool(action, invocation).await
     }
 
     #[tool(
@@ -756,19 +759,20 @@ impl P4McpServer {
     )]
     pub async fn query_shelves(
         &self,
-        Parameters(params): Parameters<CommonQueryParams>,
+        Parameters(params): Parameters<QueryShelvesParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Read, Toolset::Shelves, "query_shelves")
             .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
         let invocation = build_shelf_query_invocation(
-            &params.action,
+            action,
             params.changelist_id.as_deref(),
             params.user.as_deref(),
             params.max_results,
         )
         .map_err(to_mcp_error)?;
-        self.call_p4_tool(&params.action, invocation).await
+        self.call_p4_tool(action, invocation).await
     }
 
     #[tool(
@@ -790,29 +794,30 @@ impl P4McpServer {
     )]
     pub async fn query_workspaces(
         &self,
-        Parameters(params): Parameters<CommonQueryParams>,
+        Parameters(params): Parameters<QueryWorkspacesParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Read, Toolset::Workspaces, "query_workspaces")
             .map_err(to_mcp_error)?;
-        if params.action == "type" {
+        let action = params.action.as_str();
+        if action == "type" {
             return self
                 .query_workspace_type(params.workspace_name.as_deref())
                 .await;
         }
-        if params.action == "status" {
+        if action == "status" {
             return self
                 .query_workspace_status(params.workspace_name.as_deref())
                 .await;
         }
         let invocation = build_workspace_query_invocation(
-            &params.action,
+            action,
             params.workspace_name.as_deref(),
             params.user.as_deref(),
             params.max_results,
         )
         .map_err(to_mcp_error)?;
-        self.call_p4_tool(&params.action, invocation).await
+        self.call_p4_tool(action, invocation).await
     }
 
     #[tool(
@@ -834,19 +839,20 @@ impl P4McpServer {
     )]
     pub async fn query_jobs(
         &self,
-        Parameters(params): Parameters<CommonQueryParams>,
+        Parameters(params): Parameters<QueryJobsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Read, Toolset::Jobs, "query_jobs")
             .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
         let invocation = build_job_query_invocation(
-            &params.action,
+            action,
             params.changelist_id.as_deref(),
             params.job_id.as_deref(),
             params.max_results,
         )
         .map_err(to_mcp_error)?;
-        self.call_p4_tool(&params.action, invocation).await
+        self.call_p4_tool(action, invocation).await
     }
 
     #[tool(

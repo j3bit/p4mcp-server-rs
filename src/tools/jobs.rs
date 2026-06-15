@@ -7,7 +7,7 @@ pub fn build_job_query_invocation(
     action: &str,
     changelist_id: Option<&str>,
     job_id: Option<&str>,
-    max_results: u16,
+    _max_results: u16,
 ) -> Result<P4Invocation> {
     let args = match action {
         "list_jobs" => vec![
@@ -16,7 +16,6 @@ pub fn build_job_query_invocation(
             required(changelist_id, "changelist_id")?,
         ],
         "get_job" => vec!["job".into(), "-o".into(), required(job_id, "job_id")?],
-        "list" => vec!["jobs".into(), "-m".into(), max_results.to_string()],
         other => {
             return Err(P4McpError::InvalidInput {
                 message: format!("unknown action: {other}"),

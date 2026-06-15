@@ -638,23 +638,54 @@ fn modify_file_resolve_force_maps_to_af() {
 #[test]
 fn default_changelist_get_uses_opened_not_describe() {
     let invocation =
-        build_changelist_query_invocation("get", Some("default"), None, None, None, 10).unwrap();
+        build_changelist_query_invocation("get", Some("default"), None, None, None, None, 10)
+            .unwrap();
     assert_eq!(invocation.args, vec!["opened", "-c", "default"]);
 }
 
 #[test]
 fn numbered_changelist_get_uses_describe() {
     let invocation =
-        build_changelist_query_invocation("get", Some("123"), None, None, None, 10).unwrap();
+        build_changelist_query_invocation("get", Some("123"), None, None, None, None, 10).unwrap();
     assert_eq!(invocation.args, vec!["describe", "-s", "123"]);
 }
 
 #[test]
 fn changelist_get_blank_id_errors() {
-    let error = build_changelist_query_invocation("get", Some(" "), None, None, None, 10)
+    let error = build_changelist_query_invocation("get", Some(" "), None, None, None, None, 10)
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required"));
+}
+
+#[test]
+fn changelist_list_appends_depot_path_filter() {
+    let invocation = build_changelist_query_invocation(
+        "list",
+        None,
+        Some("pending"),
+        Some("ws-main"),
+        Some("alice"),
+        Some("//depot/main/..."),
+        7,
+    )
+    .unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "changes",
+            "-m",
+            "7",
+            "-s",
+            "pending",
+            "-c",
+            "ws-main",
+            "-u",
+            "alice",
+            "//depot/main/..."
+        ]
+    );
 }
 
 #[test]
@@ -810,6 +841,14 @@ fn job_get_blank_id_errors() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("job_id is required"));
+}
+
+#[test]
+fn job_query_rejects_non_upstream_list_action() {
+    let error = build_job_query_invocation("list", None, None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown action: list"));
 }
 
 #[test]
