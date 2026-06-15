@@ -593,6 +593,13 @@ fn workspace_list_by_user_uses_user_filter() {
 }
 
 #[test]
+fn workspace_type_uses_client_spec() {
+    let invocation = build_workspace_query_invocation("type", Some("ws-stream"), None, 10).unwrap();
+    assert_eq!(invocation.args, vec!["client", "-o", "ws-stream"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
 fn workspace_get_blank_name_errors() {
     let error = build_workspace_query_invocation("get", Some(" "), None, 10)
         .unwrap_err()

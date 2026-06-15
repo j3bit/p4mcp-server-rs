@@ -126,6 +126,19 @@ impl P4McpServer {
         Ok(Json(ToolResponse::success(action, output_message(output))))
     }
 
+    async fn query_workspace_type(
+        &self,
+        workspace_name: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let invocation = build_workspace_query_invocation("type", workspace_name, None, 100)
+            .map_err(to_mcp_error)?;
+        let output = self.run_p4(invocation).await?;
+        Ok(Json(ToolResponse::success(
+            "type",
+            json!({"workspace_type": workspace_type_from_records(&output.records)}),
+        )))
+    }
+
     async fn require_write_approval(
         &self,
         channel: ApprovalChannel,
@@ -664,7 +677,7 @@ impl P4McpServer {
     }
 
     #[tool(
-        description = "List or get workspaces",
+        description = "List, get, or classify workspaces",
         annotations(read_only_hint = true)
     )]
     pub async fn query_workspaces(
@@ -674,6 +687,11 @@ impl P4McpServer {
         self.policy()
             .check(Access::Read, Toolset::Workspaces, "query_workspaces")
             .map_err(to_mcp_error)?;
+        if params.action == "type" {
+            return self
+                .query_workspace_type(params.workspace_name.as_deref())
+                .await;
+        }
         let invocation = build_workspace_query_invocation(
             &params.action,
             params.workspace_name.as_deref(),
@@ -853,6 +871,41 @@ fn output_message(output: P4CommandOutput) -> Value {
     } else {
         Value::Array(output.records)
     }
+}
+
+fn workspace_type_from_records(records: &[Value]) -> &'static str {
+    if records
+        .iter()
+        .any(|record| non_empty_string_field(record, "Stream").is_some())
+    {
+        return "stream";
+    }
+
+    if records.iter().any(record_has_depot_view) {
+        return "standard";
+    }
+
+    "custom"
+}
+
+fn record_has_depot_view(record: &Value) -> bool {
+    let Some(object) = record.as_object() else {
+        return false;
+    };
+
+    object.iter().any(|(key, value)| {
+        (key == "View" || key.starts_with("View"))
+            && value.as_str().is_some_and(|view| view.contains("//depot/"))
+    })
+}
+
+fn non_empty_string_field(record: &Value, field: &str) -> Option<String> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn output_message_with_record_limit(mut output: P4CommandOutput, max_records: usize) -> Value {
@@ -1054,6 +1107,26 @@ mod tests {
 
         let contents = std::fs::read_to_string(dir.path().join("p4mcp.log")).unwrap();
         assert!(contents.contains("log-dir smoke"));
+    }
+
+    #[test]
+    fn workspace_type_from_records_classifies_standard_workspace() {
+        let records = vec![json!({
+            "Client": "ws-standard",
+            "View0": "//depot/main/... //ws-standard/main/..."
+        })];
+
+        assert_eq!(workspace_type_from_records(&records), "standard");
+    }
+
+    #[test]
+    fn workspace_type_from_records_classifies_custom_workspace() {
+        let records = vec![json!({
+            "Client": "ws-custom",
+            "View0": "//streams/main/... //ws-custom/main/..."
+        })];
+
+        assert_eq!(workspace_type_from_records(&records), "custom");
     }
 
     fn test_config(readonly: bool) -> AppConfig {

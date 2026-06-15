@@ -214,6 +214,43 @@ async fn query_workspaces_list_by_user_calls_injected_executor() {
 }
 
 #[tokio::test]
+async fn query_workspaces_type_classifies_stream_workspace() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: vec![json!({
+            "Client": "ws-stream",
+            "Stream": "//streams/main"
+        })],
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_workspaces(Parameters(CommonQueryParams {
+            action: "type".to_string(),
+            changelist_id: None,
+            workspace_name: Some("ws-stream".to_string()),
+            file_path: None,
+            user: None,
+            status: None,
+            job_id: None,
+            stream: None,
+            owner: None,
+            max_results: 10,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "type");
+    assert_eq!(response.0.message, json!({"workspace_type": "stream"}));
+    assert_eq!(executor.invocations().len(), 1);
+    assert_eq!(
+        executor.invocations()[0].args,
+        ["client", "-o", "ws-stream"]
+    );
+}
+
+#[tokio::test]
 async fn query_files_grep_caps_records_by_max_results() {
     let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
         records: vec![

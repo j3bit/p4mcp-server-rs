@@ -17,7 +17,7 @@ pub fn build_workspace_query_invocation(
             }
             args
         }
-        "get" => vec![
+        "get" | "type" => vec![
             "client".into(),
             "-o".into(),
             required(workspace_name, "workspace_name")?,
