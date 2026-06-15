@@ -1396,6 +1396,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modify_files_sync_without_files_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_files_params(None);
+        params.file_paths = None;
+
+        let err = match server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("sync without file_paths should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("file_paths is required for sync"));
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn modify_files_after_approval_calls_executor_once() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"depotFile": "//depot/main/file.txt"})],

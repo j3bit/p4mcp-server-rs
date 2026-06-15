@@ -330,6 +330,25 @@ fn modify_file_delete_requires_files() {
 }
 
 #[test]
+fn modify_file_sync_requires_files() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Sync,
+        file_paths: None,
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        approval_token: None,
+    };
+
+    let error = build_file_modify_invocation(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("file_paths is required for sync"));
+}
+
+#[test]
 fn modify_file_revert_maps_changelist_and_file() {
     let params = ModifyFilesParams {
         action: FileModifyAction::Revert,

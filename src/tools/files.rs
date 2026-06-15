@@ -124,6 +124,7 @@ pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invo
             with_files(vec!["reconcile", "-c", &params.changelist], files)
         }
         FileModifyAction::Sync => {
+            require_files(&files, "sync")?;
             let mut args = vec!["sync".to_string()];
             if params.force {
                 args.push("-f".to_string());
