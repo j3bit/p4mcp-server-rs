@@ -9,7 +9,7 @@ use crate::error::{P4McpError, Result};
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewAction {
+pub enum ReviewQueryAction {
     List,
     Dashboard,
     Get,
@@ -18,6 +18,61 @@ pub enum ReviewAction {
     Files,
     Comments,
     Activity,
+}
+
+impl ReviewQueryAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Dashboard => "dashboard",
+            Self::Get => "get",
+            Self::Transitions => "transitions",
+            Self::FilesReadby => "files_readby",
+            Self::Files => "files",
+            Self::Comments => "comments",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct QueryReviewsParams {
+    pub action: ReviewQueryAction,
+    #[serde(default)]
+    pub review_id: Option<u64>,
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    #[serde(default = "default_comments_fields")]
+    pub comments_fields: Option<String>,
+    #[serde(default)]
+    pub up_voters: Option<Vec<String>>,
+    #[serde(default)]
+    pub from_version: Option<u64>,
+    #[serde(default)]
+    pub to_version: Option<u64>,
+    #[serde(default = "default_max_results")]
+    pub max_results: u16,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub after_updated: Option<String>,
+    #[serde(default)]
+    pub result_order: Option<String>,
+    #[serde(default)]
+    pub projects: Option<Vec<String>>,
+    #[serde(default)]
+    pub state: Option<Vec<String>>,
+    #[serde(default)]
+    pub keywords: Option<String>,
+    #[serde(default)]
+    pub keywords_fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_transitions: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewModifyAction {
     Create,
     RefreshProjects,
     Vote,
@@ -41,15 +96,95 @@ pub enum ReviewAction {
     Obliterate,
 }
 
+impl ReviewModifyAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::RefreshProjects => "refresh_projects",
+            Self::Vote => "vote",
+            Self::Transition => "transition",
+            Self::AppendParticipants => "append_participants",
+            Self::AddComment => "add_comment",
+            Self::ReplyComment => "reply_comment",
+            Self::AppendChange => "append_change",
+            Self::ReplaceWithChange => "replace_with_change",
+            Self::Join => "join",
+            Self::ArchiveInactive => "archive_inactive",
+            Self::MarkCommentRead => "mark_comment_read",
+            Self::MarkCommentUnread => "mark_comment_unread",
+            Self::MarkAllCommentsRead => "mark_all_comments_read",
+            Self::MarkAllCommentsUnread => "mark_all_comments_unread",
+            Self::UpdateAuthor => "update_author",
+            Self::UpdateDescription => "update_description",
+            Self::ReplaceParticipants => "replace_participants",
+            Self::DeleteParticipants => "delete_participants",
+            Self::Leave => "leave",
+            Self::Obliterate => "obliterate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
-pub struct ReviewRequest {
-    pub action: ReviewAction,
+pub struct ModifyReviewsParams {
+    pub action: ReviewModifyAction,
     #[serde(default)]
     pub review_id: Option<u64>,
-    #[serde(default = "default_max_results")]
-    pub max_results: u16,
-    #[serde(default = "default_body")]
-    pub body: Value,
+    #[serde(default)]
+    pub change_id: Option<u64>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub reviewers: Option<Vec<String>>,
+    #[serde(default)]
+    pub required_reviewers: Option<Vec<String>>,
+    #[serde(default)]
+    pub reviewer_group_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub reviewer_groups_required: Option<Vec<String>>,
+    #[serde(default)]
+    pub comment_file_path: Option<String>,
+    #[serde(default)]
+    pub comment_left_line: Option<u64>,
+    #[serde(default)]
+    pub comment_right_line: Option<u64>,
+    #[serde(default)]
+    pub comment_version: Option<u64>,
+    #[serde(default)]
+    pub vote_value: Option<String>,
+    #[serde(default)]
+    pub version: Option<u64>,
+    #[serde(default)]
+    pub transition: Option<String>,
+    #[serde(default)]
+    pub jobs: Option<Vec<String>>,
+    #[serde(default)]
+    pub fix_status: Option<String>,
+    #[serde(default)]
+    pub cleanup: Option<bool>,
+    #[serde(default)]
+    pub participant_user_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub participant_users_required: Option<Vec<String>>,
+    #[serde(default)]
+    pub participant_group_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub participant_groups_required: Option<Vec<String>>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub task_state: Option<String>,
+    #[serde(default)]
+    pub notify: Option<String>,
+    #[serde(default)]
+    pub comment_id: Option<u64>,
+    #[serde(default)]
+    pub not_updated_since: Option<String>,
+    #[serde(default)]
+    pub max_reviews: u16,
+    #[serde(default)]
+    pub new_author: Option<String>,
+    #[serde(default)]
+    pub new_description: Option<String>,
     #[serde(default)]
     pub approval_token: Option<String>,
 }
@@ -172,86 +307,148 @@ fn parse_ticket_line(line: &str) -> Option<TicketEntry> {
     })
 }
 
-impl ReviewRequest {
-    pub fn to_http(&self, _api_base: &str) -> Result<BuiltReviewRequest> {
-        let id = || {
-            self.review_id.ok_or_else(|| P4McpError::InvalidInput {
-                message: "review_id is required".to_string(),
-            })
-        };
-
+impl QueryReviewsParams {
+    pub fn to_http(&self) -> Result<BuiltReviewRequest> {
+        let id = || required_id(self.review_id, "review_id");
         let built = match self.action {
-            ReviewAction::List => BuiltReviewRequest {
+            ReviewQueryAction::List => BuiltReviewRequest {
                 method: "GET".into(),
                 path: "/reviews".into(),
-                query: vec![("max".into(), self.max_results.to_string())],
+                query: review_list_query(self),
                 body: json!({}),
             },
-            ReviewAction::Dashboard => BuiltReviewRequest {
+            ReviewQueryAction::Dashboard => BuiltReviewRequest {
                 method: "GET".into(),
                 path: "/reviews/dashboard".into(),
                 query: vec![("max".into(), self.max_results.to_string())],
                 body: json!({}),
             },
-            ReviewAction::Get => get(format!("/reviews/{}", id()?)),
-            ReviewAction::Transitions => get(format!("/reviews/{}/transitions", id()?)),
-            ReviewAction::FilesReadby => get(format!("/reviews/{}/files/readby", id()?)),
-            ReviewAction::Files => get(format!("/reviews/{}/files", id()?)),
-            ReviewAction::Comments => get(format!("/reviews/{}/comments", id()?)),
-            ReviewAction::Activity => get(format!("/reviews/{}/activity", id()?)),
-            ReviewAction::Create => post("/reviews".to_string(), self.body.clone()),
-            ReviewAction::RefreshProjects => {
-                post(format!("/reviews/{}/refreshProjects", id()?), json!({}))
+            ReviewQueryAction::Get => {
+                let mut request = get(format!("/reviews/{}", id()?));
+                add_repeated_query(&mut request.query, "fields[]", self.fields.as_deref());
+                if self.include_transitions == Some(true) {
+                    request.query.push(("transitions".into(), "true".into()));
+                }
+                request
             }
-            ReviewAction::Vote => post(format!("/reviews/{}/vote", id()?), self.body.clone()),
-            ReviewAction::Transition => {
-                post(format!("/reviews/{}/transitions", id()?), self.body.clone())
+            ReviewQueryAction::Transitions => get(format!("/reviews/{}/transitions", id()?)),
+            ReviewQueryAction::FilesReadby => get(format!("/reviews/{}/files/readby", id()?)),
+            ReviewQueryAction::Files => {
+                let mut request = get(format!("/reviews/{}/files", id()?));
+                if let Some(from) = self.from_version {
+                    request.query.push(("from".into(), from.to_string()));
+                }
+                if let Some(to) = self.to_version {
+                    request.query.push(("to".into(), to.to_string()));
+                }
+                request
             }
-            ReviewAction::AppendParticipants => post(
-                format!("/reviews/{}/participants", id()?),
-                self.body.clone(),
+            ReviewQueryAction::Comments => get(format!("/reviews/{}/comments", id()?)),
+            ReviewQueryAction::Activity => {
+                let mut request = get(format!("/reviews/{}/activity", id()?));
+                request
+                    .query
+                    .push(("max".into(), self.max_results.to_string()));
+                request
+            }
+        };
+        Ok(built)
+    }
+}
+
+impl ModifyReviewsParams {
+    pub fn to_http(&self, username: Option<&str>) -> Result<BuiltReviewRequest> {
+        let review_id = || required_id(self.review_id, "review_id");
+        let change_id = || required_id(self.change_id, "change_id");
+        let built = match self.action {
+            ReviewModifyAction::Create => {
+                post("/reviews".into(), create_review_body(self, change_id()?))
+            }
+            ReviewModifyAction::RefreshProjects => post(
+                format!("/reviews/{}/refreshProjects", review_id()?),
+                json!({}),
             ),
-            ReviewAction::AddComment | ReviewAction::ReplyComment => {
-                post(format!("/reviews/{}/comments", id()?), self.body.clone())
+            ReviewModifyAction::Vote => {
+                post(format!("/reviews/{}/vote", review_id()?), vote_body(self)?)
             }
-            ReviewAction::AppendChange => post(
-                format!("/reviews/{}/appendchange", id()?),
-                self.body.clone(),
+            ReviewModifyAction::Transition => post(
+                format!("/reviews/{}/transitions", review_id()?),
+                transition_body(self)?,
             ),
-            ReviewAction::ReplaceWithChange => post(
-                format!("/reviews/{}/replacewithchange", id()?),
-                self.body.clone(),
+            ReviewModifyAction::AppendParticipants => post(
+                format!("/reviews/{}/participants", review_id()?),
+                participants_body(self),
             ),
-            ReviewAction::Join => post(format!("/reviews/{}/join", id()?), self.body.clone()),
-            ReviewAction::ArchiveInactive => {
-                post("/reviews/archiveInactive".to_string(), self.body.clone())
-            }
-            ReviewAction::MarkCommentRead => post(format!("/comments/{}/read", id()?), json!({})),
-            ReviewAction::MarkCommentUnread => {
-                post(format!("/comments/{}/unread", id()?), json!({}))
-            }
-            ReviewAction::MarkAllCommentsRead => {
-                post(format!("/reviews/{}/comments/read", id()?), json!({}))
-            }
-            ReviewAction::MarkAllCommentsUnread => {
-                post(format!("/reviews/{}/comments/unread", id()?), json!({}))
-            }
-            ReviewAction::UpdateAuthor => {
-                put(format!("/reviews/{}/author", id()?), self.body.clone())
-            }
-            ReviewAction::UpdateDescription => {
-                put(format!("/reviews/{}/description", id()?), self.body.clone())
-            }
-            ReviewAction::ReplaceParticipants => put(
-                format!("/reviews/{}/participants", id()?),
-                self.body.clone(),
+            ReviewModifyAction::AddComment => post(
+                format!("/reviews/{}/comments", review_id()?),
+                comment_body(self, None)?,
             ),
-            ReviewAction::DeleteParticipants => delete(
-                format!("/reviews/{}/participants", id()?),
-                self.body.clone(),
+            ReviewModifyAction::ReplyComment => post(
+                format!("/reviews/{}/comments", review_id()?),
+                comment_body(self, self.comment_id)?,
             ),
-            ReviewAction::Leave => delete(format!("/reviews/{}/leave", id()?), self.body.clone()),
-            ReviewAction::Obliterate => delete(format!("/reviews/{}", id()?), json!({})),
+            ReviewModifyAction::AppendChange => post(
+                format!("/reviews/{}/appendchange", review_id()?),
+                json!({"changeId": change_id()?}),
+            ),
+            ReviewModifyAction::ReplaceWithChange => post(
+                format!("/reviews/{}/replacewithchange", review_id()?),
+                json!({"changeId": change_id()?}),
+            ),
+            ReviewModifyAction::Join => post(
+                format!("/reviews/{}/join", review_id()?),
+                join_body(username),
+            ),
+            ReviewModifyAction::ArchiveInactive => {
+                post("/reviews/archiveInactive".into(), archive_body(self)?)
+            }
+            ReviewModifyAction::MarkCommentRead => post(
+                format!(
+                    "/comments/{}/read",
+                    required_id(self.comment_id, "comment_id")?
+                ),
+                json!({}),
+            ),
+            ReviewModifyAction::MarkCommentUnread => post(
+                format!(
+                    "/comments/{}/unread",
+                    required_id(self.comment_id, "comment_id")?
+                ),
+                json!({}),
+            ),
+            ReviewModifyAction::MarkAllCommentsRead => post(
+                format!("/reviews/{}/comments/read", review_id()?),
+                json!({}),
+            ),
+            ReviewModifyAction::MarkAllCommentsUnread => post(
+                format!("/reviews/{}/comments/unread", review_id()?),
+                json!({}),
+            ),
+            ReviewModifyAction::UpdateAuthor => post_put(
+                "PUT",
+                format!("/reviews/{}/author", review_id()?),
+                json!({"author": required_string(self.new_author.as_deref(), "new_author")?}),
+            ),
+            ReviewModifyAction::UpdateDescription => post_put(
+                "PUT",
+                format!("/reviews/{}/description", review_id()?),
+                json!({"description": required_string(self.new_description.as_deref(), "new_description")?}),
+            ),
+            ReviewModifyAction::ReplaceParticipants => post_put(
+                "PUT",
+                format!("/reviews/{}/participants", review_id()?),
+                participants_body(self),
+            ),
+            ReviewModifyAction::DeleteParticipants => delete(
+                format!("/reviews/{}/participants", review_id()?),
+                participants_body(self),
+            ),
+            ReviewModifyAction::Leave => {
+                delete(format!("/reviews/{}/leave", review_id()?), json!({}))
+            }
+            ReviewModifyAction::Obliterate => {
+                delete(format!("/reviews/{}", review_id()?), json!({}))
+            }
         };
         Ok(built)
     }
@@ -275,9 +472,9 @@ fn post(path: String, body: Value) -> BuiltReviewRequest {
     }
 }
 
-fn put(path: String, body: Value) -> BuiltReviewRequest {
+fn post_put(method: &str, path: String, body: Value) -> BuiltReviewRequest {
     BuiltReviewRequest {
-        method: "PUT".into(),
+        method: method.into(),
         path,
         query: Vec::new(),
         body,
@@ -297,8 +494,208 @@ fn default_max_results() -> u16 {
     10
 }
 
-fn default_body() -> Value {
-    json!({})
+fn default_comments_fields() -> Option<String> {
+    Some("id,body,user,time".to_string())
+}
+
+fn required_id(value: Option<u64>, name: &str) -> Result<u64> {
+    value.ok_or_else(|| P4McpError::InvalidInput {
+        message: format!("{name} is required"),
+    })
+}
+
+fn required_string(value: Option<&str>, name: &str) -> Result<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| P4McpError::InvalidInput {
+            message: format!("{name} is required"),
+        })
+}
+
+fn review_list_query(params: &QueryReviewsParams) -> Vec<(String, String)> {
+    let mut query = vec![("max".into(), params.max_results.to_string())];
+    push_optional(&mut query, "after", params.after.as_deref());
+    push_optional(&mut query, "afterUpdated", params.after_updated.as_deref());
+    push_optional(&mut query, "resultOrder", params.result_order.as_deref());
+    push_optional(&mut query, "keywords", params.keywords.as_deref());
+    add_repeated_query(&mut query, "project[]", params.projects.as_deref());
+    add_repeated_query(&mut query, "state[]", params.state.as_deref());
+    add_repeated_query(
+        &mut query,
+        "keywordsFields[]",
+        params.keywords_fields.as_deref(),
+    );
+    add_repeated_query(&mut query, "fields[]", params.fields.as_deref());
+    query
+}
+
+fn push_optional(query: &mut Vec<(String, String)>, name: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        query.push((name.to_string(), value.to_string()));
+    }
+}
+
+fn add_repeated_query(query: &mut Vec<(String, String)>, name: &str, values: Option<&[String]>) {
+    if let Some(values) = values {
+        query.extend(values.iter().map(|value| (name.to_string(), value.clone())));
+    }
+}
+
+fn create_review_body(params: &ModifyReviewsParams, change_id: u64) -> Value {
+    let mut body = json!({"change": change_id});
+    insert_string(&mut body, "description", params.description.as_deref());
+    insert_array(&mut body, "reviewers", params.reviewers.as_deref());
+    insert_array(
+        &mut body,
+        "requiredReviewers",
+        params.required_reviewers.as_deref(),
+    );
+    if params.reviewer_group_names.is_some() || params.reviewer_groups_required.is_some() {
+        body["reviewerGroups"] = reviewer_groups_body(params);
+    }
+    body
+}
+
+fn vote_body(params: &ModifyReviewsParams) -> Result<Value> {
+    let mut body = json!({"vote": required_string(params.vote_value.as_deref(), "vote_value")?});
+    if let Some(version) = params.version {
+        body["version"] = json!(version);
+    }
+    Ok(body)
+}
+
+fn transition_body(params: &ModifyReviewsParams) -> Result<Value> {
+    let mut body =
+        json!({"transition": required_string(params.transition.as_deref(), "transition")?});
+    if let Some(jobs) = &params.jobs {
+        body["jobs"] = json!(jobs);
+    }
+    insert_string(&mut body, "fixStatus", params.fix_status.as_deref());
+    if let Some(cleanup) = params.cleanup {
+        body["cleanup"] = json!(cleanup);
+    }
+    Ok(body)
+}
+
+fn comment_body(params: &ModifyReviewsParams, parent_comment: Option<u64>) -> Result<Value> {
+    let mut body = json!({"body": required_string(params.body.as_deref(), "body")?});
+    let mut context = json!({});
+    insert_string(&mut context, "file", params.comment_file_path.as_deref());
+    if let Some(line) = params.comment_left_line {
+        context["leftLine"] = json!(line);
+    }
+    if let Some(line) = params.comment_right_line {
+        context["rightLine"] = json!(line);
+    }
+    if let Some(version) = params.comment_version {
+        context["version"] = json!(version);
+    }
+    if let Some(comment) = parent_comment {
+        context["comment"] = json!(comment);
+    }
+    if context.as_object().is_some_and(|object| !object.is_empty()) {
+        body["context"] = context;
+    }
+    insert_string(&mut body, "taskState", params.task_state.as_deref());
+    Ok(body)
+}
+
+fn archive_body(params: &ModifyReviewsParams) -> Result<Value> {
+    let mut body = json!({
+        "notUpdatedSince": required_string(params.not_updated_since.as_deref(), "not_updated_since")?,
+        "description": params.description.as_deref().unwrap_or("Archiving inactive reviews"),
+    });
+    if params.max_reviews > 0 {
+        body["max"] = json!(params.max_reviews);
+    }
+    Ok(body)
+}
+
+fn participants_body(params: &ModifyReviewsParams) -> Value {
+    json!({
+        "participants": {
+            "users": participant_users(params),
+            "groups": participant_groups(params)
+        }
+    })
+}
+
+fn participant_users(params: &ModifyReviewsParams) -> Value {
+    let mut users = serde_json::Map::new();
+    if let Some(names) = &params.participant_user_names {
+        for name in names {
+            users.insert(name.clone(), json!({"required": "no"}));
+        }
+    }
+    if let Some(names) = &params.participant_users_required {
+        for name in names {
+            users.insert(name.clone(), json!({"required": "yes"}));
+        }
+    }
+    Value::Object(users)
+}
+
+fn participant_groups(params: &ModifyReviewsParams) -> Value {
+    let mut groups = serde_json::Map::new();
+    if let Some(names) = &params.participant_group_names {
+        for name in names {
+            groups.insert(name.clone(), json!({"required": "none"}));
+        }
+    }
+    if let Some(names) = &params.participant_groups_required {
+        for name in names {
+            groups.insert(name.clone(), json!({"required": "all"}));
+        }
+    }
+    Value::Object(groups)
+}
+
+fn reviewer_groups_body(params: &ModifyReviewsParams) -> Value {
+    let mut groups = Vec::new();
+    if let Some(names) = &params.reviewer_group_names {
+        groups.extend(
+            names
+                .iter()
+                .map(|name| json!({"name": name, "required": "false"})),
+        );
+    }
+    if let Some(names) = &params.reviewer_groups_required {
+        groups.extend(
+            names
+                .iter()
+                .map(|name| json!({"name": name, "required": "true"})),
+        );
+    }
+    Value::Array(groups)
+}
+
+fn insert_string(body: &mut Value, field: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        body[field] = json!(value);
+    }
+}
+
+fn insert_array(body: &mut Value, field: &str, value: Option<&[String]>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        body[field] = json!(value);
+    }
+}
+
+fn join_body(username: Option<&str>) -> Value {
+    match username {
+        Some(username) if !username.trim().is_empty() => {
+            let mut users = serde_json::Map::new();
+            users.insert(username.to_string(), json!([]));
+            let mut participants = serde_json::Map::new();
+            participants.insert("users".to_string(), Value::Object(users));
+            let mut body = serde_json::Map::new();
+            body.insert("participants".to_string(), Value::Object(participants));
+            Value::Object(body)
+        }
+        _ => json!({}),
+    }
 }
 
 #[derive(Clone)]
@@ -349,8 +746,11 @@ impl ReviewHttpClient {
         })
     }
 
-    pub async fn execute(&self, request: &ReviewRequest) -> anyhow::Result<Value> {
-        let built = request.to_http(&self.api_base)?;
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub async fn execute(&self, built: BuiltReviewRequest) -> anyhow::Result<Value> {
         if built.method != "GET" {
             anyhow::bail!(
                 "review API {} request requires MCP write approval before execution",
@@ -360,8 +760,7 @@ impl ReviewHttpClient {
         self.send(built).await
     }
 
-    pub async fn execute_approved(&self, request: &ReviewRequest) -> anyhow::Result<Value> {
-        let built = request.to_http(&self.api_base)?;
+    pub async fn execute_approved(&self, built: BuiltReviewRequest) -> anyhow::Result<Value> {
         self.send(built).await
     }
 

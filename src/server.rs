@@ -41,7 +41,10 @@ use crate::{
             QueryStreamsParams, QueryWorkspacesParams, WorkspaceModifyAction,
         },
         response::ToolResponse,
-        reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
+        reviews::{
+            BuiltReviewRequest, ModifyReviewsParams, QueryReviewsParams, ReviewApiConfig,
+            ReviewHttpClient,
+        },
         server::{QueryServerParams, build_server_invocation},
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
         streams::{
@@ -908,18 +911,13 @@ impl P4McpServer {
 
     async fn modify_reviews_inner(
         &self,
-        params: ReviewRequest,
+        params: ModifyReviewsParams,
         channel: ApprovalChannel,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Write, Toolset::Reviews, "modify_reviews")
             .map_err(to_mcp_error)?;
-        let built = params.to_http("unused").map_err(to_mcp_error)?;
-        if built.method == "GET" {
-            return Err(to_mcp_error(invalid_input(
-                "modify_reviews only supports write review actions",
-            )));
-        }
+        let built = params.to_http(None).map_err(to_mcp_error)?;
         let request = self.modify_reviews_approval_request(&params, &built);
         if let Some(response) = self
             .require_write_approval(channel, request, params.approval_token.as_deref())
@@ -927,10 +925,13 @@ impl P4McpServer {
         {
             return Ok(response);
         }
-        let action = review_action_name(&params);
+        let action = review_modify_action_name(&params);
         let client = self.review_http_client_from_p4().await?;
+        let built = params
+            .to_http(Some(client.username()))
+            .map_err(to_mcp_error)?;
         let message = client
-            .execute_approved(&params)
+            .execute_approved(built)
             .await
             .map_err(review_api_error)?;
         Ok(Json(ToolResponse::success(&action, message)))
@@ -938,12 +939,12 @@ impl P4McpServer {
 
     fn modify_reviews_approval_request(
         &self,
-        params: &ReviewRequest,
+        params: &ModifyReviewsParams,
         built: &BuiltReviewRequest,
     ) -> ApprovalRequest {
         let mut approval_params = params.clone();
         approval_params.approval_token = None;
-        let action = review_action_name(params);
+        let action = review_modify_action_name(params);
         let review = params.review_id.map(|review_id| review_id.to_string());
         let targets = review
             .as_ref()
@@ -1264,20 +1265,15 @@ impl P4McpServer {
     )]
     pub async fn query_reviews(
         &self,
-        Parameters(params): Parameters<ReviewRequest>,
+        Parameters(params): Parameters<QueryReviewsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Read, Toolset::Reviews, "query_reviews")
             .map_err(to_mcp_error)?;
-        let built = params.to_http("unused").map_err(to_mcp_error)?;
-        if built.method != "GET" {
-            return Err(to_mcp_error(invalid_input(
-                "query_reviews only supports read review actions",
-            )));
-        }
-        let action = review_action_name(&params);
+        let built = params.to_http().map_err(to_mcp_error)?;
+        let action = review_query_action_name(&params);
         let client = self.review_http_client_from_p4().await?;
-        let message = client.execute(&params).await.map_err(review_api_error)?;
+        let message = client.execute(built).await.map_err(review_api_error)?;
         Ok(Json(ToolResponse::success(&action, message)))
     }
 
@@ -1288,7 +1284,7 @@ impl P4McpServer {
     pub async fn modify_reviews(
         &self,
         peer: Peer<RoleServer>,
-        Parameters(params): Parameters<ReviewRequest>,
+        Parameters(params): Parameters<ModifyReviewsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.modify_reviews_inner(params, ApprovalChannel::Elicitation(peer))
             .await
@@ -1713,12 +1709,12 @@ fn approval_summary(action: &str, targets: &[String]) -> String {
     }
 }
 
-fn review_action_name(params: &ReviewRequest) -> String {
-    serde_json::to_value(&params.action)
-        .expect("review action serializes to JSON")
-        .as_str()
-        .expect("review action serializes to a string")
-        .to_string()
+fn review_query_action_name(params: &QueryReviewsParams) -> String {
+    params.action.as_str().to_string()
+}
+
+fn review_modify_action_name(params: &ModifyReviewsParams) -> String {
+    params.action.as_str().to_string()
 }
 
 fn review_target_from_path(path: &str) -> String {
@@ -1836,7 +1832,7 @@ mod tests {
             ChangelistModifyAction, FileModifyAction, JobModifyAction, ShelfModifyAction,
             WorkspaceModifyAction,
         },
-        tools::reviews::ReviewAction,
+        tools::reviews::{ModifyReviewsParams, ReviewModifyAction},
     };
 
     use super::*;
@@ -1956,12 +1952,38 @@ mod tests {
         }
     }
 
-    fn review_modify_params(approval_token: Option<&str>) -> ReviewRequest {
-        ReviewRequest {
-            action: ReviewAction::Vote,
+    fn review_modify_params(approval_token: Option<&str>) -> ModifyReviewsParams {
+        ModifyReviewsParams {
+            action: ReviewModifyAction::Vote,
             review_id: Some(123),
-            max_results: 10,
-            body: json!({"vote": "up", "version": 2}),
+            change_id: None,
+            description: None,
+            reviewers: None,
+            required_reviewers: None,
+            reviewer_group_names: None,
+            reviewer_groups_required: None,
+            comment_file_path: None,
+            comment_left_line: None,
+            comment_right_line: None,
+            comment_version: None,
+            vote_value: Some("up".to_string()),
+            version: Some(2),
+            transition: None,
+            jobs: None,
+            fix_status: None,
+            cleanup: None,
+            participant_user_names: None,
+            participant_users_required: None,
+            participant_group_names: None,
+            participant_groups_required: None,
+            body: None,
+            task_state: None,
+            notify: None,
+            comment_id: None,
+            not_updated_since: None,
+            max_reviews: 0,
+            new_author: None,
+            new_description: None,
             approval_token: approval_token.map(str::to_string),
         }
     }
@@ -2773,45 +2795,6 @@ Files:
                 .map(|request| (request.method.as_str(), request.path.as_str(),)),
             Some(("POST", "/reviews/123/vote"))
         );
-    }
-
-    #[tokio::test]
-    async fn modify_reviews_rejects_read_actions_after_policy_before_approval() {
-        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-            records: Vec::new(),
-            text: json!({}),
-        }));
-        let approval_gate = Arc::new(FakeApprovalGate::approved());
-        let server = P4McpServer::with_executor_and_approval(
-            test_config(false),
-            executor.clone(),
-            approval_gate.clone(),
-        );
-
-        let err = match server
-            .modify_reviews_inner(
-                ReviewRequest {
-                    action: ReviewAction::List,
-                    review_id: None,
-                    max_results: 10,
-                    body: json!({}),
-                    approval_token: Some("approved-token".to_string()),
-                },
-                ApprovalChannel::FallbackOnly,
-            )
-            .await
-        {
-            Ok(_) => panic!("modify_reviews should reject read review actions"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
-        assert!(
-            err.message
-                .contains("modify_reviews only supports write review actions")
-        );
-        assert!(approval_gate.calls().is_empty());
-        assert!(executor.invocations().is_empty());
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use p4mcp_server_rs::{
             ChangelistQueryAction, FileQueryAction, QueryChangelistsParams, QueryFilesParams,
             QueryStreamsParams, QueryWorkspacesParams, StreamQueryAction, WorkspaceQueryAction,
         },
-        reviews::{ReviewAction, ReviewRequest},
+        reviews::{QueryReviewsParams, ReviewQueryAction},
         server::{QueryServerParams, ServerQueryAction},
     },
 };
@@ -63,6 +63,27 @@ fn stream_query_params(action: StreamQueryAction) -> QueryStreamsParams {
         long_output: false,
         limit: None,
         max_results: 50,
+    }
+}
+
+fn query_reviews_params(action: ReviewQueryAction) -> QueryReviewsParams {
+    QueryReviewsParams {
+        action,
+        review_id: None,
+        fields: None,
+        comments_fields: Some("id,body,user,time".to_string()),
+        up_voters: None,
+        from_version: None,
+        to_version: None,
+        max_results: 10,
+        after: None,
+        after_updated: None,
+        result_order: None,
+        projects: None,
+        state: None,
+        keywords: None,
+        keywords_fields: None,
+        include_transitions: None,
     }
 }
 
@@ -676,12 +697,9 @@ async fn query_reviews_executes_review_api_request() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
-        .query_reviews(Parameters(ReviewRequest {
-            action: ReviewAction::List,
-            review_id: None,
+        .query_reviews(Parameters(QueryReviewsParams {
             max_results: 5,
-            body: json!({}),
-            approval_token: None,
+            ..query_reviews_params(ReviewQueryAction::List)
         }))
         .await
         .unwrap();
@@ -701,7 +719,7 @@ async fn query_reviews_executes_review_api_request() {
 }
 
 #[tokio::test]
-async fn query_reviews_rejects_write_actions_before_p4_discovery() {
+async fn query_reviews_rejects_missing_review_id_before_p4_discovery() {
     let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
         records: Vec::new(),
         text: json!({}),
@@ -709,24 +727,15 @@ async fn query_reviews_rejects_write_actions_before_p4_discovery() {
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let err = match server
-        .query_reviews(Parameters(ReviewRequest {
-            action: ReviewAction::Vote,
-            review_id: Some(123),
-            max_results: 10,
-            body: json!({"vote": "up"}),
-            approval_token: None,
-        }))
+        .query_reviews(Parameters(query_reviews_params(ReviewQueryAction::Get)))
         .await
     {
-        Ok(_) => panic!("query_reviews should reject write review actions"),
+        Ok(_) => panic!("query_reviews should reject missing review_id"),
         Err(err) => err,
     };
 
     assert_eq!(err.code, ErrorData::invalid_params("", None).code);
-    assert!(
-        err.message
-            .contains("query_reviews only supports read review actions")
-    );
+    assert!(err.message.contains("review_id is required"));
     assert!(executor.invocations().is_empty());
 }
 

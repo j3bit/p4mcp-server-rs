@@ -1,26 +1,71 @@
-use p4mcp_server_rs::tools::reviews::{ReviewAction, ReviewHttpClient, ReviewRequest};
-use schemars::JsonSchema;
+use p4mcp_server_rs::tools::reviews::{
+    ModifyReviewsParams, QueryReviewsParams, ReviewHttpClient, ReviewModifyAction,
+    ReviewQueryAction,
+};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn schema_has_property<T: JsonSchema>(name: &str) -> bool {
-    let schema = schemars::schema_for!(T);
-    let schema = serde_json::to_value(schema).unwrap();
-    schema["properties"].as_object().unwrap().contains_key(name)
+fn list_reviews_request(max_results: u16) -> QueryReviewsParams {
+    QueryReviewsParams {
+        action: ReviewQueryAction::List,
+        review_id: None,
+        fields: None,
+        comments_fields: Some("id,body,user,time".to_string()),
+        up_voters: None,
+        from_version: None,
+        to_version: None,
+        max_results,
+        after: None,
+        after_updated: None,
+        result_order: None,
+        projects: None,
+        state: None,
+        keywords: None,
+        keywords_fields: None,
+        include_transitions: None,
+    }
+}
+
+fn vote_review_request(approval_token: Option<&str>) -> ModifyReviewsParams {
+    ModifyReviewsParams {
+        action: ReviewModifyAction::Vote,
+        review_id: Some(123),
+        change_id: None,
+        description: None,
+        reviewers: None,
+        required_reviewers: None,
+        reviewer_group_names: None,
+        reviewer_groups_required: None,
+        comment_file_path: None,
+        comment_left_line: None,
+        comment_right_line: None,
+        comment_version: None,
+        vote_value: Some("up".to_string()),
+        version: Some(2),
+        transition: None,
+        jobs: None,
+        fix_status: None,
+        cleanup: None,
+        participant_user_names: None,
+        participant_users_required: None,
+        participant_group_names: None,
+        participant_groups_required: None,
+        body: None,
+        task_state: None,
+        notify: None,
+        comment_id: None,
+        not_updated_since: None,
+        max_reviews: 0,
+        new_author: None,
+        new_description: None,
+        approval_token: approval_token.map(str::to_string),
+    }
 }
 
 #[test]
 fn list_reviews_builds_v11_reviews_path() {
-    let request = ReviewRequest {
-        action: ReviewAction::List,
-        review_id: None,
-        max_results: 25,
-        body: serde_json::json!({}),
-        approval_token: None,
-    };
-    let built = request
-        .to_http("https://swarm.example.com/api/v11")
-        .unwrap();
+    let request = list_reviews_request(25);
+    let built = request.to_http().unwrap();
     assert_eq!(built.method, "GET");
     assert_eq!(built.path, "/reviews");
     assert_eq!(built.query, vec![("max".to_string(), "25".to_string())]);
@@ -28,58 +73,52 @@ fn list_reviews_builds_v11_reviews_path() {
 
 #[test]
 fn vote_review_builds_post_payload() {
-    let request = ReviewRequest {
-        action: ReviewAction::Vote,
-        review_id: Some(123),
-        max_results: 10,
-        body: serde_json::json!({"vote": "up", "version": 2}),
-        approval_token: None,
-    };
-    let built = request
-        .to_http("https://swarm.example.com/api/v11")
-        .unwrap();
+    let request = vote_review_request(None);
+    let built = request.to_http(Some("user")).unwrap();
     assert_eq!(built.method, "POST");
     assert_eq!(built.path, "/reviews/123/vote");
     assert_eq!(built.body["vote"], "up");
 }
 
 #[test]
-fn review_request_schema_exposes_approval_token() {
-    assert!(schema_has_property::<ReviewRequest>("approval_token"));
-}
-
-#[test]
-fn review_request_schema_omits_confirmation() {
-    assert!(!schema_has_property::<ReviewRequest>("confirmation"));
-}
-
-#[test]
 fn obliterate_review_builds_delete_without_body_confirmation() {
-    let request = ReviewRequest {
-        action: ReviewAction::Obliterate,
+    let request = ModifyReviewsParams {
+        action: ReviewModifyAction::Obliterate,
         review_id: Some(123),
-        max_results: 10,
-        body: serde_json::json!({}),
+        change_id: None,
+        description: None,
+        reviewers: None,
+        required_reviewers: None,
+        reviewer_group_names: None,
+        reviewer_groups_required: None,
+        comment_file_path: None,
+        comment_left_line: None,
+        comment_right_line: None,
+        comment_version: None,
+        vote_value: None,
+        version: None,
+        transition: None,
+        jobs: None,
+        fix_status: None,
+        cleanup: None,
+        participant_user_names: None,
+        participant_users_required: None,
+        participant_group_names: None,
+        participant_groups_required: None,
+        body: None,
+        task_state: None,
+        notify: None,
+        comment_id: None,
+        not_updated_since: None,
+        max_reviews: 0,
+        new_author: None,
+        new_description: None,
         approval_token: None,
     };
-    let built = request
-        .to_http("https://swarm.example.com/api/v11")
-        .unwrap();
+    let built = request.to_http(Some("user")).unwrap();
     assert_eq!(built.method, "DELETE");
     assert_eq!(built.path, "/reviews/123");
     assert_eq!(built.body, serde_json::json!({}));
-}
-
-#[test]
-fn missing_body_deserializes_to_empty_object() {
-    let request: ReviewRequest = serde_json::from_value(serde_json::json!({
-        "action": "list"
-    }))
-    .unwrap();
-
-    assert_eq!(request.body, serde_json::json!({}));
-    assert_eq!(request.max_results, 10);
-    assert_eq!(request.approval_token, None);
 }
 
 #[test]
@@ -198,15 +237,10 @@ async fn execute_list_sends_get_with_query_and_basic_auth() {
         false,
     )
     .unwrap();
-    let request = ReviewRequest {
-        action: ReviewAction::List,
-        review_id: None,
-        max_results: 7,
-        body: serde_json::json!({}),
-        approval_token: None,
-    };
+    let request = list_reviews_request(7);
+    let built = request.to_http().unwrap();
 
-    let result = client.execute(&request).await.unwrap();
+    let result = client.execute(built).await.unwrap();
 
     assert_eq!(result, serde_json::json!({ "reviews": [123] }));
 }
@@ -220,15 +254,10 @@ async fn execute_vote_rejects_write_without_approval() {
         false,
     )
     .unwrap();
-    let request = ReviewRequest {
-        action: ReviewAction::Vote,
-        review_id: Some(123),
-        max_results: 10,
-        body: serde_json::json!({"vote": "up", "version": 2}),
-        approval_token: None,
-    };
+    let request = vote_review_request(None);
+    let built = request.to_http(Some("user")).unwrap();
 
-    let error = client.execute(&request).await.unwrap_err().to_string();
+    let error = client.execute(built).await.unwrap_err().to_string();
 
     assert!(error.contains("requires MCP write approval"));
     assert!(!error.contains("ticket"));
@@ -255,15 +284,10 @@ async fn execute_approved_vote_sends_post_with_body_and_basic_auth() {
         false,
     )
     .unwrap();
-    let request = ReviewRequest {
-        action: ReviewAction::Vote,
-        review_id: Some(123),
-        max_results: 10,
-        body: serde_json::json!({"vote": "up", "version": 2}),
-        approval_token: Some("approved-token".to_string()),
-    };
+    let request = vote_review_request(Some("approved-token"));
+    let built = request.to_http(Some("user")).unwrap();
 
-    let result = client.execute_approved(&request).await.unwrap();
+    let result = client.execute_approved(built).await.unwrap();
 
     assert_eq!(result, serde_json::json!({ "vote": "recorded" }));
 }
@@ -290,15 +314,10 @@ async fn execute_non_success_returns_error_without_credentials() {
         false,
     )
     .unwrap();
-    let request = ReviewRequest {
-        action: ReviewAction::List,
-        review_id: None,
-        max_results: 10,
-        body: serde_json::json!({}),
-        approval_token: None,
-    };
+    let request = list_reviews_request(10);
+    let built = request.to_http().unwrap();
 
-    let error = client.execute(&request).await.unwrap_err().to_string();
+    let error = client.execute(built).await.unwrap_err().to_string();
 
     assert!(error.contains("HTTP 500"));
     assert!(!error.contains("Authorization: Basic"));

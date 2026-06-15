@@ -6,6 +6,7 @@ use p4mcp_server_rs::tools::{
         ModifyShelvesParams, ModifyStreamsParams, ModifyWorkspacesParams, ShelfModifyAction,
         StreamModifyAction, WorkspaceModifyAction,
     },
+    reviews::{ModifyReviewsParams, QueryReviewsParams, ReviewModifyAction, ReviewQueryAction},
     server::QueryServerParams,
 };
 use schemars::JsonSchema;
@@ -200,4 +201,90 @@ fn modify_streams_schema_matches_upstream_fields() {
     .unwrap();
 
     assert_eq!(params.action, StreamModifyAction::CreateWorkspace);
+}
+
+#[test]
+fn query_reviews_schema_matches_upstream_fields_and_omits_write_fields() {
+    for field in [
+        "action",
+        "review_id",
+        "fields",
+        "comments_fields",
+        "up_voters",
+        "from_version",
+        "to_version",
+        "max_results",
+        "after",
+        "after_updated",
+        "result_order",
+        "projects",
+        "state",
+        "keywords",
+        "keywords_fields",
+        "include_transitions",
+    ] {
+        assert_has::<QueryReviewsParams>(field);
+    }
+    assert_omits::<QueryReviewsParams>("comment_id");
+    assert_omits::<QueryReviewsParams>("approval_token");
+
+    let params: QueryReviewsParams = serde_json::from_value(serde_json::json!({
+        "action": "files",
+        "review_id": 123,
+        "from_version": 1,
+        "to_version": 2
+    }))
+    .unwrap();
+    assert_eq!(params.action, ReviewQueryAction::Files);
+}
+
+#[test]
+fn modify_reviews_schema_matches_upstream_fields_and_omits_read_fields() {
+    for field in [
+        "action",
+        "review_id",
+        "change_id",
+        "description",
+        "reviewers",
+        "required_reviewers",
+        "reviewer_group_names",
+        "reviewer_groups_required",
+        "comment_file_path",
+        "comment_left_line",
+        "comment_right_line",
+        "comment_version",
+        "vote_value",
+        "version",
+        "transition",
+        "jobs",
+        "fix_status",
+        "cleanup",
+        "participant_user_names",
+        "participant_users_required",
+        "participant_group_names",
+        "participant_groups_required",
+        "body",
+        "task_state",
+        "notify",
+        "comment_id",
+        "not_updated_since",
+        "max_reviews",
+        "new_author",
+        "new_description",
+        "approval_token",
+    ] {
+        assert_has::<ModifyReviewsParams>(field);
+    }
+    assert_omits::<ModifyReviewsParams>("after");
+    assert_omits::<ModifyReviewsParams>("fields");
+    assert_omits::<ModifyReviewsParams>("confirmation");
+
+    let params: ModifyReviewsParams = serde_json::from_value(serde_json::json!({
+        "action": "reply_comment",
+        "review_id": 123,
+        "comment_id": 987,
+        "body": "reply"
+    }))
+    .unwrap();
+    assert_eq!(params.action, ReviewModifyAction::ReplyComment);
 }
