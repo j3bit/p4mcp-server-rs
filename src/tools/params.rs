@@ -294,25 +294,6 @@ pub struct QueryStreamsParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-pub struct CommonModifyParams {
-    pub action: String,
-    #[serde(default)]
-    pub changelist_id: Option<String>,
-    #[serde(default)]
-    pub workspace_name: Option<String>,
-    #[serde(default)]
-    pub stream: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub files: Vec<String>,
-    #[serde(default)]
-    pub form: Option<String>,
-    #[serde(default)]
-    pub approval_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangelistModifyAction {
     Create,

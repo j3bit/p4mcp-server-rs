@@ -36,11 +36,10 @@ use crate::{
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
-            ChangelistModifyAction, CommonModifyParams, FileQueryAction, ModifyChangelistsParams,
-            ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams,
-            ModifyWorkspacesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
-            QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction,
-            WorkspaceModifyAction,
+            ChangelistModifyAction, FileQueryAction, ModifyChangelistsParams, ModifyFilesParams,
+            ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams, ModifyWorkspacesParams,
+            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
+            QueryStreamsParams, QueryWorkspacesParams, WorkspaceModifyAction,
         },
         response::ToolResponse,
         reviews::{
@@ -835,23 +834,6 @@ impl P4McpServer {
                 )
                 .await
             }
-        }
-    }
-
-    fn common_modify_approval_request(
-        &self,
-        params: &CommonModifyParams,
-        context: P4ApprovalContext<'_>,
-    ) -> ApprovalRequest {
-        let mut approval_params = params.clone();
-        approval_params.approval_token = None;
-
-        ApprovalRequest {
-            tool: context.tool.to_string(),
-            action: context.action.to_string(),
-            params: serde_json::to_value(approval_params)
-                .expect("common modify params serialize to JSON"),
-            preview: self.p4_approval_preview(context),
         }
     }
 
@@ -1733,10 +1715,10 @@ fn changelist_modify_targets(
     changelist_id: Option<&str>,
 ) -> Vec<String> {
     let mut targets = changelist_id.map(changelist_targets).unwrap_or_default();
-    if params.action == ChangelistModifyAction::MoveFiles {
-        if let Some(file_paths) = &params.file_paths {
-            targets.extend(file_paths.iter().cloned());
-        }
+    if params.action == ChangelistModifyAction::MoveFiles
+        && let Some(file_paths) = &params.file_paths
+    {
+        targets.extend(file_paths.iter().cloned());
     }
     targets
 }
@@ -1884,7 +1866,7 @@ mod tests {
         p4::runner::{P4CommandOutput, P4Env},
         tools::params::{
             ChangelistModifyAction, FileModifyAction, JobModifyAction, ShelfModifyAction,
-            WorkspaceModifyAction,
+            StreamModifyAction, WorkspaceModifyAction,
         },
         tools::reviews::{ModifyReviewsParams, ReviewModifyAction},
     };
@@ -2754,7 +2736,7 @@ Files:
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = modify_streams_params(StreamModifyAction::Update);
+        let params = modify_streams_params(StreamModifyAction::Update);
 
         let response = server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
