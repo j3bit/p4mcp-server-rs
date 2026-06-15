@@ -26,9 +26,9 @@ fn list_reviews_request(max_results: u16) -> QueryReviewsParams {
     }
 }
 
-fn vote_review_request(approval_token: Option<&str>) -> ModifyReviewsParams {
+fn modify_review_request(action: ReviewModifyAction) -> ModifyReviewsParams {
     ModifyReviewsParams {
-        action: ReviewModifyAction::Vote,
+        action,
         review_id: Some(123),
         change_id: None,
         description: None,
@@ -40,8 +40,8 @@ fn vote_review_request(approval_token: Option<&str>) -> ModifyReviewsParams {
         comment_left_line: None,
         comment_right_line: None,
         comment_version: None,
-        vote_value: Some("up".to_string()),
-        version: Some(2),
+        vote_value: None,
+        version: None,
         transition: None,
         jobs: None,
         fix_status: None,
@@ -58,8 +58,87 @@ fn vote_review_request(approval_token: Option<&str>) -> ModifyReviewsParams {
         max_reviews: 0,
         new_author: None,
         new_description: None,
-        approval_token: approval_token.map(str::to_string),
+        approval_token: None,
     }
+}
+
+fn vote_review_request(approval_token: Option<&str>) -> ModifyReviewsParams {
+    ModifyReviewsParams {
+        vote_value: Some("up".to_string()),
+        version: Some(2),
+        approval_token: approval_token.map(str::to_string),
+        ..modify_review_request(ReviewModifyAction::Vote)
+    }
+}
+
+#[test]
+fn add_comment_includes_notify_query_param_when_set() {
+    let request = ModifyReviewsParams {
+        body: Some("Looks good.".to_string()),
+        notify: Some("delayed".to_string()),
+        ..modify_review_request(ReviewModifyAction::AddComment)
+    };
+
+    let built = request.to_http(Some("alice")).unwrap();
+
+    assert_eq!(built.method, "POST");
+    assert_eq!(built.path, "/reviews/123/comments");
+    assert_eq!(
+        built.query,
+        vec![("notify".to_string(), "delayed".to_string())]
+    );
+    assert_eq!(built.body, serde_json::json!({"body": "Looks good."}));
+}
+
+#[test]
+fn delete_participants_uses_empty_array_dynamic_participant_keys() {
+    let request = ModifyReviewsParams {
+        participant_user_names: Some(vec!["bob".to_string()]),
+        participant_users_required: Some(vec!["carol".to_string()]),
+        participant_group_names: Some(vec!["dev-team".to_string()]),
+        participant_groups_required: Some(vec!["ops".to_string()]),
+        ..modify_review_request(ReviewModifyAction::DeleteParticipants)
+    };
+
+    let built = request.to_http(Some("alice")).unwrap();
+
+    assert_eq!(built.method, "DELETE");
+    assert_eq!(built.path, "/reviews/123/participants");
+    assert_eq!(
+        built.body,
+        serde_json::json!({
+            "participants": {
+                "users": {
+                    "bob": [],
+                    "carol": []
+                },
+                "groups": {
+                    "dev-team": [],
+                    "ops": []
+                }
+            }
+        })
+    );
+}
+
+#[test]
+fn leave_uses_username_participant_body() {
+    let request = modify_review_request(ReviewModifyAction::Leave);
+
+    let built = request.to_http(Some("alice")).unwrap();
+
+    assert_eq!(built.method, "DELETE");
+    assert_eq!(built.path, "/reviews/123/leave");
+    assert_eq!(
+        built.body,
+        serde_json::json!({
+            "participants": {
+                "users": {
+                    "alice": []
+                }
+            }
+        })
+    );
 }
 
 #[test]

@@ -379,10 +379,14 @@ impl ModifyReviewsParams {
                 format!("/reviews/{}/participants", review_id()?),
                 participants_body(self),
             ),
-            ReviewModifyAction::AddComment => post(
-                format!("/reviews/{}/comments", review_id()?),
-                comment_body(self, None)?,
-            ),
+            ReviewModifyAction::AddComment => {
+                let mut request = post(
+                    format!("/reviews/{}/comments", review_id()?),
+                    comment_body(self, None)?,
+                );
+                push_optional(&mut request.query, "notify", self.notify.as_deref());
+                request
+            }
             ReviewModifyAction::ReplyComment => post(
                 format!("/reviews/{}/comments", review_id()?),
                 comment_body(self, self.comment_id)?,
@@ -441,11 +445,12 @@ impl ModifyReviewsParams {
             ),
             ReviewModifyAction::DeleteParticipants => delete(
                 format!("/reviews/{}/participants", review_id()?),
-                participants_body(self),
+                delete_participants_body(self),
             ),
-            ReviewModifyAction::Leave => {
-                delete(format!("/reviews/{}/leave", review_id()?), json!({}))
-            }
+            ReviewModifyAction::Leave => delete(
+                format!("/reviews/{}/leave", review_id()?),
+                join_body(username),
+            ),
             ReviewModifyAction::Obliterate => {
                 delete(format!("/reviews/{}", review_id()?), json!({}))
             }
@@ -620,6 +625,45 @@ fn participants_body(params: &ModifyReviewsParams) -> Value {
             "groups": participant_groups(params)
         }
     })
+}
+
+fn delete_participants_body(params: &ModifyReviewsParams) -> Value {
+    let mut participants = serde_json::Map::new();
+    let users = empty_array_participants(
+        params
+            .participant_user_names
+            .iter()
+            .chain(params.participant_users_required.iter()),
+    );
+    if !users.is_empty() {
+        participants.insert("users".to_string(), Value::Object(users));
+    }
+
+    let groups = empty_array_participants(
+        params
+            .participant_group_names
+            .iter()
+            .chain(params.participant_groups_required.iter()),
+    );
+    if !groups.is_empty() {
+        participants.insert("groups".to_string(), Value::Object(groups));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("participants".to_string(), Value::Object(participants));
+    Value::Object(body)
+}
+
+fn empty_array_participants<'a>(
+    groups: impl Iterator<Item = &'a Vec<String>>,
+) -> serde_json::Map<String, Value> {
+    let mut entries = serde_json::Map::new();
+    for names in groups {
+        for name in names {
+            entries.insert(name.clone(), json!([]));
+        }
+    }
+    entries
 }
 
 fn participant_users(params: &ModifyReviewsParams) -> Value {
