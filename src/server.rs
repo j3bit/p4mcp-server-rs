@@ -2798,6 +2798,74 @@ Files:
     }
 
     #[tokio::test]
+    async fn modify_reviews_comment_read_uses_comment_id_after_approval() {
+        let swarm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v11/comments/987/read"))
+            .and(header("authorization", "Basic YWxpY2U6dGlja2V0LTEyMw=="))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "comment": "read"
+            })))
+            .expect(1)
+            .mount(&swarm)
+            .await;
+
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "userName": "alice",
+                    "serverAddress": "perforce:1666"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({
+                    "value": swarm.uri()
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "perforce:1666 (alice) ticket-123\n",
+                    "stderr": ""
+                }),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor,
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(
+                ModifyReviewsParams {
+                    action: ReviewModifyAction::MarkCommentRead,
+                    review_id: None,
+                    vote_value: None,
+                    version: None,
+                    comment_id: Some(987),
+                    approval_token: Some("approved-token".to_string()),
+                    ..review_modify_params(None)
+                },
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+            .expect("approved comment read should execute");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "mark_comment_read");
+        assert_eq!(response.0.message, json!({"comment": "read"}));
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+    }
+
+    #[tokio::test]
     async fn modify_reviews_approval_preview_uses_method_and_path() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: Vec::new(),
