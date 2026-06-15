@@ -1,6 +1,7 @@
 use crate::{
     error::{P4McpError, Result},
     p4::runner::{OutputMode, P4Invocation},
+    tools::params::{ChangelistModifyAction, ModifyChangelistsParams},
 };
 
 pub fn build_changelist_query_invocation(
@@ -47,44 +48,45 @@ pub fn build_changelist_query_invocation(
 }
 
 pub fn build_changelist_modify_invocation(
-    action: &str,
-    changelist_id: &str,
+    params: &ModifyChangelistsParams,
     stdin: Option<String>,
-    files: &[String],
 ) -> Result<P4Invocation> {
-    let (args, stdin) = match action {
-        "create" => (
+    let (args, stdin) = match params.action {
+        ChangelistModifyAction::Create => (
             vec!["change".into(), "-i".into()],
             Some(required_stdin(stdin, "create")?),
         ),
-        "update" => (
+        ChangelistModifyAction::Update => (
             vec!["change".into(), "-i".into()],
             Some(required_stdin(stdin, "update")?),
         ),
-        "submit" => (
+        ChangelistModifyAction::Submit => (
             vec![
                 "submit".into(),
                 "-c".into(),
-                required_value(changelist_id, "changelist_id", "submit")?,
+                required_for_action(params.changelist_id.as_deref(), "changelist_id", "submit")?,
             ],
             None,
         ),
-        "delete" => (
+        ChangelistModifyAction::Delete => (
             vec![
                 "change".into(),
                 "-d".into(),
-                required_value(changelist_id, "changelist_id", "delete")?,
+                required_for_action(params.changelist_id.as_deref(), "changelist_id", "delete")?,
             ],
             None,
         ),
-        "move_files" => {
-            let change = required_value(changelist_id, "changelist_id", "move_files")?;
-            required_files(files, "move_files")?;
+        ChangelistModifyAction::MoveFiles => {
+            let change = required_for_action(
+                params.changelist_id.as_deref(),
+                "changelist_id",
+                "move_files",
+            )?;
+            let files = required_file_paths(params.file_paths.as_deref(), "move_files")?;
             let mut args = vec!["reopen".into(), "-c".into(), change];
             args.extend(files.iter().cloned());
             (args, None)
         }
-        other => return unknown(other),
     };
     Ok(P4Invocation {
         args,
@@ -102,31 +104,29 @@ fn required_stdin(stdin: Option<String>, action: &str) -> Result<String> {
     }
 }
 
-fn required_value(value: &str, name: &str, action: &str) -> Result<String> {
-    if value.trim().is_empty() {
-        Err(P4McpError::InvalidInput {
-            message: format!("{name} is required for {action}"),
-        })
-    } else {
-        Ok(value.to_string())
-    }
-}
-
-fn required_files(files: &[String], action: &str) -> Result<()> {
-    if files.is_empty() {
-        Err(P4McpError::InvalidInput {
-            message: format!("files is required for {action}"),
-        })
-    } else {
-        Ok(())
-    }
-}
-
 fn required(value: Option<&str>, name: &str) -> Result<String> {
     match value {
         Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
         _ => Err(P4McpError::InvalidInput {
             message: format!("{name} is required"),
+        }),
+    }
+}
+
+fn required_for_action(value: Option<&str>, name: &str, action: &str) -> Result<String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => Err(P4McpError::InvalidInput {
+            message: format!("{name} is required for {action}"),
+        }),
+    }
+}
+
+fn required_file_paths<'a>(file_paths: Option<&'a [String]>, action: &str) -> Result<&'a [String]> {
+    match file_paths {
+        Some(file_paths) if !file_paths.is_empty() => Ok(file_paths),
+        _ => Err(P4McpError::InvalidInput {
+            message: format!("file_paths is required for {action}"),
         }),
     }
 }

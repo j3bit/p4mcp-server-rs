@@ -24,18 +24,18 @@ use crate::{
     config::{AppConfig, Cli, Toolset, TransportMode},
     error::P4McpError,
     p4::{
-        forms::{change_form, change_form_for},
+        forms::{change_form, patch_change_description_form},
         runner::{OutputMode, P4CommandOutput, P4Env, P4Executor, P4Invocation, TokioP4Executor},
     },
     permissions::{Access, SafetyPolicy},
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{build_file_invocation, build_file_modify_invocation},
-        jobs::build_job_query_invocation,
+        jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
-            CommonModifyParams, FileQueryAction, ModifyFilesParams, QueryChangelistsParams,
-            QueryFilesParams, QueryJobsParams, QueryShelvesParams, QueryStreamsParams,
-            QueryWorkspacesParams,
+            ChangelistModifyAction, CommonModifyParams, FileQueryAction, ModifyChangelistsParams,
+            ModifyFilesParams, ModifyJobsParams, QueryChangelistsParams, QueryFilesParams,
+            QueryJobsParams, QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams,
         },
         response::ToolResponse,
         reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
@@ -537,44 +537,46 @@ impl P4McpServer {
 
     async fn modify_changelists_inner(
         &self,
-        params: CommonModifyParams,
+        params: ModifyChangelistsParams,
         channel: ApprovalChannel,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Write, Toolset::Changelists, "modify_changelists")
             .map_err(to_mcp_error)?;
-        let changelist_id = match params.action.as_str() {
-            "create" => "new".to_string(),
-            "update" | "submit" | "delete" | "move_files" => required_option(
+
+        let action = params.action.as_str().to_string();
+        let changelist_id = match params.action {
+            ChangelistModifyAction::Create => Some("new".to_string()),
+            ChangelistModifyAction::Update
+            | ChangelistModifyAction::Submit
+            | ChangelistModifyAction::Delete
+            | ChangelistModifyAction::MoveFiles => Some(required_option(
                 params.changelist_id.as_deref(),
                 "changelist_id",
-                &params.action,
-            )?,
-            other => return Err(to_mcp_error(unknown_action(other))),
+                &action,
+            )?),
         };
-        let stdin = params.form.clone().or_else(|| {
-            params.description.as_ref().map(|description| {
-                if params.action == "create" {
-                    change_form(description, &params.files)
-                } else {
-                    change_form_for(&changelist_id, description, &params.files)
-                }
-            })
-        });
-        let invocation = build_changelist_modify_invocation(
-            &params.action,
-            &changelist_id,
-            stdin,
-            &params.files,
-        )
-        .map_err(to_mcp_error)?;
-        let request = self.common_modify_approval_request(
+        let stdin = match params.action {
+            ChangelistModifyAction::Create => Some(change_form(
+                params.description.as_deref().unwrap_or_default(),
+                &[],
+            )),
+            ChangelistModifyAction::Update => {
+                Some("Description:\n\tapproval preview placeholder\n".to_string())
+            }
+            ChangelistModifyAction::Submit
+            | ChangelistModifyAction::Delete
+            | ChangelistModifyAction::MoveFiles => None,
+        };
+        let invocation =
+            build_changelist_modify_invocation(&params, stdin).map_err(to_mcp_error)?;
+        let request = self.modify_changelists_approval_request(
             &params,
             P4ApprovalContext {
                 tool: "modify_changelists",
-                action: &params.action,
-                targets: changelist_modify_targets(&params.action, &changelist_id, &params.files),
-                changelist: Some(changelist_id),
+                action: &action,
+                targets: changelist_modify_targets(&params, changelist_id.as_deref()),
+                changelist: changelist_id.clone(),
                 workspace: None,
                 stream: None,
                 invocation: &invocation,
@@ -586,7 +588,31 @@ impl P4McpServer {
         {
             return Ok(response);
         }
-        self.call_p4_tool(&params.action, invocation).await
+
+        let invocation = if params.action == ChangelistModifyAction::Update {
+            let changelist_id = changelist_id.expect("update changelist id was required");
+            let output = self
+                .run_p4(text_invocation(vec![
+                    "change".to_string(),
+                    "-o".to_string(),
+                    changelist_id,
+                ]))
+                .await?;
+            let existing = output
+                .text
+                .get("stdout")
+                .and_then(Value::as_str)
+                .ok_or_else(|| to_mcp_error(invalid_input("p4 change -o did not return stdout")))?;
+            let patched = patch_change_description_form(
+                existing,
+                params.description.as_deref().unwrap_or_default(),
+            )
+            .map_err(to_mcp_error)?;
+            build_changelist_modify_invocation(&params, Some(patched)).map_err(to_mcp_error)?
+        } else {
+            invocation
+        };
+        self.call_p4_tool(&action, invocation).await
     }
 
     async fn modify_shelves_inner(
@@ -692,42 +718,24 @@ impl P4McpServer {
 
     async fn modify_jobs_inner(
         &self,
-        params: CommonModifyParams,
+        params: ModifyJobsParams,
         channel: ApprovalChannel,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Write, Toolset::Jobs, "modify_jobs")
             .map_err(to_mcp_error)?;
-        let change = required_option(
-            params.changelist_id.as_deref(),
-            "changelist_id",
-            &params.action,
-        )?;
-        let job = params
-            .files
-            .first()
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .ok_or_else(|| to_mcp_error(invalid_input("files[0] must contain the job id")))?;
-        let args = match params.action.as_str() {
-            "fix" => vec!["fix".to_string(), "-c".to_string(), change.clone(), job],
-            "unfix" => vec![
-                "fix".to_string(),
-                "-d".to_string(),
-                "-c".to_string(),
-                change.clone(),
-                job,
-            ],
-            other => return Err(to_mcp_error(unknown_action(other))),
-        };
-        let invocation = json_invocation(args, None);
-        let request = self.common_modify_approval_request(
+        let invocation = build_job_modify_invocation(&params).map_err(to_mcp_error)?;
+        let action = params.action.as_str().to_string();
+        let request = self.modify_jobs_approval_request(
             &params,
             P4ApprovalContext {
                 tool: "modify_jobs",
-                action: &params.action,
-                targets: params.files.clone(),
-                changelist: Some(change),
+                action: &action,
+                targets: vec![
+                    format!("job:{}", params.job_id),
+                    format!("changelist:{}", params.changelist_id),
+                ],
+                changelist: Some(params.changelist_id.clone()),
                 workspace: None,
                 stream: None,
                 invocation: &invocation,
@@ -739,7 +747,7 @@ impl P4McpServer {
         {
             return Ok(response);
         }
-        self.call_p4_tool(&params.action, invocation).await
+        self.call_p4_tool(&action, invocation).await
     }
 
     async fn modify_streams_inner(
@@ -802,6 +810,40 @@ impl P4McpServer {
             action: context.action.to_string(),
             params: serde_json::to_value(approval_params)
                 .expect("common modify params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_changelists_approval_request(
+        &self,
+        params: &ModifyChangelistsParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify changelists params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_jobs_approval_request(
+        &self,
+        params: &ModifyJobsParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify jobs params serialize to JSON"),
             preview: self.p4_approval_preview(context),
         }
     }
@@ -978,7 +1020,7 @@ impl P4McpServer {
     pub async fn modify_changelists(
         &self,
         peer: Peer<RoleServer>,
-        Parameters(params): Parameters<CommonModifyParams>,
+        Parameters(params): Parameters<ModifyChangelistsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.modify_changelists_inner(params, ApprovalChannel::Elicitation(peer))
             .await
@@ -1093,7 +1135,7 @@ impl P4McpServer {
     pub async fn modify_jobs(
         &self,
         peer: Peer<RoleServer>,
-        Parameters(params): Parameters<CommonModifyParams>,
+        Parameters(params): Parameters<ModifyJobsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.modify_jobs_inner(params, ApprovalChannel::Elicitation(peer))
             .await
@@ -1589,10 +1631,15 @@ fn changelist_targets(changelist_id: &str) -> Vec<String> {
     vec![format!("changelist:{changelist_id}")]
 }
 
-fn changelist_modify_targets(action: &str, changelist_id: &str, files: &[String]) -> Vec<String> {
-    let mut targets = changelist_targets(changelist_id);
-    if action == "move_files" {
-        targets.extend(files.iter().cloned());
+fn changelist_modify_targets(
+    params: &ModifyChangelistsParams,
+    changelist_id: Option<&str>,
+) -> Vec<String> {
+    let mut targets = changelist_id.map(changelist_targets).unwrap_or_default();
+    if params.action == ChangelistModifyAction::MoveFiles {
+        if let Some(file_paths) = &params.file_paths {
+            targets.extend(file_paths.iter().cloned());
+        }
     }
     targets
 }
@@ -1735,7 +1782,7 @@ mod tests {
         approval::{ApprovalChannel, ApprovalDecision, ApprovalRequest, WriteApprovalGate},
         config::{SslVerify, TransportMode},
         p4::runner::{P4CommandOutput, P4Env},
-        tools::params::FileModifyAction,
+        tools::params::{ChangelistModifyAction, FileModifyAction, JobModifyAction},
         tools::reviews::ReviewAction,
     };
 
@@ -1809,6 +1856,25 @@ mod tests {
             description: None,
             files: Vec::new(),
             form: None,
+            approval_token: None,
+        }
+    }
+
+    fn modify_changelists_params(action: ChangelistModifyAction) -> ModifyChangelistsParams {
+        ModifyChangelistsParams {
+            action,
+            changelist_id: None,
+            description: None,
+            file_paths: None,
+            approval_token: None,
+        }
+    }
+
+    fn modify_jobs_params(action: JobModifyAction) -> ModifyJobsParams {
+        ModifyJobsParams {
+            action,
+            changelist_id: "123".to_string(),
+            job_id: "job000001".to_string(),
             approval_token: None,
         }
     }
@@ -1978,9 +2044,8 @@ mod tests {
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("submit");
+        let mut params = modify_changelists_params(ChangelistModifyAction::Submit);
         params.changelist_id = Some("123".to_string());
-        params.files = vec!["//depot/main/file.txt".to_string()];
 
         let response = server
             .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
@@ -2022,12 +2087,12 @@ mod tests {
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("move_files");
+        let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
         params.changelist_id = Some("123".to_string());
-        params.files = vec![
+        params.file_paths = Some(vec![
             "//depot/main/a.rs".to_string(),
             "//depot/main/b.rs".to_string(),
-        ];
+        ]);
 
         let response = server
             .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
@@ -2072,12 +2137,12 @@ mod tests {
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("move_files");
+        let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
         params.changelist_id = Some("123".to_string());
-        params.files = vec![
+        params.file_paths = Some(vec![
             "//depot/main/a.rs".to_string(),
             "//depot/main/b.rs".to_string(),
-        ];
+        ]);
         params.approval_token = Some("approved-token".to_string());
 
         let response = server
@@ -2109,6 +2174,100 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
         assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_update_without_approval_does_not_fetch_form() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+        params.changelist_id = Some("123".to_string());
+        params.description = Some("new description".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "change".to_string(),
+                "-i".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_update_after_approval_patches_existing_form() {
+        let existing_form = "\
+Change: 123
+
+Description:
+\told description
+
+Files:
+\t//depot/main/a.rs
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"change": "123"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+        params.changelist_id = Some("123".to_string());
+        params.description = Some("new description".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved update should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].args, ["change", "-o", "123"]);
+        assert_eq!(invocations[0].mode, OutputMode::Text);
+        assert_eq!(invocations[1].args, ["change", "-i"]);
+        assert_eq!(
+            invocations[1].stdin.as_deref(),
+            Some(
+                "\
+Change: 123
+
+Description:
+\tnew description
+
+Files:
+\t//depot/main/a.rs
+"
+            )
+        );
     }
 
     #[tokio::test]
@@ -2295,9 +2454,7 @@ mod tests {
             executor.clone(),
             approval_gate.clone(),
         );
-        let mut params = common_modify_params("fix");
-        params.changelist_id = Some("123".to_string());
-        params.files = vec!["job000001".to_string()];
+        let params = modify_jobs_params(JobModifyAction::LinkJob);
 
         let response = server
             .modify_jobs_inner(params, ApprovalChannel::FallbackOnly)
@@ -2310,9 +2467,12 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].fallback_only);
         assert_eq!(calls[0].request.tool, "modify_jobs");
-        assert_eq!(calls[0].request.action, "fix");
+        assert_eq!(calls[0].request.action, "link_job");
         assert_eq!(calls[0].request.params["approval_token"], json!(null));
-        assert_eq!(calls[0].request.preview.targets, ["job000001"]);
+        assert_eq!(
+            calls[0].request.preview.targets,
+            ["job:job000001", "changelist:123"]
+        );
         assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
         assert_eq!(
             calls[0].request.preview.command,

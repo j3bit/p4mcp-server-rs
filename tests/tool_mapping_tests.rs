@@ -1,14 +1,16 @@
 use p4mcp_server_rs::{
     config::Toolset,
+    p4::forms::patch_change_description_form,
     p4::runner::{OutputMode, P4Invocation},
     permissions::{Access, SafetyPolicy},
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{build_file_invocation, build_file_modify_invocation},
-        jobs::build_job_query_invocation,
+        jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
-            ChangelistQueryAction, FileModifyAction, FileQueryAction, JobQueryAction,
-            ModifyFilesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
+            ChangelistModifyAction, ChangelistQueryAction, FileModifyAction, FileQueryAction,
+            JobModifyAction, JobQueryAction, ModifyChangelistsParams, ModifyFilesParams,
+            ModifyJobsParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
             QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, ShelfQueryAction,
             StreamQueryAction, WorkspaceQueryAction,
         },
@@ -682,9 +684,70 @@ fn changelist_list_appends_depot_path_filter() {
     );
 }
 
+fn modify_changelists_params(action: ChangelistModifyAction) -> ModifyChangelistsParams {
+    ModifyChangelistsParams {
+        action,
+        changelist_id: None,
+        description: None,
+        file_paths: None,
+        approval_token: None,
+    }
+}
+
+#[test]
+fn modify_changelists_move_files_uses_file_paths() {
+    let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
+    params.changelist_id = Some("12345".to_string());
+    params.file_paths = Some(vec!["//depot/main/a.txt".to_string()]);
+
+    let invocation = build_changelist_modify_invocation(&params, None).unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec!["reopen", "-c", "12345", "//depot/main/a.txt"]
+    );
+    assert_eq!(invocation.stdin, None);
+}
+
+#[test]
+fn patch_change_description_preserves_existing_files() {
+    let existing = "\
+Change: 12345
+
+Description:
+\told description
+\tcontinued
+
+Files:
+\t//depot/main/a.txt
+\t//depot/main/b.txt
+";
+
+    let patched = patch_change_description_form(existing, "new description\nsecond line").unwrap();
+
+    assert_eq!(
+        patched,
+        "\
+Change: 12345
+
+Description:
+\tnew description
+\tsecond line
+
+Files:
+\t//depot/main/a.txt
+\t//depot/main/b.txt
+"
+    );
+}
+
 #[test]
 fn changelist_submit_uses_numbered_change() {
-    let invocation = build_changelist_modify_invocation("submit", "123", None, &[]).unwrap();
+    let mut params = modify_changelists_params(ChangelistModifyAction::Submit);
+    params.changelist_id = Some("123".to_string());
+
+    let invocation = build_changelist_modify_invocation(&params, None).unwrap();
+
     assert_eq!(invocation.args, vec!["submit", "-c", "123"]);
 }
 
@@ -695,7 +758,11 @@ fn changelist_move_files_uses_reopen() {
         "//depot/main/b.rs".to_string(),
     ];
 
-    let invocation = build_changelist_modify_invocation("move_files", "123", None, &files).unwrap();
+    let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
+    params.changelist_id = Some("123".to_string());
+    params.file_paths = Some(files);
+
+    let invocation = build_changelist_modify_invocation(&params, None).unwrap();
 
     assert_eq!(
         invocation.args,
@@ -713,17 +780,23 @@ fn changelist_move_files_uses_reopen() {
 
 #[test]
 fn changelist_move_files_requires_files() {
-    let error = build_changelist_modify_invocation("move_files", "123", None, &[])
+    let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
+    params.changelist_id = Some("123".to_string());
+
+    let error = build_changelist_modify_invocation(&params, None)
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("files is required for move_files"));
+    assert!(error.contains("file_paths is required for move_files"));
 }
 
 #[test]
 fn changelist_move_files_empty_id_errors() {
-    let files = vec!["//depot/main/a.rs".to_string()];
-    let error = build_changelist_modify_invocation("move_files", " ", None, &files)
+    let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
+    params.changelist_id = Some(" ".to_string());
+    params.file_paths = Some(vec!["//depot/main/a.rs".to_string()]);
+
+    let error = build_changelist_modify_invocation(&params, None)
         .unwrap_err()
         .to_string();
 
@@ -732,7 +805,9 @@ fn changelist_move_files_empty_id_errors() {
 
 #[test]
 fn changelist_create_without_stdin_errors() {
-    let error = build_changelist_modify_invocation("create", "", None, &[])
+    let params = modify_changelists_params(ChangelistModifyAction::Create);
+
+    let error = build_changelist_modify_invocation(&params, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("stdin is required for create"));
@@ -740,7 +815,10 @@ fn changelist_create_without_stdin_errors() {
 
 #[test]
 fn changelist_update_without_stdin_errors() {
-    let error = build_changelist_modify_invocation("update", "123", None, &[])
+    let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+    params.changelist_id = Some("123".to_string());
+
+    let error = build_changelist_modify_invocation(&params, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("stdin is required for update"));
@@ -748,7 +826,10 @@ fn changelist_update_without_stdin_errors() {
 
 #[test]
 fn changelist_submit_empty_id_errors() {
-    let error = build_changelist_modify_invocation("submit", " ", None, &[])
+    let mut params = modify_changelists_params(ChangelistModifyAction::Submit);
+    params.changelist_id = Some(" ".to_string());
+
+    let error = build_changelist_modify_invocation(&params, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required for submit"));
@@ -756,7 +837,10 @@ fn changelist_submit_empty_id_errors() {
 
 #[test]
 fn changelist_delete_empty_id_errors() {
-    let error = build_changelist_modify_invocation("delete", "", None, &[])
+    let mut params = modify_changelists_params(ChangelistModifyAction::Delete);
+    params.changelist_id = Some("".to_string());
+
+    let error = build_changelist_modify_invocation(&params, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("changelist_id is required for delete"));
@@ -843,6 +927,37 @@ fn job_query_rejects_non_upstream_list_action() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("unknown action: list"));
+}
+
+#[test]
+fn modify_jobs_link_job_uses_upstream_action_and_job_id() {
+    let params = ModifyJobsParams {
+        action: JobModifyAction::LinkJob,
+        changelist_id: "12345".to_string(),
+        job_id: "job000123".to_string(),
+        approval_token: None,
+    };
+
+    let invocation = build_job_modify_invocation(&params).unwrap();
+
+    assert_eq!(invocation.args, vec!["fix", "-c", "12345", "job000123"]);
+}
+
+#[test]
+fn modify_jobs_unlink_job_uses_upstream_action_and_job_id() {
+    let params = ModifyJobsParams {
+        action: JobModifyAction::UnlinkJob,
+        changelist_id: "12345".to_string(),
+        job_id: "job000123".to_string(),
+        approval_token: None,
+    };
+
+    let invocation = build_job_modify_invocation(&params).unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec!["fix", "-d", "-c", "12345", "job000123"]
+    );
 }
 
 #[test]

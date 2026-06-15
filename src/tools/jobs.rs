@@ -1,6 +1,7 @@
 use crate::{
     error::{P4McpError, Result},
     p4::runner::{OutputMode, P4Invocation},
+    tools::params::{JobModifyAction, ModifyJobsParams},
 };
 
 pub fn build_job_query_invocation(
@@ -21,6 +22,20 @@ pub fn build_job_query_invocation(
                 message: format!("unknown action: {other}"),
             });
         }
+    };
+    Ok(P4Invocation {
+        args,
+        stdin: None,
+        mode: OutputMode::JsonLines,
+    })
+}
+
+pub fn build_job_modify_invocation(params: &ModifyJobsParams) -> Result<P4Invocation> {
+    let change = required(Some(params.changelist_id.as_str()), "changelist_id")?;
+    let job = required(Some(params.job_id.as_str()), "job_id")?;
+    let args = match params.action {
+        JobModifyAction::LinkJob => vec!["fix".into(), "-c".into(), change, job],
+        JobModifyAction::UnlinkJob => vec!["fix".into(), "-d".into(), "-c".into(), change, job],
     };
     Ok(P4Invocation {
         args,
