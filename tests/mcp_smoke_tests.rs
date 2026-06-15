@@ -20,6 +20,8 @@ use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::Tool;
 use serde_json::json;
+use wiremock::matchers::{header, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn test_config() -> AppConfig {
     AppConfig {
@@ -389,8 +391,42 @@ async fn query_files_grep_caps_records_by_max_results() {
 }
 
 #[tokio::test]
-async fn query_reviews_returns_dry_run_request_metadata() {
-    let server = P4McpServer::new(test_config());
+async fn query_reviews_executes_review_api_request() {
+    let swarm = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v11/reviews"))
+        .and(query_param("max", "5"))
+        .and(header("authorization", "Basic YWxpY2U6dGlja2V0LTEyMw=="))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "reviews": [123]
+        })))
+        .expect(1)
+        .mount(&swarm)
+        .await;
+
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({
+                "userName": "alice",
+                "serverAddress": "perforce:1666"
+            })],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({
+                "value": swarm.uri()
+            })],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({
+                "stdout": "perforce:1666 (alice) ticket-123\n",
+                "stderr": ""
+            }),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
         .query_reviews(Parameters(ReviewRequest {
@@ -403,10 +439,48 @@ async fn query_reviews_returns_dry_run_request_metadata() {
         .await
         .unwrap();
 
-    assert_eq!(response.0.status, "dry_run");
-    assert_eq!(response.0.action, "query_reviews");
-    assert_eq!(response.0.message["method"], "GET");
-    assert_eq!(response.0.message["path"], "/reviews");
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "list");
+    assert_eq!(response.0.message, json!({ "reviews": [123] }));
+
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 3);
+    assert_eq!(invocations[0].args, ["info"]);
+    assert_eq!(
+        invocations[1].args,
+        ["property", "-l", "-n", "P4.Swarm.URL"]
+    );
+    assert_eq!(invocations[2].args, ["tickets"]);
+}
+
+#[tokio::test]
+async fn query_reviews_rejects_write_actions_before_p4_discovery() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_reviews(Parameters(ReviewRequest {
+            action: ReviewAction::Vote,
+            review_id: Some(123),
+            max_results: 10,
+            body: json!({"vote": "up"}),
+            approval_token: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("query_reviews should reject write review actions"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(
+        err.message
+            .contains("query_reviews only supports read review actions")
+    );
+    assert!(executor.invocations().is_empty());
 }
 
 #[tokio::test]

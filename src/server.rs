@@ -37,7 +37,7 @@ use crate::{
             QueryFilesParams,
         },
         response::ToolResponse,
-        reviews::{BuiltReviewRequest, ReviewRequest},
+        reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
         streams::build_stream_query_invocation,
@@ -124,6 +124,42 @@ impl P4McpServer {
     ) -> McpResult<Json<ToolResponse>> {
         let output = self.run_p4(invocation).await?;
         Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn review_http_client_from_p4(&self) -> McpResult<ReviewHttpClient> {
+        let info = self
+            .run_p4(json_invocation(vec!["info".to_string()], None))
+            .await?;
+        let swarm_property = self
+            .run_p4(json_invocation(
+                vec![
+                    "property".to_string(),
+                    "-l".to_string(),
+                    "-n".to_string(),
+                    "P4.Swarm.URL".to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        let tickets = self
+            .run_p4(text_invocation(vec!["tickets".to_string()]))
+            .await?;
+        let tickets_stdout = tickets
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let api_config =
+            ReviewApiConfig::from_p4(&info.records, &swarm_property.records, tickets_stdout)
+                .map_err(to_mcp_error)?;
+
+        ReviewHttpClient::new_with_ssl_verify(
+            api_config.api_base,
+            api_config.username,
+            api_config.ticket,
+            &self.config.ssl_verify,
+        )
+        .map_err(review_api_error)
     }
 
     async fn query_workspace_type(
@@ -864,10 +900,15 @@ impl P4McpServer {
             .check(Access::Read, Toolset::Reviews, "query_reviews")
             .map_err(to_mcp_error)?;
         let built = params.to_http("unused").map_err(to_mcp_error)?;
-        Ok(Json(ToolResponse::dry_run(
-            "query_reviews",
-            review_message(built),
-        )))
+        if built.method != "GET" {
+            return Err(to_mcp_error(invalid_input(
+                "query_reviews only supports read review actions",
+            )));
+        }
+        let action = review_action_name(&params);
+        let client = self.review_http_client_from_p4().await?;
+        let message = client.execute(&params).await.map_err(review_api_error)?;
+        Ok(Json(ToolResponse::success(&action, message)))
     }
 
     #[tool(
@@ -1043,6 +1084,14 @@ fn json_invocation(args: Vec<String>, stdin: Option<String>) -> P4Invocation {
     }
 }
 
+fn text_invocation(args: Vec<String>) -> P4Invocation {
+    P4Invocation {
+        args,
+        stdin: None,
+        mode: OutputMode::Text,
+    }
+}
+
 fn modify_files_targets(params: &ModifyFilesParams) -> Vec<String> {
     let mut targets = Vec::new();
     if let Some(file_paths) = &params.file_paths {
@@ -1152,6 +1201,10 @@ fn to_mcp_error(error: P4McpError) -> ErrorData {
             ErrorData::internal_error(error.to_string(), None)
         }
     }
+}
+
+fn review_api_error(error: anyhow::Error) -> ErrorData {
+    ErrorData::internal_error(format!("review API request failed: {error}"), None)
 }
 
 #[must_use]
