@@ -33,15 +33,19 @@ use crate::{
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::build_job_query_invocation,
         params::{
-            CommonModifyParams, CommonQueryParams, FileQueryAction, ModifyFilesParams,
-            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
+            CommonModifyParams, FileQueryAction, ModifyFilesParams, QueryChangelistsParams,
+            QueryFilesParams, QueryJobsParams, QueryShelvesParams, QueryStreamsParams,
             QueryWorkspacesParams,
         },
         response::ToolResponse,
         reviews::{BuiltReviewRequest, ReviewApiConfig, ReviewHttpClient, ReviewRequest},
         server::{ServerQueryAction, build_server_invocation},
         shelves::build_shelf_query_invocation,
-        streams::build_stream_query_invocation,
+        streams::{
+            StreamQueryCommand, build_stream_query_command, client_spec_invocation,
+            interchanges_invocation, opened_for_stream_validation_invocation,
+            stream_resolve_preview_invocation, stream_spec_with_view_invocation,
+        },
         workspaces::build_workspace_query_invocation,
     },
 };
@@ -221,6 +225,233 @@ impl P4McpServer {
                 &synced_changes.records,
             ),
         )))
+    }
+
+    async fn query_stream_parent(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let output = self
+            .run_p4(json_invocation(
+                vec!["stream".into(), "-o".into(), stream_name.into()],
+                None,
+            ))
+            .await?;
+        let parent = output
+            .records
+            .first()
+            .and_then(|record| record.get("Parent"))
+            .cloned()
+            .unwrap_or(json!(null));
+        Ok(Json(ToolResponse::success(action, parent)))
+    }
+
+    async fn query_stream_graph(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let stream = self
+            .run_p4(json_invocation(
+                vec!["stream".into(), "-o".into(), stream_name.into()],
+                None,
+            ))
+            .await?;
+        let children = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-F".into(),
+                    format!("Parent={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        let parent = stream
+            .records
+            .first()
+            .and_then(|record| record.get("Parent"))
+            .cloned()
+            .unwrap_or(json!(null));
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "stream": stream_name,
+                "parent": parent,
+                "children": children.records
+            }),
+        )))
+    }
+
+    async fn query_stream_validate_file(
+        &self,
+        action: &str,
+        workspace: Option<&str>,
+        file_paths: &[String],
+    ) -> McpResult<Json<ToolResponse>> {
+        let client = self.run_p4(client_spec_invocation(workspace)).await?;
+        let stream = required_record_field(&client.records, "Stream").map_err(to_mcp_error)?;
+        let stream_spec = self
+            .run_p4(stream_spec_with_view_invocation(&stream))
+            .await?;
+        let paths = collect_record_strings(&stream_spec.records, "Paths");
+        let ignored = collect_record_strings(&stream_spec.records, "Ignored");
+        let results = file_paths
+            .iter()
+            .map(|file| classify_stream_file(file, &stream, &paths, &ignored))
+            .collect::<Vec<_>>();
+        let all_allowed = results
+            .iter()
+            .all(|result| result.get("allowed").and_then(Value::as_bool) == Some(true));
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "status": "success",
+                "all_allowed": all_allowed,
+                "stream": stream,
+                "workspace": workspace,
+                "file_count": file_paths.len(),
+                "results": results
+            }),
+        )))
+    }
+
+    async fn query_stream_validate_submit(
+        &self,
+        action: &str,
+        workspace: Option<&str>,
+        changelist: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let client = self.run_p4(client_spec_invocation(workspace)).await?;
+        let stream = required_record_field(&client.records, "Stream").map_err(to_mcp_error)?;
+        let opened = self
+            .run_p4(opened_for_stream_validation_invocation(
+                workspace, changelist,
+            ))
+            .await?;
+        let stream_spec = self
+            .run_p4(stream_spec_with_view_invocation(&stream))
+            .await?;
+        let paths = collect_record_strings(&stream_spec.records, "Paths");
+        let ignored = collect_record_strings(&stream_spec.records, "Ignored");
+        let results = opened
+            .records
+            .iter()
+            .filter_map(|record| record.get("depotFile").and_then(Value::as_str))
+            .map(|file| classify_stream_file(file, &stream, &paths, &ignored))
+            .collect::<Vec<_>>();
+        let submittable = results
+            .iter()
+            .all(|result| result.get("allowed").and_then(Value::as_bool) == Some(true));
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "status": "success",
+                "submittable": submittable,
+                "stream": stream,
+                "workspace": workspace,
+                "file_count": results.len(),
+                "results": results
+            }),
+        )))
+    }
+
+    async fn query_stream_check_resolve(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let preview = self.run_p4(stream_resolve_preview_invocation()).await?;
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "status": "success",
+                "resolve_needed": !preview.records.is_empty(),
+                "stream": stream_name,
+                "conflicts": preview.records
+            }),
+        )))
+    }
+
+    async fn query_stream_interchanges(
+        &self,
+        action: &str,
+        stream_name: &str,
+        reverse: bool,
+        file_paths: &[String],
+        long_output: bool,
+        limit: Option<u16>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let client = self.run_p4(client_spec_invocation(None)).await?;
+        let workspace_stream = required_workspace_stream(&client.records).map_err(to_mcp_error)?;
+        self.require_existing_stream(stream_name).await?;
+        let output = self
+            .run_p4(interchanges_invocation(
+                stream_name,
+                reverse,
+                file_paths,
+                long_output,
+            ))
+            .await?;
+        let changelists = match limit {
+            Some(limit) => output.records.into_iter().take(limit as usize).collect(),
+            None => output.records,
+        };
+        let message =
+            stream_interchanges_message(stream_name, &workspace_stream, reverse, changelists.len());
+        let source_stream = if reverse {
+            workspace_stream.clone()
+        } else {
+            stream_name.to_string()
+        };
+        let message = json!({
+            "changelists": changelists,
+            "count": message.0,
+            "source_stream": source_stream,
+            "workspace_stream": workspace_stream,
+            "direction": if reverse { "reverse" } else { "forward" },
+            "message": message.1
+        });
+        Ok(Json(ToolResponse::success(action, message)))
+    }
+
+    async fn require_existing_stream(&self, stream_name: &str) -> McpResult<()> {
+        let active = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if !active.records.is_empty() {
+            return Ok(());
+        }
+
+        let including_deleted = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-a".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if including_deleted.records.is_empty() {
+            return Err(to_mcp_error(invalid_input(format!(
+                "stream does not exist: {stream_name}"
+            ))));
+        }
+
+        Ok(())
     }
 
     async fn run_workspace_status_command(
@@ -869,24 +1100,65 @@ impl P4McpServer {
     }
 
     #[tool(
-        description = "List streams, get stream specs, graph streams, and inspect stream integration status",
+        description = "List streams, get stream specs, graph streams, validate stream files, check stream resolves, and inspect stream integration status",
         annotations(read_only_hint = true)
     )]
     pub async fn query_streams(
         &self,
-        Parameters(params): Parameters<CommonQueryParams>,
+        Parameters(params): Parameters<QueryStreamsParams>,
     ) -> McpResult<Json<ToolResponse>> {
         self.policy()
             .check(Access::Read, Toolset::Streams, "query_streams")
             .map_err(to_mcp_error)?;
-        let invocation = build_stream_query_invocation(
-            &params.action,
-            params.stream.as_deref(),
-            params.owner.as_deref(),
-            params.max_results,
-        )
-        .map_err(to_mcp_error)?;
-        self.call_p4_tool(&params.action, invocation).await
+        let action = params.action.as_str();
+        let command = build_stream_query_command(&params).map_err(to_mcp_error)?;
+        match command {
+            StreamQueryCommand::Single(invocation) => self.call_p4_tool(action, invocation).await,
+            StreamQueryCommand::Parent { stream_name } => {
+                self.query_stream_parent(action, &stream_name).await
+            }
+            StreamQueryCommand::Graph { stream_name } => {
+                self.query_stream_graph(action, &stream_name).await
+            }
+            StreamQueryCommand::ValidateFile {
+                workspace,
+                file_paths,
+            } => {
+                self.query_stream_validate_file(action, workspace.as_deref(), &file_paths)
+                    .await
+            }
+            StreamQueryCommand::ValidateSubmit {
+                workspace,
+                changelist,
+            } => {
+                self.query_stream_validate_submit(
+                    action,
+                    workspace.as_deref(),
+                    changelist.as_deref(),
+                )
+                .await
+            }
+            StreamQueryCommand::CheckResolve { stream_name } => {
+                self.query_stream_check_resolve(action, &stream_name).await
+            }
+            StreamQueryCommand::Interchanges {
+                stream_name,
+                reverse,
+                file_paths,
+                long_output,
+                limit,
+            } => {
+                self.query_stream_interchanges(
+                    action,
+                    &stream_name,
+                    reverse,
+                    &file_paths,
+                    long_output,
+                    limit,
+                )
+                .await
+            }
+        }
     }
 
     #[tool(
@@ -1035,6 +1307,199 @@ fn collect_string_field(records: &[Value], field: &str) -> Vec<String> {
         .iter()
         .filter_map(|record| non_empty_string_field(record, field))
         .collect()
+}
+
+fn required_record_field(records: &[Value], field: &str) -> crate::error::Result<String> {
+    records
+        .first()
+        .and_then(|record| non_empty_string_field(record, field))
+        .ok_or_else(|| P4McpError::InvalidInput {
+            message: format!("{field} is required"),
+        })
+}
+
+fn required_workspace_stream(records: &[Value]) -> crate::error::Result<String> {
+    required_record_field(records, "Stream").map_err(|_| P4McpError::InvalidInput {
+        message: "interchanges requires a stream-based workspace".to_string(),
+    })
+}
+
+fn collect_record_strings(records: &[Value], field: &str) -> Vec<String> {
+    let mut values = Vec::new();
+
+    for record in records {
+        if let Some(value) = record.get(field) {
+            push_record_strings(value, &mut values);
+        }
+
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        let mut indexed = object
+            .iter()
+            .filter_map(|(key, value)| {
+                let suffix = key.strip_prefix(field)?;
+                if suffix.is_empty() {
+                    return None;
+                }
+                Some((suffix.parse::<usize>().ok(), suffix.to_string(), value))
+            })
+            .collect::<Vec<_>>();
+        indexed.sort_by(
+            |(left_index, left_suffix, _), (right_index, right_suffix, _)| match (
+                left_index,
+                right_index,
+            ) {
+                (Some(left), Some(right)) => left.cmp(right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left_suffix.cmp(right_suffix),
+            },
+        );
+        for (_, _, value) in indexed {
+            push_record_strings(value, &mut values);
+        }
+    }
+
+    values
+}
+
+fn push_record_strings(value: &Value, values: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            values.extend(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        Value::String(value) => {
+            let value = value.trim();
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stream_interchanges_message(
+    stream_name: &str,
+    workspace_stream: &str,
+    reverse: bool,
+    count: usize,
+) -> (usize, String) {
+    if count == 0 {
+        return (
+            count,
+            format!(
+                "Streams are in sync; no outstanding changelists between '{stream_name}' and '{workspace_stream}'"
+            ),
+        );
+    }
+
+    let message = if reverse {
+        format!(
+            "{count} outstanding changelist(s) in '{workspace_stream}' not yet propagated to '{stream_name}'"
+        )
+    } else {
+        format!(
+            "{count} outstanding changelist(s) in '{stream_name}' not yet merged into '{workspace_stream}'"
+        )
+    };
+
+    (count, message)
+}
+
+fn stream_rule_result(path_type: &str) -> (bool, String) {
+    match path_type {
+        "exclude" => (false, "excluded".to_string()),
+        "import" => (false, "import_readonly".to_string()),
+        "share" | "isolate" | "import+" => (true, path_type.to_string()),
+        other => (false, other.to_string()),
+    }
+}
+
+fn p4_pattern_matches(pattern: &str, file: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("/...") {
+        return file == prefix || file.starts_with(&format!("{prefix}/"));
+    }
+    wildcard_match(pattern.as_bytes(), file.as_bytes())
+}
+
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern.starts_with(b"...") {
+        return wildcard_match(&pattern[3..], text)
+            || (!text.is_empty() && wildcard_match(pattern, &text[1..]));
+    }
+    if pattern[0] == b'*' {
+        return wildcard_match(&pattern[1..], text)
+            || (!text.is_empty() && text[0] != b'/' && wildcard_match(pattern, &text[1..]));
+    }
+    if text.first() == Some(&pattern[0]) {
+        return wildcard_match(&pattern[1..], &text[1..]);
+    }
+    false
+}
+
+fn stream_pattern_matches(file: &str, stream: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let depot_pattern = if pattern.starts_with("//") {
+        pattern.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            stream.trim_end_matches('/'),
+            pattern.trim_start_matches('/')
+        )
+    };
+    p4_pattern_matches(&depot_pattern, file)
+}
+
+fn classify_stream_file(file: &str, stream: &str, paths: &[String], ignored: &[String]) -> Value {
+    if ignored
+        .iter()
+        .any(|pattern| stream_pattern_matches(file, stream, pattern))
+    {
+        return json!({
+            "file": file,
+            "allowed": false,
+            "rule": "ignored"
+        });
+    }
+
+    let mut matched_rule = None;
+    for path in paths {
+        let mut parts = path.split_whitespace();
+        let path_type = parts.next().unwrap_or_default();
+        let pattern = parts.next().unwrap_or_default();
+        if stream_pattern_matches(file, stream, pattern) {
+            matched_rule = Some(stream_rule_result(path_type));
+        }
+    }
+
+    if let Some((allowed, rule)) = matched_rule {
+        return json!({
+            "file": file,
+            "allowed": allowed,
+            "rule": rule
+        });
+    }
+
+    json!({
+        "file": file,
+        "allowed": false,
+        "rule": "outside_view"
+    })
 }
 
 fn collect_string_values(records: &[Value]) -> Vec<String> {

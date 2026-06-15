@@ -13,7 +13,7 @@ use p4mcp_server_rs::{
     tools::{
         params::{
             ChangelistQueryAction, FileQueryAction, QueryChangelistsParams, QueryFilesParams,
-            QueryWorkspacesParams, WorkspaceQueryAction,
+            QueryStreamsParams, QueryWorkspacesParams, StreamQueryAction, WorkspaceQueryAction,
         },
         reviews::{ReviewAction, ReviewRequest},
         server::ServerQueryAction,
@@ -37,6 +37,32 @@ fn test_config() -> AppConfig {
         p4_bin: "p4".into(),
         log_dir: None,
         ssl_verify: SslVerify::Enabled,
+    }
+}
+
+fn stream_query_params(action: StreamQueryAction) -> QueryStreamsParams {
+    QueryStreamsParams {
+        action,
+        stream_name: Some("//streams/dev".to_string()),
+        stream_path: None,
+        filter: None,
+        fields: None,
+        unloaded: false,
+        all_streams: false,
+        viewmatch: None,
+        view_without_edit: false,
+        at_change: None,
+        both_directions: false,
+        force_refresh: false,
+        workspace: None,
+        template: None,
+        user: None,
+        file_paths: None,
+        changelist: None,
+        reverse: false,
+        long_output: false,
+        limit: None,
+        max_results: 50,
     }
 }
 
@@ -332,6 +358,240 @@ async fn query_workspaces_status_requires_workspace_name() {
     assert_eq!(err.code, ErrorData::invalid_params("", None).code);
     assert!(err.message.contains("workspace_name is required"));
     assert!(executor.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn query_streams_interchanges_runs_upstream_command_and_limits_client_side() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/workspace"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![
+                json!({"change": "101"}),
+                json!({"change": "102"}),
+                json!({"change": "103"}),
+            ],
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+    let mut params = stream_query_params(StreamQueryAction::Interchanges);
+    params.reverse = true;
+    params.long_output = true;
+    params.limit = Some(2);
+    params.file_paths = Some(vec!["//streams/dev/src/...".to_string()]);
+
+    let response = server.query_streams(Parameters(params)).await.unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "interchanges");
+    assert_eq!(
+        response.0.message,
+        json!({
+            "changelists": [{"change": "101"}, {"change": "102"}],
+            "count": 2,
+            "source_stream": "//streams/workspace",
+            "workspace_stream": "//streams/workspace",
+            "direction": "reverse",
+            "message": "2 outstanding changelist(s) in '//streams/workspace' not yet propagated to '//streams/dev'"
+        })
+    );
+    let invocations = executor.invocations();
+    assert_eq!(invocations[0].args, ["client", "-o"]);
+    assert_eq!(
+        invocations[1].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(
+        invocations[2].args,
+        [
+            "interchanges",
+            "-S",
+            "//streams/dev",
+            "-r",
+            "-l",
+            "//streams/dev/src/..."
+        ]
+    );
+}
+
+#[tokio::test]
+async fn query_streams_interchanges_rejects_classic_workspace_before_stream_lookup() {
+    let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+        records: vec![json!({"Client": "classic-ws"})],
+        text: json!({}),
+    }]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_streams(Parameters(stream_query_params(
+            StreamQueryAction::Interchanges,
+        )))
+        .await
+    {
+        Ok(_) => panic!("query_streams interchanges should require a stream workspace"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("stream-based workspace"));
+    assert_eq!(executor.invocations().len(), 1);
+    assert_eq!(executor.invocations()[0].args, ["client", "-o"]);
+}
+
+#[tokio::test]
+async fn query_streams_validate_file_reads_indexed_stream_rules_and_later_exclude_wins() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({
+                "Stream": "//streams/dev",
+                "Update": "2026/06/15"
+            })],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({
+                "Paths0": "share ...",
+                "Paths1": "exclude src/private/...",
+                "Ignored0": "*.tmp"
+            })],
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+    let mut params = stream_query_params(StreamQueryAction::ValidateFile);
+    params.file_paths = Some(vec![
+        "//streams/dev/src/private/secret.rs".to_string(),
+        "//streams/dev/src/main.rs".to_string(),
+        "//streams/dev/build.tmp".to_string(),
+    ]);
+
+    let response = server.query_streams(Parameters(params)).await.unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "validate_file");
+    assert_eq!(response.0.message["all_allowed"], json!(false));
+    assert_eq!(response.0.message["results"][0]["allowed"], json!(false));
+    assert_eq!(response.0.message["results"][0]["rule"], json!("excluded"));
+    assert_eq!(response.0.message["results"][1]["allowed"], json!(true));
+    assert_eq!(response.0.message["results"][1]["rule"], json!("share"));
+    assert_eq!(response.0.message["results"][2]["allowed"], json!(false));
+    assert_eq!(response.0.message["results"][2]["rule"], json!("ignored"));
+    let invocations = executor.invocations();
+    assert_eq!(invocations[0].args, ["client", "-o"]);
+    assert_eq!(invocations[1].args, ["stream", "-o", "-v", "//streams/dev"]);
+}
+
+#[tokio::test]
+async fn query_streams_check_resolve_runs_preview_after_stream_check() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"resolve": "needed"})],
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_streams(Parameters(stream_query_params(
+            StreamQueryAction::CheckResolve,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "check_resolve");
+    assert_eq!(response.0.message["resolve_needed"], json!(true));
+    let invocations = executor.invocations();
+    assert_eq!(
+        invocations[0].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(invocations[1].args, ["stream", "resolve", "-n"]);
+}
+
+#[tokio::test]
+async fn query_streams_check_resolve_rejects_missing_stream_before_preview() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_streams(Parameters(stream_query_params(
+            StreamQueryAction::CheckResolve,
+        )))
+        .await
+    {
+        Ok(_) => panic!("query_streams check_resolve should reject missing streams"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("does not exist"));
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(
+        invocations[1].args,
+        ["streams", "-a", "-F", "Stream=//streams/dev"]
+    );
+}
+
+#[tokio::test]
+async fn query_streams_parent_rejects_missing_stream_before_fetch() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_streams(Parameters(stream_query_params(StreamQueryAction::Parent)))
+        .await
+    {
+        Ok(_) => panic!("query_streams parent should reject missing streams"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("does not exist"));
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(
+        invocations[1].args,
+        ["streams", "-a", "-F", "Stream=//streams/dev"]
+    );
 }
 
 #[tokio::test]
