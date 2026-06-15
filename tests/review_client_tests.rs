@@ -1,6 +1,6 @@
 use p4mcp_server_rs::tools::reviews::{ReviewAction, ReviewHttpClient, ReviewRequest};
 use schemars::JsonSchema;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn schema_has_property<T: JsonSchema>(name: &str) -> bool {
@@ -235,13 +235,50 @@ async fn execute_vote_rejects_write_without_approval() {
 }
 
 #[tokio::test]
+async fn execute_approved_vote_sends_post_with_body_and_basic_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v11/reviews/123/vote"))
+        .and(header("authorization", "Basic dXNlcjp0aWNrZXQ="))
+        .and(body_json(serde_json::json!({"vote": "up", "version": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "vote": "recorded"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ReviewHttpClient::new(
+        format!("{}/api/v11", server.uri()),
+        "user".into(),
+        "ticket".into(),
+        false,
+    )
+    .unwrap();
+    let request = ReviewRequest {
+        action: ReviewAction::Vote,
+        review_id: Some(123),
+        max_results: 10,
+        body: serde_json::json!({"vote": "up", "version": 2}),
+        approval_token: Some("approved-token".to_string()),
+    };
+
+    let result = client.execute_approved(&request).await.unwrap();
+
+    assert_eq!(result, serde_json::json!({ "vote": "recorded" }));
+}
+
+#[tokio::test]
 async fn execute_non_success_returns_error_without_credentials() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v11/reviews"))
         .and(query_param("max", "10"))
         .and(header("authorization", "Basic dXNlcjp0aWNrZXQ="))
-        .respond_with(ResponseTemplate::new(500).set_body_string("server failed"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("server failed: Authorization: Basic dXNlcjp0aWNrZXQ= ticket"),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -264,6 +301,7 @@ async fn execute_non_success_returns_error_without_credentials() {
     let error = client.execute(&request).await.unwrap_err().to_string();
 
     assert!(error.contains("HTTP 500"));
+    assert!(!error.contains("Authorization: Basic"));
     assert!(!error.contains("ticket"));
     assert!(!error.contains("dXNlcjp0aWNrZXQ="));
 }

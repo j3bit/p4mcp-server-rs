@@ -1,7 +1,10 @@
+use std::path::PathBuf;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::config::SslVerify;
 use crate::error::{P4McpError, Result};
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -313,11 +316,33 @@ impl ReviewHttpClient {
         ticket: String,
         accept_invalid_certs: bool,
     ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(accept_invalid_certs)
-            .build()?;
+        let ssl_verify = if accept_invalid_certs {
+            SslVerify::Disabled
+        } else {
+            SslVerify::Enabled
+        };
+        Self::new_with_ssl_verify(api_base, username, ticket, &ssl_verify)
+    }
+
+    pub fn new_with_ssl_verify(
+        api_base: String,
+        username: String,
+        ticket: String,
+        ssl_verify: &SslVerify,
+    ) -> anyhow::Result<Self> {
+        let mut builder = reqwest::Client::builder();
+        match ssl_verify {
+            SslVerify::Enabled => {}
+            SslVerify::Disabled => {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            SslVerify::CaBundle(path) => {
+                builder = builder.add_root_certificate(load_ca_bundle(path)?);
+            }
+        }
+
         Ok(Self {
-            client,
+            client: builder.build()?,
             api_base: api_base.trim_end_matches('/').to_string(),
             username,
             ticket,
@@ -332,6 +357,15 @@ impl ReviewHttpClient {
                 built.method
             );
         }
+        self.send(built).await
+    }
+
+    pub async fn execute_approved(&self, request: &ReviewRequest) -> anyhow::Result<Value> {
+        let built = request.to_http(&self.api_base)?;
+        self.send(built).await
+    }
+
+    async fn send(&self, built: BuiltReviewRequest) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.api_base, built.path);
         let mut req = match built.method.as_str() {
             "GET" => self.client.get(url).query(&built.query),
@@ -345,8 +379,13 @@ impl ReviewHttpClient {
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
-            anyhow::bail!("review API returned HTTP {status}: {text}");
+            anyhow::bail!("review API returned HTTP {status}");
         }
         Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "message": text })))
     }
+}
+
+fn load_ca_bundle(path: &PathBuf) -> anyhow::Result<reqwest::Certificate> {
+    let pem = std::fs::read(path)?;
+    Ok(reqwest::Certificate::from_pem(&pem)?)
 }
