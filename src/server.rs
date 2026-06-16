@@ -663,9 +663,19 @@ impl P4McpServer {
                 &action,
             )?),
         };
+        let description = match params.action {
+            ChangelistModifyAction::Create | ChangelistModifyAction::Update => Some(
+                required_option(params.description.as_deref(), "description", &action)?,
+            ),
+            ChangelistModifyAction::Submit
+            | ChangelistModifyAction::Delete
+            | ChangelistModifyAction::MoveFiles => None,
+        };
         let stdin = match params.action {
             ChangelistModifyAction::Create => Some(change_form(
-                params.description.as_deref().unwrap_or_default(),
+                description
+                    .as_deref()
+                    .expect("create description was required"),
                 &[],
             )),
             ChangelistModifyAction::Update => {
@@ -712,7 +722,9 @@ impl P4McpServer {
                 .ok_or_else(|| to_mcp_error(invalid_input("p4 change -o did not return stdout")))?;
             let patched = patch_change_description_form(
                 existing,
-                params.description.as_deref().unwrap_or_default(),
+                description
+                    .as_deref()
+                    .expect("update description was required"),
             )
             .map_err(to_mcp_error)?;
             build_changelist_modify_invocation(&params, Some(patched)).map_err(to_mcp_error)?
@@ -2560,6 +2572,63 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
         assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_create_without_description_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_changelists_params(ChangelistModifyAction::Create);
+
+        let err = match server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("create without description should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("description is required for create"));
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_update_without_description_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+        params.changelist_id = Some("123".to_string());
+
+        let err = match server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update without description should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("description is required for update"));
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
     }
 
     #[tokio::test]
