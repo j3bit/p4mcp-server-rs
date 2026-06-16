@@ -1,6 +1,8 @@
+use std::fs;
+
 use p4mcp_server_rs::tools::reviews::{
     ModifyReviewsParams, QueryReviewsParams, ReviewHttpClient, ReviewModifyAction,
-    ReviewQueryAction,
+    ReviewQueryAction, configured_p4_password,
 };
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -211,6 +213,7 @@ fn review_api_config_uses_swarm_property_and_matching_ticket() {
             "value": "https://swarm.example.com/"
         })],
         "perforce:1666 (alice) ticket-123\nother:1666 (alice) wrong-ticket\n",
+        None,
     )
     .unwrap();
 
@@ -229,12 +232,85 @@ fn review_api_config_uses_single_user_ticket_when_server_address_is_absent() {
             "value": "https://swarm.example.com"
         })],
         "perforce:1666 (alice) ticket-123\nother:1666 (bob) other-ticket\n",
+        None,
     )
     .unwrap();
 
     assert_eq!(config.api_base, "https://swarm.example.com/api/v11");
     assert_eq!(config.username, "alice");
     assert_eq!(config.ticket, "ticket-123");
+}
+
+#[test]
+fn review_api_config_uses_configured_password_when_ticket_is_missing() {
+    let config = p4mcp_server_rs::tools::reviews::ReviewApiConfig::from_p4(
+        &[serde_json::json!({
+            "userName": "alice",
+            "serverAddress": "perforce:1666"
+        })],
+        &[serde_json::json!({
+            "value": "https://swarm.example.com"
+        })],
+        "",
+        Some("password-or-ticket"),
+    )
+    .unwrap();
+
+    assert_eq!(config.api_base, "https://swarm.example.com/api/v11");
+    assert_eq!(config.username, "alice");
+    assert_eq!(config.ticket, "password-or-ticket");
+}
+
+#[test]
+fn review_api_config_does_not_use_password_fallback_for_ambiguous_tickets() {
+    let error = p4mcp_server_rs::tools::reviews::ReviewApiConfig::from_p4(
+        &[serde_json::json!({
+            "userName": "alice"
+        })],
+        &[serde_json::json!({
+            "value": "https://swarm.example.com"
+        })],
+        "perforce:1666 (alice) ticket-123\nother:1666 (alice) other-ticket\n",
+        Some("secret-password"),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+
+    assert!(error.contains("multiple P4 tickets found for user alice"));
+    assert!(!error.contains("ticket-123"));
+    assert!(!error.contains("other-ticket"));
+    assert!(!error.contains("secret-password"));
+}
+
+#[test]
+fn configured_p4_password_prefers_env_password_over_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".p4config"), "P4PASSWD=config-password\n").unwrap();
+
+    let password = configured_p4_password(Some("env-password"), Some(".p4config"), dir.path());
+
+    assert_eq!(password.as_deref(), Some("env-password"));
+}
+
+#[test]
+fn configured_p4_password_reads_parent_p4config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child").join("workspace");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(
+        dir.path().join(".p4config"),
+        "\
+# comment
+P4PORT=perforce:1666
+P4PASSWD = config-password
+",
+    )
+    .unwrap();
+
+    let password = configured_p4_password(None, Some(".p4config"), &child);
+
+    assert_eq!(password.as_deref(), Some("config-password"));
 }
 
 #[test]
@@ -247,6 +323,7 @@ fn review_api_config_rejects_ambiguous_user_tickets() {
             "value": "https://swarm.example.com"
         })],
         "perforce:1666 (alice) ticket-123\nother:1666 (alice) other-ticket\n",
+        None,
     )
     .err()
     .unwrap()
@@ -268,6 +345,7 @@ fn review_api_config_rejects_duplicate_exact_server_tickets() {
             "value": "https://swarm.example.com"
         })],
         "perforce:1666 (alice) ticket-123\nperforce:1666 (alice) other-ticket\n",
+        None,
     )
     .err()
     .unwrap()
@@ -287,6 +365,7 @@ fn review_api_config_requires_swarm_url_property() {
         })],
         &[],
         "perforce:1666 (alice) ticket-123\n",
+        None,
     )
     .err()
     .unwrap()

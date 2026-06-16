@@ -186,7 +186,7 @@ impl P4McpServer {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let api_config =
-            ReviewApiConfig::from_p4(&info.records, &swarm_property.records, tickets_stdout)
+            ReviewApiConfig::from_p4(&info.records, &swarm_property.records, tickets_stdout, None)
                 .map_err(to_mcp_error)?;
 
         ReviewHttpClient::new_with_ssl_verify(

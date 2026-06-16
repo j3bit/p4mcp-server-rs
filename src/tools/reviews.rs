@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -216,6 +219,7 @@ impl ReviewApiConfig {
         info_records: &[Value],
         property_records: &[Value],
         tickets_stdout: &str,
+        configured_password: Option<&str>,
     ) -> Result<Self> {
         let username = first_non_empty_field(info_records, &["userName", "User", "user"])
             .ok_or_else(|| P4McpError::P4Command {
@@ -227,7 +231,13 @@ impl ReviewApiConfig {
                 message: "Swarm URL not configured on the server".to_string(),
             }
         })?;
-        let ticket = ticket_for_user(tickets_stdout, &username, server.as_deref())?;
+        let ticket = ticket_for_user(tickets_stdout, &username, server.as_deref())?
+            .or_else(|| configured_password.and_then(non_blank_value))
+            .ok_or_else(|| P4McpError::P4Command {
+                message: format!(
+                    "No P4 ticket or configured P4PASSWD found for user {username}. Please run p4 login first or configure P4PASSWD."
+                ),
+            })?;
 
         Ok(Self {
             api_base: format!("{}/api/v11", swarm_url.trim_end_matches('/')),
@@ -250,7 +260,7 @@ fn first_non_empty_field(records: &[Value], fields: &[&str]) -> Option<String> {
     })
 }
 
-fn ticket_for_user(stdout: &str, username: &str, server: Option<&str>) -> Result<String> {
+fn ticket_for_user(stdout: &str, username: &str, server: Option<&str>) -> Result<Option<String>> {
     let entries: Vec<TicketEntry> = stdout
         .lines()
         .filter_map(parse_ticket_line)
@@ -263,7 +273,7 @@ fn ticket_for_user(stdout: &str, username: &str, server: Option<&str>) -> Result
             .filter(|entry| entry.server == server)
             .collect();
         match exact_matches.as_slice() {
-            [entry] => return Ok(entry.ticket.clone()),
+            [entry] => return Ok(Some(entry.ticket.clone())),
             [_, ..] => {
                 return Err(P4McpError::P4Command {
                     message: format!(
@@ -276,10 +286,8 @@ fn ticket_for_user(stdout: &str, username: &str, server: Option<&str>) -> Result
     }
 
     match entries.as_slice() {
-        [entry] => Ok(entry.ticket.clone()),
-        [] => Err(P4McpError::P4Command {
-            message: format!("No P4 ticket found for user {username}. Please run p4 login first."),
-        }),
+        [entry] => Ok(Some(entry.ticket.clone())),
+        [] => Ok(None),
         _ => Err(P4McpError::P4Command {
             message: format!(
                 "multiple P4 tickets found for user {username}; configure a matching P4PORT or run p4 login for the active server"
@@ -304,6 +312,49 @@ fn parse_ticket_line(line: &str) -> Option<TicketEntry> {
         server: server.to_string(),
         user: user.to_string(),
         ticket: ticket.to_string(),
+    })
+}
+
+pub fn configured_p4_password(
+    env_password: Option<&str>,
+    p4config_name: Option<&str>,
+    cwd: &Path,
+) -> Option<String> {
+    env_password.and_then(non_blank_value).or_else(|| {
+        let config_name = p4config_name.and_then(non_blank_value)?;
+        let config_path = find_p4_config(cwd, &config_name)?;
+        let content = fs::read_to_string(config_path).ok()?;
+        p4_config_value(&content, "P4PASSWD")
+    })
+}
+
+fn non_blank_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn find_p4_config(cwd: &Path, config_name: &str) -> Option<PathBuf> {
+    cwd.ancestors()
+        .map(|ancestor| ancestor.join(config_name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn p4_config_value(content: &str, key: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let (name, value) = trimmed.split_once('=')?;
+        if name.trim() == key {
+            non_blank_value(value)
+        } else {
+            None
+        }
     })
 }
 
