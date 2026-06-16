@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use p4mcp_server_rs::tools::{
     params::{
-        ChangelistModifyAction, JobModifyAction, ModifyChangelistsParams, ModifyJobsParams,
-        ModifyShelvesParams, ModifyStreamsParams, ModifyWorkspacesParams, ShelfModifyAction,
+        ChangelistModifyAction, FileModifyAction, FileQueryAction, JobModifyAction,
+        ModifyChangelistsParams, ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams,
+        ModifyStreamsParams, ModifyWorkspacesParams, QueryFilesParams, ShelfModifyAction,
         StreamModifyAction, WorkspaceModifyAction,
     },
     reviews::{ModifyReviewsParams, QueryReviewsParams, ReviewModifyAction, ReviewQueryAction},
@@ -41,6 +42,59 @@ fn query_server_schema_matches_upstream_params_object() {
     let props = schema_properties::<QueryServerParams>();
     assert!(props.contains("action"));
     assert_eq!(props.len(), 1);
+}
+
+#[test]
+fn file_tool_schemas_match_upstream_fields() {
+    for field in [
+        "action",
+        "file_path",
+        "file2",
+        "diff2",
+        "max_results",
+        "pattern",
+        "case_insensitive",
+    ] {
+        assert_has::<QueryFilesParams>(field);
+    }
+
+    let query: QueryFilesParams = serde_json::from_value(serde_json::json!({
+        "action": "diff",
+        "file_path": "//depot/main/file.txt",
+        "file2": "//depot/dev/file.txt",
+        "diff2": false
+    }))
+    .unwrap();
+    assert_eq!(query.action, FileQueryAction::Diff);
+    assert_eq!(query.file2.as_deref(), Some("//depot/dev/file.txt"));
+    assert!(!query.diff2);
+
+    for field in [
+        "action",
+        "file_paths",
+        "changelist",
+        "source_paths",
+        "target_paths",
+        "mode",
+        "force",
+        "approval_token",
+    ] {
+        assert_has::<ModifyFilesParams>(field);
+    }
+
+    for field in ["files", "form", "confirmation"] {
+        assert_omits::<ModifyFilesParams>(field);
+    }
+
+    let modify: ModifyFilesParams = serde_json::from_value(serde_json::json!({
+        "action": "move",
+        "source_paths": ["//depot/main/a.txt", "//depot/main/b.txt"],
+        "target_paths": ["//depot/dev/a.txt", "//depot/dev/b.txt"]
+    }))
+    .unwrap();
+    assert_eq!(modify.action, FileModifyAction::Move);
+    assert_eq!(modify.source_paths.as_ref().unwrap().len(), 2);
+    assert_eq!(modify.target_paths.as_ref().unwrap().len(), 2);
 }
 
 #[test]

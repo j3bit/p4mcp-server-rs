@@ -324,7 +324,7 @@ fn query_file_diff2_requires_and_uses_second_depot_path() {
 }
 
 #[test]
-fn query_file_workspace_diff_uses_single_path() {
+fn query_file_workspace_diff_requires_second_path_like_upstream() {
     let params = QueryFilesParams {
         action: FileQueryAction::Diff,
         file_path: "//depot/main/file.txt".to_string(),
@@ -334,19 +334,13 @@ fn query_file_workspace_diff_uses_single_path() {
         pattern: None,
         case_insensitive: false,
     };
-    let invocation = build_file_invocation(&params).unwrap();
-    assert_eq!(
-        invocation,
-        P4Invocation {
-            args: vec!["diff".into(), "//depot/main/file.txt".into()],
-            stdin: None,
-            mode: OutputMode::Text,
-        }
-    );
+
+    let error = build_file_invocation(&params).unwrap_err().to_string();
+    assert!(error.contains("file2 is required for diff action"));
 }
 
 #[test]
-fn query_file_workspace_diff_rejects_second_path() {
+fn query_file_workspace_diff_uses_second_path_like_upstream() {
     let params = QueryFilesParams {
         action: FileQueryAction::Diff,
         file_path: "//depot/main/file.txt".to_string(),
@@ -356,8 +350,20 @@ fn query_file_workspace_diff_rejects_second_path() {
         pattern: None,
         case_insensitive: false,
     };
-    let error = build_file_invocation(&params).unwrap_err().to_string();
-    assert!(error.contains("file2 cannot be used for workspace diff"));
+
+    let invocation = build_file_invocation(&params).unwrap();
+    assert_eq!(
+        invocation,
+        P4Invocation {
+            args: vec![
+                "diff".into(),
+                "//depot/main/file.txt".into(),
+                "//depot/dev/file.txt".into()
+            ],
+            stdin: None,
+            mode: OutputMode::Text,
+        }
+    );
 }
 
 #[test]
@@ -372,7 +378,7 @@ fn query_file_diff2_requires_second_path() {
         case_insensitive: false,
     };
     let error = build_file_invocation(&params).unwrap_err().to_string();
-    assert!(error.contains("file2 is required for diff2"));
+    assert!(error.contains("file2 is required for diff action"));
 }
 
 #[test]

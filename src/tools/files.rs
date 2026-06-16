@@ -31,29 +31,17 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
             mode: OutputMode::JsonLines,
         },
         FileQueryAction::Diff => {
-            if params.diff2 {
-                let file2 = params
-                    .file2
-                    .clone()
-                    .ok_or_else(|| P4McpError::InvalidInput {
-                        message: "file2 is required for diff2".to_string(),
-                    })?;
-                P4Invocation {
-                    args: vec!["diff2".into(), params.file_path.clone(), file2],
-                    stdin: None,
-                    mode: OutputMode::Text,
-                }
-            } else {
-                if params.file2.is_some() {
-                    return Err(P4McpError::InvalidInput {
-                        message: "file2 cannot be used for workspace diff".to_string(),
-                    });
-                }
-                P4Invocation {
-                    args: vec!["diff".into(), params.file_path.clone()],
-                    stdin: None,
-                    mode: OutputMode::Text,
-                }
+            let file2 = params
+                .file2
+                .clone()
+                .ok_or_else(|| P4McpError::InvalidInput {
+                    message: "file2 is required for diff action".to_string(),
+                })?;
+            let command = if params.diff2 { "diff2" } else { "diff" };
+            P4Invocation {
+                args: vec![command.into(), params.file_path.clone(), file2],
+                stdin: None,
+                mode: OutputMode::Text,
             }
         }
         FileQueryAction::Annotations => P4Invocation {

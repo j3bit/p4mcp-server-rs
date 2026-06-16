@@ -1252,7 +1252,7 @@ async fn invalid_tool_params_return_invalid_params_error() {
     };
 
     assert_eq!(err.code, ErrorData::invalid_params("", None).code);
-    assert!(err.message.contains("file2 is required for diff2"));
+    assert!(err.message.contains("file2 is required for diff action"));
 }
 
 #[tokio::test]
