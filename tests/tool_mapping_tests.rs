@@ -1202,6 +1202,196 @@ fn modify_streams_copy_uses_upstream_stream_flags() {
 }
 
 #[test]
+fn modify_streams_copy_ignores_branch_like_upstream_handler() {
+    let mut params = modify_streams_params(StreamModifyAction::Copy);
+    params.stream_name = Some("//streams/dev".to_string());
+    params.branch = Some("ignored_branch".to_string());
+    params.force = true;
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(invocation.args, vec!["copy", "-F", "-S", "//streams/dev"]);
+}
+
+#[test]
+fn modify_streams_merge_ignores_branch_like_upstream_handler() {
+    let mut params = modify_streams_params(StreamModifyAction::Merge);
+    params.stream_name = Some("//streams/dev".to_string());
+    params.parent_stream = Some("//streams/main".to_string());
+    params.branch = Some("ignored_branch".to_string());
+    params.force = true;
+    params.output_base = true;
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "merge",
+            "-F",
+            "-Ob",
+            "-S",
+            "//streams/dev",
+            "-P",
+            "//streams/main"
+        ]
+    );
+}
+
+#[test]
+fn modify_streams_integrate_uses_lowercase_force_and_branch_precedence() {
+    let mut params = modify_streams_params(StreamModifyAction::Integrate);
+    params.stream_name = Some("//streams/dev".to_string());
+    params.parent_stream = Some("//streams/main".to_string());
+    params.branch = Some("dev_to_rel".to_string());
+    params.file_paths = Some(vec!["//streams/dev/src/...".to_string()]);
+    params.preview = true;
+    params.force = true;
+    params.reverse = true;
+    params.quiet = true;
+    params.max_files = Some(10);
+    params.output_base = true;
+    params.schedule_branch_resolve = true;
+    params.integrate_around_deleted = true;
+    params.skip_cherry_picked = true;
+    params.changelist = Some("12345".to_string());
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "integrate",
+            "-n",
+            "-f",
+            "-q",
+            "-Ob",
+            "-c",
+            "12345",
+            "-m10",
+            "-Di",
+            "-Rb",
+            "-Rs",
+            "-b",
+            "dev_to_rel",
+            "-r",
+            "//streams/dev/src/..."
+        ]
+    );
+}
+
+#[test]
+fn modify_streams_integrate_uses_stream_mode_when_branch_absent() {
+    let mut params = modify_streams_params(StreamModifyAction::Integrate);
+    params.stream_name = Some("//streams/dev".to_string());
+    params.parent_stream = Some("//streams/main".to_string());
+    params.force = true;
+    params.reverse = true;
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "integrate",
+            "-f",
+            "-S",
+            "//streams/dev",
+            "-P",
+            "//streams/main",
+            "-r"
+        ]
+    );
+}
+
+#[test]
+fn modify_streams_integrate_ignores_parent_when_stream_absent() {
+    let mut params = modify_streams_params(StreamModifyAction::Integrate);
+    params.parent_stream = Some("//streams/main".to_string());
+    params.force = true;
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(invocation.args, vec!["integrate", "-f"]);
+}
+
+#[test]
+fn modify_streams_populate_uses_lowercase_force_and_branch_precedence() {
+    let mut params = modify_streams_params(StreamModifyAction::Populate);
+    params.stream_name = Some("//streams/dev".to_string());
+    params.parent_stream = Some("//streams/main".to_string());
+    params.branch = Some("seed_branch".to_string());
+    params.source_path = Some("//depot/source/...".to_string());
+    params.target_path = Some("//depot/target/...".to_string());
+    params.preview = true;
+    params.force = true;
+    params.reverse = true;
+    params.max_files = Some(20);
+    params.output_base = true;
+    params.description = Some("Seed stream".to_string());
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec![
+            "populate",
+            "-n",
+            "-f",
+            "-o",
+            "-m20",
+            "-d",
+            "Seed stream",
+            "-b",
+            "seed_branch",
+            "-r"
+        ]
+    );
+}
+
+#[test]
+fn modify_streams_populate_uses_direct_paths_when_branch_and_stream_absent() {
+    let mut params = modify_streams_params(StreamModifyAction::Populate);
+    params.source_path = Some("//depot/source/...".to_string());
+    params.target_path = Some("//depot/target/...".to_string());
+    params.force = true;
+    params.reverse = true;
+
+    let command = build_stream_modify_command(&params).unwrap();
+    let invocation = command.into_single_invocation().unwrap();
+
+    assert_eq!(
+        invocation.args,
+        vec!["populate", "-f", "//depot/source/...", "//depot/target/..."]
+    );
+}
+
+#[test]
+fn modify_streams_populate_direct_paths_require_source_target_pair() {
+    for (source_path, target_path) in [
+        (Some("//depot/source/..."), None),
+        (None, Some("//depot/target/...")),
+    ] {
+        let mut params = modify_streams_params(StreamModifyAction::Populate);
+        params.source_path = source_path.map(str::to_string);
+        params.target_path = target_path.map(str::to_string);
+        params.force = true;
+        params.reverse = true;
+
+        let command = build_stream_modify_command(&params).unwrap();
+        let invocation = command.into_single_invocation().unwrap();
+
+        assert_eq!(invocation.args, vec!["populate", "-f"]);
+    }
+}
+
+#[test]
 fn workspace_get_blank_name_errors() {
     let error = build_workspace_query_invocation("get", Some(" "), None, 10)
         .unwrap_err()

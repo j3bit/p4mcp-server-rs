@@ -180,10 +180,10 @@ pub fn build_stream_modify_command(params: &ModifyStreamsParams) -> Result<Strea
             }
             json_invocation(args)
         }
-        StreamModifyAction::Copy => propagation_invocation("copy", params)?,
-        StreamModifyAction::Merge => propagation_invocation("merge", params)?,
-        StreamModifyAction::Integrate => propagation_invocation("integrate", params)?,
-        StreamModifyAction::Populate => populate_invocation(params)?,
+        StreamModifyAction::Copy => copy_invocation(params),
+        StreamModifyAction::Merge => merge_invocation(params),
+        StreamModifyAction::Integrate => integrate_invocation(params),
+        StreamModifyAction::Populate => populate_invocation(params),
         StreamModifyAction::Switch => {
             let mut args = vec![
                 "client".to_string(),
@@ -344,68 +344,81 @@ pub fn stream_resolve_preview_invocation() -> P4Invocation {
     json_invocation(vec!["stream".into(), "resolve".into(), "-n".into()])
 }
 
-fn propagation_invocation(command: &str, params: &ModifyStreamsParams) -> Result<P4Invocation> {
-    let mut args = vec![command.to_string()];
-    if params.preview {
-        args.push("-n".into());
-    }
+fn copy_invocation(params: &ModifyStreamsParams) -> P4Invocation {
+    let mut args = vec!["copy".to_string()];
+    push_preview(&mut args, params);
     if params.force {
         args.push("-F".into());
     }
-    if command == "copy" && params.virtual_stream {
+    if params.virtual_stream {
         args.push("-v".into());
+    }
+    push_quiet_changelist_max(&mut args, params);
+    push_stream_mode(&mut args, params);
+    if params.reverse {
+        args.push("-r".into());
+    }
+    push_file_paths(&mut args, params);
+    json_invocation(args)
+}
+
+fn merge_invocation(params: &ModifyStreamsParams) -> P4Invocation {
+    let mut args = vec!["merge".to_string()];
+    push_preview(&mut args, params);
+    if params.force {
+        args.push("-F".into());
+    }
+    push_quiet_changelist_max(&mut args, params);
+    if params.output_base {
+        args.push("-Ob".into());
+    }
+    push_stream_mode(&mut args, params);
+    if params.reverse {
+        args.push("-r".into());
+    }
+    push_file_paths(&mut args, params);
+    json_invocation(args)
+}
+
+fn integrate_invocation(params: &ModifyStreamsParams) -> P4Invocation {
+    let mut args = vec!["integrate".to_string()];
+    push_preview(&mut args, params);
+    if params.force {
+        args.push("-f".into());
     }
     if params.quiet {
         args.push("-q".into());
     }
-    if let Some(changelist) = non_blank(params.changelist.as_deref()) {
-        args.extend(["-c".into(), changelist.into()]);
+    if params.output_base {
+        args.push("-Ob".into());
     }
-    if let Some(max_files) = params.max_files {
-        args.push(format!("-m{max_files}"));
+    push_changelist_max(&mut args, params);
+    if params.integrate_around_deleted {
+        args.push("-Di".into());
     }
-    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
-        args.extend(["-S".into(), stream_name.into()]);
+    if params.schedule_branch_resolve {
+        args.push("-Rb".into());
     }
-    if let Some(parent) = non_blank(params.parent_stream.as_deref()) {
-        args.extend(["-P".into(), parent.into()]);
+    if params.skip_cherry_picked {
+        args.push("-Rs".into());
     }
     if let Some(branch) = non_blank(params.branch.as_deref()) {
         args.extend(["-b".into(), branch.into()]);
+    } else {
+        push_stream_mode(&mut args, params);
     }
     if params.reverse {
         args.push("-r".into());
     }
-    if params.output_base && matches!(command, "merge" | "integrate") {
-        args.push("-Ob".into());
-    }
-    if command == "integrate" {
-        if params.schedule_branch_resolve {
-            args.push("-Rb".into());
-        }
-        if params.integrate_around_deleted {
-            args.push("-Di".into());
-        }
-        if params.skip_cherry_picked {
-            args.push("-Rs".into());
-        }
-    }
-    if let Some(file_paths) = &params.file_paths {
-        args.extend(file_paths.iter().cloned());
-    }
-    Ok(json_invocation(args))
+    push_file_paths(&mut args, params);
+    json_invocation(args)
 }
 
-fn populate_invocation(params: &ModifyStreamsParams) -> Result<P4Invocation> {
+fn populate_invocation(params: &ModifyStreamsParams) -> P4Invocation {
     let mut args = vec!["populate".to_string()];
-    if params.preview {
-        args.push("-n".into());
-    }
+    push_preview(&mut args, params);
     if params.force {
-        args.push("-F".into());
-    }
-    if params.reverse {
-        args.push("-r".into());
+        args.push("-f".into());
     }
     if params.output_base {
         args.push("-o".into());
@@ -416,22 +429,63 @@ fn populate_invocation(params: &ModifyStreamsParams) -> Result<P4Invocation> {
     if let Some(description) = non_blank(params.description.as_deref()) {
         args.extend(["-d".into(), description.into()]);
     }
-    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
-        args.extend(["-S".into(), stream_name.into()]);
-    }
-    if let Some(parent) = non_blank(params.parent_stream.as_deref()) {
-        args.extend(["-P".into(), parent.into()]);
-    }
     if let Some(branch) = non_blank(params.branch.as_deref()) {
         args.extend(["-b".into(), branch.into()]);
+        if params.reverse {
+            args.push("-r".into());
+        }
+    } else if non_blank(params.stream_name.as_deref()).is_some() {
+        push_stream_mode(&mut args, params);
+        if params.reverse {
+            args.push("-r".into());
+        }
+    } else {
+        if let (Some(source), Some(target)) = (
+            non_blank(params.source_path.as_deref()),
+            non_blank(params.target_path.as_deref()),
+        ) {
+            args.push(source.into());
+            args.push(target.into());
+        }
     }
-    if let Some(source) = non_blank(params.source_path.as_deref()) {
-        args.push(source.into());
+    json_invocation(args)
+}
+
+fn push_preview(args: &mut Vec<String>, params: &ModifyStreamsParams) {
+    if params.preview {
+        args.push("-n".into());
     }
-    if let Some(target) = non_blank(params.target_path.as_deref()) {
-        args.push(target.into());
+}
+
+fn push_quiet_changelist_max(args: &mut Vec<String>, params: &ModifyStreamsParams) {
+    if params.quiet {
+        args.push("-q".into());
     }
-    Ok(json_invocation(args))
+    push_changelist_max(args, params);
+}
+
+fn push_changelist_max(args: &mut Vec<String>, params: &ModifyStreamsParams) {
+    if let Some(changelist) = non_blank(params.changelist.as_deref()) {
+        args.extend(["-c".into(), changelist.into()]);
+    }
+    if let Some(max_files) = params.max_files {
+        args.push(format!("-m{max_files}"));
+    }
+}
+
+fn push_stream_mode(args: &mut Vec<String>, params: &ModifyStreamsParams) {
+    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
+        args.extend(["-S".into(), stream_name.into()]);
+        if let Some(parent) = non_blank(params.parent_stream.as_deref()) {
+            args.extend(["-P".into(), parent.into()]);
+        }
+    }
+}
+
+fn push_file_paths(args: &mut Vec<String>, params: &ModifyStreamsParams) {
+    if let Some(file_paths) = &params.file_paths {
+        args.extend(file_paths.iter().cloned());
+    }
 }
 
 fn json_invocation(args: Vec<String>) -> P4Invocation {
