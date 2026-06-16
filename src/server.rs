@@ -323,12 +323,12 @@ impl P4McpServer {
                 template,
             ))
             .await?;
-        if let Some(workspace) = workspace {
-            if !client_spec_is_existing_workspace(&output.records) {
-                return Err(to_mcp_error(invalid_input(format!(
-                    "Workspace '{workspace}' does not exist"
-                ))));
-            }
+        if let Some(workspace) = workspace
+            && !client_spec_is_existing_workspace(&output.records)
+        {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace}' does not exist"
+            ))));
         }
         Ok(Json(ToolResponse::success(action, output_message(output))))
     }
