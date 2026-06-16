@@ -1029,7 +1029,7 @@ async fn query_files_grep_caps_records_by_max_results() {
     assert_eq!(executor.invocations().len(), 1);
     assert_eq!(
         executor.invocations()[0].args,
-        ["grep", "-n", "-i", "-e", "needle", "//depot/main/..."]
+        ["grep", "-n", "-s", "-i", "-e", "needle", "//depot/main/..."]
     );
 }
 

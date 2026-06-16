@@ -282,7 +282,7 @@ fn query_file_content_uses_text_print() {
 }
 
 #[test]
-fn query_file_grep_maps_pattern() {
+fn query_file_grep_maps_pattern_and_suppresses_long_line_errors() {
     let params = QueryFilesParams {
         action: FileQueryAction::Grep,
         file_path: "//depot/main/...".to_string(),
@@ -295,7 +295,15 @@ fn query_file_grep_maps_pattern() {
     let invocation = build_file_invocation(&params).unwrap();
     assert_eq!(
         invocation.args,
-        vec!["grep", "-n", "-i", "-e", "needle", "//depot/main/..."]
+        vec![
+            "grep",
+            "-n",
+            "-s",
+            "-i",
+            "-e",
+            "needle",
+            "//depot/main/..."
+        ]
     );
     assert_eq!(invocation.mode, OutputMode::JsonLines);
 }

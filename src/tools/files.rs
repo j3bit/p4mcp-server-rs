@@ -99,7 +99,7 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
                 .ok_or_else(|| P4McpError::InvalidInput {
                     message: "pattern is required for grep".to_string(),
                 })?;
-            let mut args = vec!["grep".into(), "-n".into()];
+            let mut args = vec!["grep".into(), "-n".into(), "-s".into()];
             if params.case_insensitive {
                 args.push("-i".into());
             }
