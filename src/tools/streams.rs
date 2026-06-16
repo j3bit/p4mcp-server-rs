@@ -14,6 +14,9 @@ pub enum StreamQueryCommand {
         view_without_edit: bool,
         at_change: Option<String>,
     },
+    Children {
+        stream_name: String,
+    },
     Parent {
         stream_name: String,
     },
@@ -37,6 +40,17 @@ pub enum StreamQueryCommand {
         file_paths: Vec<String>,
         long_output: bool,
         limit: Option<u16>,
+    },
+    GetWorkspace {
+        workspace: Option<String>,
+        stream_name: Option<String>,
+        template: Option<String>,
+    },
+    ListWorkspaces {
+        stream_name: Option<String>,
+        user: Option<String>,
+        unloaded: bool,
+        max_results: u16,
     },
 }
 
@@ -79,9 +93,9 @@ pub fn build_stream_query_command(params: &QueryStreamsParams) -> Result<StreamQ
             view_without_edit: params.view_without_edit,
             at_change: non_blank(params.at_change.as_deref()).map(str::to_string),
         }),
-        StreamQueryAction::Children => Ok(StreamQueryCommand::Single(stream_children_invocation(
-            params,
-        )?)),
+        StreamQueryAction::Children => Ok(StreamQueryCommand::Children {
+            stream_name: required(params.stream_name.as_deref(), "stream_name")?,
+        }),
         StreamQueryAction::Parent => Ok(StreamQueryCommand::Parent {
             stream_name: required(params.stream_name.as_deref(), "stream_name")?,
         }),
@@ -91,12 +105,17 @@ pub fn build_stream_query_command(params: &QueryStreamsParams) -> Result<StreamQ
         StreamQueryAction::IntegrationStatus => {
             Ok(StreamQueryCommand::Single(stream_istat_invocation(params)))
         }
-        StreamQueryAction::GetWorkspace => Ok(StreamQueryCommand::Single(
-            stream_get_workspace_invocation(params),
-        )),
-        StreamQueryAction::ListWorkspaces => Ok(StreamQueryCommand::Single(
-            stream_list_workspaces_invocation(params),
-        )),
+        StreamQueryAction::GetWorkspace => Ok(StreamQueryCommand::GetWorkspace {
+            workspace: non_blank(params.workspace.as_deref()).map(str::to_string),
+            stream_name: non_blank(params.stream_name.as_deref()).map(str::to_string),
+            template: non_blank(params.template.as_deref()).map(str::to_string),
+        }),
+        StreamQueryAction::ListWorkspaces => Ok(StreamQueryCommand::ListWorkspaces {
+            stream_name: non_blank(params.stream_name.as_deref()).map(str::to_string),
+            user: non_blank(params.user.as_deref()).map(str::to_string),
+            unloaded: params.unloaded,
+            max_results: params.max_results,
+        }),
         StreamQueryAction::ValidateFile => Ok(StreamQueryCommand::ValidateFile {
             workspace: params.workspace.clone(),
             file_paths: required_files(params.file_paths.as_deref(), "file_paths")?,
@@ -250,15 +269,12 @@ pub fn stream_get_invocation(
     json_invocation(args)
 }
 
-fn stream_children_invocation(params: &QueryStreamsParams) -> Result<P4Invocation> {
-    Ok(json_invocation(vec![
+pub fn stream_children_invocation(stream_name: &str) -> P4Invocation {
+    json_invocation(vec![
         "streams".into(),
         "-F".into(),
-        format!(
-            "Parent={}",
-            required(params.stream_name.as_deref(), "stream_name")?
-        ),
-    ]))
+        format!("Parent={stream_name}"),
+    ])
 }
 
 fn stream_istat_invocation(params: &QueryStreamsParams) -> P4Invocation {
@@ -275,32 +291,41 @@ fn stream_istat_invocation(params: &QueryStreamsParams) -> P4Invocation {
     json_invocation(args)
 }
 
-fn stream_get_workspace_invocation(params: &QueryStreamsParams) -> P4Invocation {
+pub fn stream_get_workspace_invocation(
+    workspace: Option<&str>,
+    stream_name: Option<&str>,
+    template: Option<&str>,
+) -> P4Invocation {
     let mut args = vec!["client".into(), "-o".into()];
-    if let Some(template) = non_blank(params.template.as_deref()) {
-        args.extend(["-t".into(), template.into()]);
-    }
-    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
+    if let Some(stream_name) = non_blank(stream_name) {
         args.extend(["-S".into(), stream_name.into()]);
     }
-    if let Some(workspace) = non_blank(params.workspace.as_deref()) {
+    if let Some(template) = non_blank(template) {
+        args.extend(["-t".into(), template.into()]);
+    }
+    if let Some(workspace) = non_blank(workspace) {
         args.push(workspace.into());
     }
     json_invocation(args)
 }
 
-fn stream_list_workspaces_invocation(params: &QueryStreamsParams) -> P4Invocation {
+pub fn stream_list_workspaces_invocation(
+    stream_name: Option<&str>,
+    user: Option<&str>,
+    unloaded: bool,
+    max_results: u16,
+) -> P4Invocation {
     let mut args = vec!["clients".into()];
-    if params.unloaded {
+    if unloaded {
         args.push("-U".into());
     }
-    if let Some(stream_name) = non_blank(params.stream_name.as_deref()) {
+    if let Some(stream_name) = non_blank(stream_name) {
         args.extend(["-S".into(), stream_name.into()]);
     }
-    if let Some(user) = non_blank(params.user.as_deref()) {
+    if let Some(user) = non_blank(user) {
         args.extend(["-u".into(), user.into()]);
     }
-    args.extend(["-m".into(), params.max_results.to_string()]);
+    args.extend(["-m".into(), max_results.to_string()]);
     json_invocation(args)
 }
 

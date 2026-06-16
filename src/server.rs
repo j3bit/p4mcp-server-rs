@@ -52,8 +52,10 @@ use crate::{
         streams::{
             StreamModifyCommand, StreamQueryCommand, build_stream_modify_command,
             build_stream_query_command, client_spec_invocation, interchanges_invocation,
-            opened_for_stream_validation_invocation, stream_get_invocation,
-            stream_resolve_preview_invocation, stream_spec_with_view_invocation,
+            opened_for_stream_validation_invocation, stream_children_invocation,
+            stream_get_invocation, stream_get_workspace_invocation,
+            stream_list_workspaces_invocation, stream_resolve_preview_invocation,
+            stream_spec_with_view_invocation,
         },
         workspaces::{
             build_workspace_delete_invocation, build_workspace_query_invocation,
@@ -295,6 +297,62 @@ impl P4McpServer {
                 "No stream specified and current workspace is not stream-based",
             ))
         })
+    }
+
+    async fn query_stream_children(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let output = self.run_p4(stream_children_invocation(stream_name)).await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn query_stream_get_workspace(
+        &self,
+        action: &str,
+        workspace: Option<&str>,
+        stream_name: Option<&str>,
+        template: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self
+            .run_p4(stream_get_workspace_invocation(
+                workspace,
+                stream_name,
+                template,
+            ))
+            .await?;
+        if let Some(workspace) = workspace {
+            if !client_spec_is_existing_workspace(&output.records) {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Workspace '{workspace}' does not exist"
+                ))));
+            }
+        }
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn query_stream_list_workspaces(
+        &self,
+        action: &str,
+        stream_name: Option<&str>,
+        user: Option<&str>,
+        unloaded: bool,
+        max_results: u16,
+    ) -> McpResult<Json<ToolResponse>> {
+        if let Some(stream_name) = stream_name {
+            self.require_existing_stream(stream_name).await?;
+        }
+        let output = self
+            .run_p4(stream_list_workspaces_invocation(
+                stream_name,
+                user,
+                unloaded,
+                max_results,
+            ))
+            .await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
     }
 
     async fn query_stream_graph(
@@ -1360,6 +1418,9 @@ impl P4McpServer {
                 )
                 .await
             }
+            StreamQueryCommand::Children { stream_name } => {
+                self.query_stream_children(action, &stream_name).await
+            }
             StreamQueryCommand::Parent { stream_name } => {
                 self.query_stream_parent(action, &stream_name).await
             }
@@ -1401,6 +1462,34 @@ impl P4McpServer {
                     &file_paths,
                     long_output,
                     limit,
+                )
+                .await
+            }
+            StreamQueryCommand::GetWorkspace {
+                workspace,
+                stream_name,
+                template,
+            } => {
+                self.query_stream_get_workspace(
+                    action,
+                    workspace.as_deref(),
+                    stream_name.as_deref(),
+                    template.as_deref(),
+                )
+                .await
+            }
+            StreamQueryCommand::ListWorkspaces {
+                stream_name,
+                user,
+                unloaded,
+                max_results,
+            } => {
+                self.query_stream_list_workspaces(
+                    action,
+                    stream_name.as_deref(),
+                    user.as_deref(),
+                    unloaded,
+                    max_results,
                 )
                 .await
             }
@@ -1785,6 +1874,13 @@ fn non_empty_string_field(record: &Value, field: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn client_spec_is_existing_workspace(records: &[Value]) -> bool {
+    records.first().is_some_and(|record| {
+        non_empty_string_field(record, "Update").is_some()
+            || non_empty_string_field(record, "Access").is_some()
+    })
 }
 
 fn output_message_with_record_limit(mut output: P4CommandOutput, max_records: usize) -> Value {

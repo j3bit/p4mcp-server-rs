@@ -475,7 +475,10 @@ async fn query_streams_get_rejects_missing_explicit_stream_before_fetch() {
     };
 
     assert_eq!(err.code, ErrorData::invalid_params("", None).code);
-    assert!(err.message.contains("stream does not exist: //streams/missing"));
+    assert!(
+        err.message
+            .contains("stream does not exist: //streams/missing")
+    );
     let invocations = executor.invocations();
     assert_eq!(invocations.len(), 2);
     assert_eq!(
@@ -521,6 +524,193 @@ async fn query_streams_get_at_change_uses_resolved_stream_without_existence_look
     assert_eq!(
         invocations[1].args,
         ["stream", "-o", "//streams/current@12345"]
+    );
+}
+
+#[tokio::test]
+async fn query_streams_children_validates_parent_stream_before_listing_children() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/child", "Parent": "//streams/dev"})],
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_streams(Parameters(stream_query_params(StreamQueryAction::Children)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "children");
+    assert_eq!(
+        response.0.message,
+        json!([{"Stream": "//streams/child", "Parent": "//streams/dev"}])
+    );
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(
+        invocations[1].args,
+        ["streams", "-F", "Parent=//streams/dev"]
+    );
+}
+
+#[tokio::test]
+async fn query_streams_children_rejects_missing_stream_before_listing_children() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_streams(Parameters(stream_query_params(StreamQueryAction::Children)))
+        .await
+    {
+        Ok(_) => panic!("query_streams children should reject missing parent streams"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("stream does not exist: //streams/dev"));
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(
+        invocations[1].args,
+        ["streams", "-a", "-F", "Stream=//streams/dev"]
+    );
+}
+
+#[tokio::test]
+async fn query_streams_list_workspaces_validates_stream_before_listing_clients() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({"client": "stream-ws"})],
+            text: json!({}),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+    let mut params = stream_query_params(StreamQueryAction::ListWorkspaces);
+    params.user = Some("alice".to_string());
+    params.unloaded = true;
+    params.max_results = 5;
+
+    let response = server.query_streams(Parameters(params)).await.unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "list_workspaces");
+    assert_eq!(response.0.message, json!([{"client": "stream-ws"}]));
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0].args,
+        ["streams", "-F", "Stream=//streams/dev"]
+    );
+    assert_eq!(
+        invocations[1].args,
+        [
+            "clients",
+            "-U",
+            "-S",
+            "//streams/dev",
+            "-u",
+            "alice",
+            "-m",
+            "5"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn query_streams_get_workspace_rejects_template_for_named_workspace() {
+    let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+        records: vec![json!({"Client": "missing-ws"})],
+        text: json!({}),
+    }]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+    let mut params = stream_query_params(StreamQueryAction::GetWorkspace);
+    params.workspace = Some("missing-ws".to_string());
+    params.stream_name = None;
+
+    let err = match server.query_streams(Parameters(params)).await {
+        Ok(_) => panic!("query_streams get_workspace should reject template specs"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(
+        err.message
+            .contains("Workspace 'missing-ws' does not exist")
+    );
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].args, ["client", "-o", "missing-ws"]);
+}
+
+#[tokio::test]
+async fn query_streams_get_workspace_returns_existing_named_workspace() {
+    let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+        records: vec![json!({
+            "Client": "stream-ws",
+            "Update": "2026/06/16",
+            "Stream": "//streams/dev"
+        })],
+        text: json!({}),
+    }]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+    let mut params = stream_query_params(StreamQueryAction::GetWorkspace);
+    params.workspace = Some("stream-ws".to_string());
+    params.stream_name = Some("//streams/dev".to_string());
+    params.template = Some("template-ws".to_string());
+
+    let response = server.query_streams(Parameters(params)).await.unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "get_workspace");
+    assert_eq!(
+        response.0.message,
+        json!([{
+            "Client": "stream-ws",
+            "Update": "2026/06/16",
+            "Stream": "//streams/dev"
+        }])
+    );
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(
+        invocations[0].args,
+        [
+            "client",
+            "-o",
+            "-S",
+            "//streams/dev",
+            "-t",
+            "template-ws",
+            "stream-ws"
+        ]
     );
 }
 
