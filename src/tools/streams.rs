@@ -9,6 +9,11 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamQueryCommand {
     Single(P4Invocation),
+    Get {
+        stream_name: Option<String>,
+        view_without_edit: bool,
+        at_change: Option<String>,
+    },
     Parent {
         stream_name: String,
     },
@@ -69,7 +74,11 @@ impl StreamModifyCommand {
 pub fn build_stream_query_command(params: &QueryStreamsParams) -> Result<StreamQueryCommand> {
     match &params.action {
         StreamQueryAction::List => Ok(StreamQueryCommand::Single(stream_list_invocation(params))),
-        StreamQueryAction::Get => Ok(StreamQueryCommand::Single(stream_get_invocation(params)?)),
+        StreamQueryAction::Get => Ok(StreamQueryCommand::Get {
+            stream_name: non_blank(params.stream_name.as_deref()).map(str::to_string),
+            view_without_edit: params.view_without_edit,
+            at_change: non_blank(params.at_change.as_deref()).map(str::to_string),
+        }),
         StreamQueryAction::Children => Ok(StreamQueryCommand::Single(stream_children_invocation(
             params,
         )?)),
@@ -224,18 +233,21 @@ fn stream_list_invocation(params: &QueryStreamsParams) -> P4Invocation {
     json_invocation(args)
 }
 
-fn stream_get_invocation(params: &QueryStreamsParams) -> Result<P4Invocation> {
-    let stream_name = required(params.stream_name.as_deref(), "stream_name")?;
+pub fn stream_get_invocation(
+    stream_name: &str,
+    view_without_edit: bool,
+    at_change: Option<&str>,
+) -> P4Invocation {
     let mut args = vec!["stream".into(), "-o".into()];
-    if params.view_without_edit {
+    if view_without_edit {
         args.push("-v".into());
     }
-    let specifier = match non_blank(params.at_change.as_deref()) {
+    let specifier = match non_blank(at_change) {
         Some(change) => format!("{stream_name}@{change}"),
-        None => stream_name,
+        None => stream_name.to_string(),
     };
     args.push(specifier);
-    Ok(json_invocation(args))
+    json_invocation(args)
 }
 
 fn stream_children_invocation(params: &QueryStreamsParams) -> Result<P4Invocation> {

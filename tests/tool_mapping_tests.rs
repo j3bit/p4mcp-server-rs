@@ -1535,7 +1535,7 @@ fn stream_integration_status_uses_upstream_flags() {
 }
 
 #[test]
-fn stream_get_blank_name_errors() {
+fn stream_get_without_name_is_server_side_current_stream_workflow() {
     let params = QueryStreamsParams {
         action: StreamQueryAction::Get,
         stream_name: Some(" ".to_string()),
@@ -1545,8 +1545,8 @@ fn stream_get_blank_name_errors() {
         unloaded: false,
         all_streams: false,
         viewmatch: None,
-        view_without_edit: false,
-        at_change: None,
+        view_without_edit: true,
+        at_change: Some("12345".to_string()),
         both_directions: false,
         force_refresh: false,
         workspace: None,
@@ -1560,6 +1560,14 @@ fn stream_get_blank_name_errors() {
         max_results: 10,
     };
 
-    let error = build_stream_query_command(&params).unwrap_err().to_string();
-    assert!(error.contains("stream_name is required"));
+    let command = build_stream_query_command(&params).unwrap();
+
+    assert!(matches!(
+        command,
+        p4mcp_server_rs::tools::streams::StreamQueryCommand::Get {
+            stream_name: None,
+            view_without_edit: true,
+            at_change: Some(_),
+        }
+    ));
 }

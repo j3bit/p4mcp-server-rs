@@ -52,8 +52,8 @@ use crate::{
         streams::{
             StreamModifyCommand, StreamQueryCommand, build_stream_modify_command,
             build_stream_query_command, client_spec_invocation, interchanges_invocation,
-            opened_for_stream_validation_invocation, stream_resolve_preview_invocation,
-            stream_spec_with_view_invocation,
+            opened_for_stream_validation_invocation, stream_get_invocation,
+            stream_resolve_preview_invocation, stream_spec_with_view_invocation,
         },
         workspaces::{
             build_workspace_delete_invocation, build_workspace_query_invocation,
@@ -258,6 +258,43 @@ impl P4McpServer {
             .cloned()
             .unwrap_or(json!(null));
         Ok(Json(ToolResponse::success(action, parent)))
+    }
+
+    async fn query_stream_get(
+        &self,
+        action: &str,
+        stream_name: Option<&str>,
+        view_without_edit: bool,
+        at_change: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let effective_stream = self.resolve_current_stream(stream_name).await?;
+        if at_change.is_none() {
+            self.require_existing_stream(&effective_stream).await?;
+        }
+        let output = self
+            .run_p4(stream_get_invocation(
+                &effective_stream,
+                view_without_edit,
+                at_change,
+            ))
+            .await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn resolve_current_stream(&self, stream_name: Option<&str>) -> McpResult<String> {
+        if let Some(stream_name) = stream_name
+            .map(str::trim)
+            .filter(|stream_name| !stream_name.is_empty())
+        {
+            return Ok(stream_name.to_string());
+        }
+
+        let client = self.run_p4(client_spec_invocation(None)).await?;
+        required_record_field(&client.records, "Stream").map_err(|_| {
+            to_mcp_error(invalid_input(
+                "No stream specified and current workspace is not stream-based",
+            ))
+        })
     }
 
     async fn query_stream_graph(
@@ -1310,6 +1347,19 @@ impl P4McpServer {
         let command = build_stream_query_command(&params).map_err(to_mcp_error)?;
         match command {
             StreamQueryCommand::Single(invocation) => self.call_p4_tool(action, invocation).await,
+            StreamQueryCommand::Get {
+                stream_name,
+                view_without_edit,
+                at_change,
+            } => {
+                self.query_stream_get(
+                    action,
+                    stream_name.as_deref(),
+                    view_without_edit,
+                    at_change.as_deref(),
+                )
+                .await
+            }
             StreamQueryCommand::Parent { stream_name } => {
                 self.query_stream_parent(action, &stream_name).await
             }
