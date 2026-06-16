@@ -301,7 +301,11 @@ fn format_elicitation_message(preview: &ApprovalPreview) -> String {
     }
     if let Some(commands) = &preview.commands {
         for (index, command) in commands.iter().enumerate() {
-            lines.push(format!("Command {}: {}", index + 1, format_command(command)));
+            lines.push(format!(
+                "Command {}: {}",
+                index + 1,
+                format_command(command)
+            ));
         }
     } else if let Some(command) = &preview.command {
         lines.push(format!("Command: {}", format_command(command)));
@@ -621,12 +625,8 @@ mod tests {
 
         let message = format_elicitation_message(&preview);
 
-        assert!(message.contains(
-            "Command 1: p4 move -c 123 //depot/main/a.txt //depot/dev/a.txt"
-        ));
-        assert!(message.contains(
-            "Command 2: p4 move -c 123 //depot/main/b.txt //depot/dev/b.txt"
-        ));
+        assert!(message.contains("Command 1: p4 move -c 123 //depot/main/a.txt //depot/dev/a.txt"));
+        assert!(message.contains("Command 2: p4 move -c 123 //depot/main/b.txt //depot/dev/b.txt"));
     }
 
     #[test]
@@ -648,9 +648,7 @@ mod tests {
 
         let message = format_elicitation_message(&preview);
 
-        assert!(message.contains(
-            "Command 1: p4 move -c 123 //depot/main/a.txt //depot/dev/a.txt"
-        ));
+        assert!(message.contains("Command 1: p4 move -c 123 //depot/main/a.txt //depot/dev/a.txt"));
         assert!(!message.contains("Command: p4 sync //depot/main/single.txt"));
     }
 
