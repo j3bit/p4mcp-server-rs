@@ -281,7 +281,7 @@ fn ticket_for_user(stdout: &str, username: &str, server: Option<&str>) -> Result
                     ),
                 });
             }
-            [] => {}
+            [] => return Ok(None),
         }
     }
 

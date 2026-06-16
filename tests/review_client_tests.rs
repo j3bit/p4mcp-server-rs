@@ -262,6 +262,24 @@ fn review_api_config_uses_configured_password_when_ticket_is_missing() {
 }
 
 #[test]
+fn review_api_config_uses_configured_password_when_ticket_is_for_other_server() {
+    let config = p4mcp_server_rs::tools::reviews::ReviewApiConfig::from_p4(
+        &[serde_json::json!({
+            "userName": "alice",
+            "serverAddress": "perforce:1666"
+        })],
+        &[serde_json::json!({
+            "value": "https://swarm.example.com"
+        })],
+        "other:1666 (alice) ticket-123\n",
+        Some("password-or-ticket"),
+    )
+    .unwrap();
+
+    assert_eq!(config.ticket, "password-or-ticket");
+}
+
+#[test]
 fn review_api_config_does_not_use_password_fallback_for_ambiguous_tickets() {
     let error = p4mcp_server_rs::tools::reviews::ReviewApiConfig::from_p4(
         &[serde_json::json!({
