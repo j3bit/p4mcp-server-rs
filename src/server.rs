@@ -2949,6 +2949,98 @@ Files:
     }
 
     #[tokio::test]
+    async fn modify_streams_integrate_preview_uses_lowercase_force_without_executor_call() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Integrate);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.force = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "integrate");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//streams/dev"]);
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/dev")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "integrate".to_string(),
+                "-f".to_string(),
+                "-S".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_populate_preview_uses_lowercase_force_without_executor_call() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Populate);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.force = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "populate");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//streams/dev"]);
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/dev")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "populate".to_string(),
+                "-f".to_string(),
+                "-S".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn modify_streams_create_and_update_require_stream_name_before_approval() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"Stream": "//streams/dev"})],
