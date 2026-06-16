@@ -38,7 +38,8 @@ use crate::{
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{
-            build_file_invocation, build_file_modify_invocation, build_file_search_invocations,
+            build_file_invocation, build_file_modify_invocation, build_file_move_invocations,
+            build_file_search_invocations,
         },
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
@@ -165,6 +166,24 @@ impl P4McpServer {
             }
             Err(error) => Err(to_mcp_error(error)),
         }
+    }
+
+    async fn call_p4_sequence_tool(
+        &self,
+        action: &str,
+        invocations: Vec<P4Invocation>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let mut messages = Vec::new();
+        for invocation in invocations {
+            let output = self
+                .executor
+                .run(invocation, P4Env::new())
+                .await
+                .map_err(to_mcp_error)?;
+            messages.push(output_message(output));
+        }
+
+        Ok(Json(ToolResponse::success(action, Value::Array(messages))))
     }
 
     async fn review_http_client_from_p4(&self) -> McpResult<ReviewHttpClient> {
@@ -635,8 +654,12 @@ impl P4McpServer {
             .check(Access::Write, Toolset::Files, "modify_files")
             .map_err(to_mcp_error)?;
         let action = params.action.as_str();
-        let invocation = build_file_modify_invocation(&params).map_err(to_mcp_error)?;
-        let request = self.modify_files_approval_request(&params, &invocation);
+        let invocations = if params.action == FileModifyAction::Move {
+            build_file_move_invocations(&params).map_err(to_mcp_error)?
+        } else {
+            vec![build_file_modify_invocation(&params).map_err(to_mcp_error)?]
+        };
+        let request = self.modify_files_approval_request(&params, &invocations);
         if let Some(response) = self
             .require_write_approval(channel, request, params.approval_token.as_deref())
             .await?
@@ -644,6 +667,10 @@ impl P4McpServer {
             return Ok(response);
         }
         if params.action == FileModifyAction::Sync {
+            let invocation = invocations
+                .into_iter()
+                .next()
+                .expect("sync builds exactly one invocation");
             return self
                 .call_p4_tool_with_benign_success(
                     action,
@@ -653,13 +680,20 @@ impl P4McpServer {
                 )
                 .await;
         }
+        if params.action == FileModifyAction::Move {
+            return self.call_p4_sequence_tool(action, invocations).await;
+        }
+        let invocation = invocations
+            .into_iter()
+            .next()
+            .expect("non-move file action builds exactly one invocation");
         self.call_p4_tool(action, invocation).await
     }
 
     fn modify_files_approval_request(
         &self,
         params: &ModifyFilesParams,
-        invocation: &P4Invocation,
+        invocations: &[P4Invocation],
     ) -> ApprovalRequest {
         let mut approval_params = params.clone();
         approval_params.approval_token = None;
@@ -671,15 +705,12 @@ impl P4McpServer {
             action: action.clone(),
             params: serde_json::to_value(approval_params)
                 .expect("modify files params serialize to JSON"),
-            preview: self.p4_approval_preview(P4ApprovalContext {
-                tool: "modify_files",
-                action: &action,
+            preview: self.p4_file_approval_preview(
+                &action,
                 targets,
-                changelist: Some(params.changelist.clone()),
-                workspace: None,
-                stream: None,
-                invocation,
-            }),
+                Some(params.changelist.clone()),
+                invocations,
+            ),
         }
     }
 
@@ -1165,6 +1196,43 @@ impl P4McpServer {
             review: None,
             command: Some(command_preview(&self.config.p4_bin, context.invocation)),
             commands: None,
+            request: None,
+        }
+    }
+
+    fn p4_file_approval_preview(
+        &self,
+        action: &str,
+        targets: Vec<String>,
+        changelist: Option<String>,
+        invocations: &[P4Invocation],
+    ) -> ApprovalPreview {
+        let commands: Vec<Vec<String>> = invocations
+            .iter()
+            .map(|invocation| command_preview(&self.config.p4_bin, invocation))
+            .collect();
+        let command = if commands.len() == 1 {
+            commands.first().cloned()
+        } else {
+            None
+        };
+        let commands = if commands.len() > 1 {
+            Some(commands)
+        } else {
+            None
+        };
+
+        ApprovalPreview {
+            summary: approval_summary(action, &targets),
+            tool: "modify_files".to_string(),
+            action: action.to_string(),
+            targets,
+            changelist,
+            workspace: None,
+            stream: None,
+            review: None,
+            command,
+            commands,
             request: None,
         }
     }
@@ -2547,6 +2615,148 @@ mod tests {
                 "default".to_string(),
                 "//depot/main/file.txt".to_string(),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_files_move_without_approval_previews_all_move_commands() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_files_params(None);
+        params.action = FileModifyAction::Move;
+        params.force = false;
+        params.file_paths = None;
+        params.changelist = "123".to_string();
+        params.source_paths = Some(vec![
+            "//depot/main/a.txt".to_string(),
+            "//depot/main/b.txt".to_string(),
+        ]);
+        params.target_paths = Some(vec![
+            "//depot/dev/a.txt".to_string(),
+            "//depot/dev/b.txt".to_string(),
+        ]);
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.tool, "modify_files");
+        assert_eq!(calls[0].request.action, "move");
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0].request.preview.commands,
+            Some(vec![
+                vec![
+                    "p4".to_string(),
+                    "move".to_string(),
+                    "-c".to_string(),
+                    "123".to_string(),
+                    "//depot/main/a.txt".to_string(),
+                    "//depot/dev/a.txt".to_string(),
+                ],
+                vec![
+                    "p4".to_string(),
+                    "move".to_string(),
+                    "-c".to_string(),
+                    "123".to_string(),
+                    "//depot/main/b.txt".to_string(),
+                    "//depot/dev/b.txt".to_string(),
+                ],
+            ])
+        );
+        assert_eq!(
+            calls[0].request.preview.targets,
+            [
+                "//depot/main/a.txt",
+                "//depot/main/b.txt",
+                "//depot/dev/a.txt",
+                "//depot/dev/b.txt",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_files_move_after_approval_executes_all_pairs() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/dev/a.txt"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/dev/b.txt"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_files_params(Some("approved-token"));
+        params.action = FileModifyAction::Move;
+        params.force = false;
+        params.file_paths = None;
+        params.changelist = "123".to_string();
+        params.source_paths = Some(vec![
+            "//depot/main/a.txt".to_string(),
+            "//depot/main/b.txt".to_string(),
+        ]);
+        params.target_paths = Some(vec![
+            "//depot/dev/a.txt".to_string(),
+            "//depot/dev/b.txt".to_string(),
+        ]);
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved batch move should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "move");
+        assert_eq!(
+            response.0.message,
+            json!([
+                [{"depotFile": "//depot/dev/a.txt"}],
+                [{"depotFile": "//depot/dev/b.txt"}],
+            ])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            [
+                "move",
+                "-c",
+                "123",
+                "//depot/main/a.txt",
+                "//depot/dev/a.txt"
+            ]
+        );
+        assert_eq!(
+            invocations[1].args,
+            [
+                "move",
+                "-c",
+                "123",
+                "//depot/main/b.txt",
+                "//depot/dev/b.txt"
+            ]
         );
     }
 

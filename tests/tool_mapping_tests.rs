@@ -9,7 +9,8 @@ use p4mcp_server_rs::{
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
         files::{
-            build_file_invocation, build_file_modify_invocation, build_file_search_invocations,
+            build_file_invocation, build_file_modify_invocation, build_file_move_invocations,
+            build_file_search_invocations,
         },
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
@@ -617,7 +618,10 @@ fn modify_file_move_source_target_mismatch_errors() {
         file_paths: None,
         changelist: "default".to_string(),
         source_paths: Some(vec!["//depot/main/source.rs".to_string()]),
-        target_paths: Some(vec![]),
+        target_paths: Some(vec![
+            "//depot/main/target.rs".to_string(),
+            "//depot/main/other.rs".to_string(),
+        ]),
         mode: "auto".to_string(),
         force: false,
         approval_token: None,
@@ -627,6 +631,68 @@ fn modify_file_move_source_target_mismatch_errors() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("source_paths and target_paths must have the same length"));
+}
+
+#[test]
+fn modify_file_move_multiple_pairs_builds_one_invocation_per_pair() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Move,
+        file_paths: None,
+        changelist: "123".to_string(),
+        source_paths: Some(vec![
+            "//depot/main/a.txt".to_string(),
+            "//depot/main/b.txt".to_string(),
+        ]),
+        target_paths: Some(vec![
+            "//depot/dev/a.txt".to_string(),
+            "//depot/dev/b.txt".to_string(),
+        ]),
+        mode: "auto".to_string(),
+        force: false,
+        approval_token: None,
+    };
+
+    let invocations = build_file_move_invocations(&params).unwrap();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0].args,
+        [
+            "move",
+            "-c",
+            "123",
+            "//depot/main/a.txt",
+            "//depot/dev/a.txt"
+        ]
+    );
+    assert_eq!(
+        invocations[1].args,
+        [
+            "move",
+            "-c",
+            "123",
+            "//depot/main/b.txt",
+            "//depot/dev/b.txt"
+        ]
+    );
+}
+
+#[test]
+fn modify_file_move_requires_source_and_target_paths() {
+    let params = ModifyFilesParams {
+        action: FileModifyAction::Move,
+        file_paths: None,
+        changelist: "default".to_string(),
+        source_paths: None,
+        target_paths: None,
+        mode: "auto".to_string(),
+        force: false,
+        approval_token: None,
+    };
+
+    let error = build_file_move_invocations(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("source_paths and target_paths required for move action"));
 }
 
 #[test]

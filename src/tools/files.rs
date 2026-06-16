@@ -114,6 +114,38 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
     Ok(invocation)
 }
 
+pub fn build_file_move_invocations(params: &ModifyFilesParams) -> Result<Vec<P4Invocation>> {
+    let sources = params.source_paths.clone().unwrap_or_default();
+    let targets = params.target_paths.clone().unwrap_or_default();
+
+    if sources.is_empty() || targets.is_empty() {
+        return Err(P4McpError::InvalidInput {
+            message: "source_paths and target_paths required for move action".to_string(),
+        });
+    }
+    if sources.len() != targets.len() {
+        return Err(P4McpError::InvalidInput {
+            message: "source_paths and target_paths must have the same length".to_string(),
+        });
+    }
+
+    Ok(sources
+        .into_iter()
+        .zip(targets)
+        .map(|(source, target)| P4Invocation {
+            args: vec![
+                "move".into(),
+                "-c".into(),
+                params.changelist.clone(),
+                source,
+                target,
+            ],
+            stdin: None,
+            mode: OutputMode::JsonLines,
+        })
+        .collect())
+}
+
 pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invocation> {
     let files = params.file_paths.clone().unwrap_or_default();
     let invocation = match params.action {
@@ -150,29 +182,13 @@ pub fn build_file_modify_invocation(params: &ModifyFilesParams) -> Result<P4Invo
             }
         }
         FileModifyAction::Move => {
-            let sources = params.source_paths.clone().unwrap_or_default();
-            let targets = params.target_paths.clone().unwrap_or_default();
-            if sources.len() != targets.len() {
+            let mut invocations = build_file_move_invocations(params)?;
+            if invocations.len() == 1 {
+                invocations.remove(0)
+            } else {
                 return Err(P4McpError::InvalidInput {
-                    message: "source_paths and target_paths must have the same length".to_string(),
+                    message: "multi-pair move requires build_file_move_invocations".to_string(),
                 });
-            }
-            if sources.len() != 1 {
-                return Err(P4McpError::InvalidInput {
-                    message: "move accepts exactly one source and one target per tool call"
-                        .to_string(),
-                });
-            }
-            P4Invocation {
-                args: vec![
-                    "move".into(),
-                    "-c".into(),
-                    params.changelist.clone(),
-                    sources[0].clone(),
-                    targets[0].clone(),
-                ],
-                stdin: None,
-                mode: OutputMode::JsonLines,
             }
         }
         FileModifyAction::Resolve => {
