@@ -4,6 +4,39 @@ use crate::{
     tools::params::{FileModifyAction, FileQueryAction, ModifyFilesParams, QueryFilesParams},
 };
 
+pub fn build_file_search_invocations(params: &QueryFilesParams) -> Result<Vec<P4Invocation>> {
+    let pattern = params
+        .pattern
+        .clone()
+        .ok_or_else(|| P4McpError::InvalidInput {
+            message: "pattern is required for search".to_string(),
+        })?;
+
+    Ok(search_filespecs(&params.file_path, &pattern)
+        .into_iter()
+        .map(|filespec| P4Invocation {
+            args: vec![
+                "files".into(),
+                "-m".into(),
+                params.max_results.to_string(),
+                filespec,
+            ],
+            stdin: None,
+            mode: OutputMode::JsonLines,
+        })
+        .collect())
+}
+
+fn search_filespecs(depot_path: &str, pattern: &str) -> Vec<String> {
+    if let Some(base) = depot_path.strip_suffix("...") {
+        vec![format!("{base}{pattern}"), format!("{base}.../{pattern}")]
+    } else if depot_path.ends_with('/') {
+        vec![format!("{depot_path}{pattern}")]
+    } else {
+        vec![format!("{depot_path}/{pattern}")]
+    }
+}
+
 pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> {
     let invocation = match params.action {
         FileQueryAction::Content => P4Invocation {
@@ -50,21 +83,13 @@ pub fn build_file_invocation(params: &QueryFilesParams) -> Result<P4Invocation> 
             mode: OutputMode::JsonLines,
         },
         FileQueryAction::Search => {
-            let pattern = params
-                .pattern
-                .clone()
-                .ok_or_else(|| P4McpError::InvalidInput {
-                    message: "pattern is required for search".to_string(),
-                })?;
-            P4Invocation {
-                args: vec![
-                    "files".into(),
-                    "-m".into(),
-                    params.max_results.to_string(),
-                    format!("{}/{}", params.file_path.trim_end_matches('/'), pattern),
-                ],
-                stdin: None,
-                mode: OutputMode::JsonLines,
+            let mut invocations = build_file_search_invocations(params)?;
+            if invocations.len() == 1 {
+                invocations.remove(0)
+            } else {
+                return Err(P4McpError::InvalidInput {
+                    message: "recursive search requires build_file_search_invocations".to_string(),
+                });
             }
         }
         FileQueryAction::Grep => {

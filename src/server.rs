@@ -37,7 +37,9 @@ use crate::{
     permissions::{Access, SafetyPolicy},
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
-        files::{build_file_invocation, build_file_modify_invocation},
+        files::{
+            build_file_invocation, build_file_modify_invocation, build_file_search_invocations,
+        },
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
             ChangelistModifyAction, FileModifyAction, FileQueryAction, ModifyChangelistsParams,
@@ -1251,6 +1253,22 @@ impl P4McpServer {
         )))
     }
 
+    async fn query_files_search(&self, params: QueryFilesParams) -> McpResult<Json<ToolResponse>> {
+        let mut records = Vec::new();
+        let invocations = build_file_search_invocations(&params).map_err(to_mcp_error)?;
+
+        for invocation in invocations {
+            match self.executor.run(invocation, P4Env::new()).await {
+                Ok(output) => records.extend(output.records),
+                Err(error) if is_no_such_file_error(&error) => {}
+                Err(error) => return Err(to_mcp_error(error)),
+            }
+        }
+
+        records.truncate(params.max_results as usize);
+        Ok(Json(ToolResponse::success("search", Value::Array(records))))
+    }
+
     #[tool(
         description = "Query Perforce files",
         annotations(read_only_hint = true)
@@ -1262,6 +1280,10 @@ impl P4McpServer {
         self.policy()
             .check(Access::Read, Toolset::Files, "query_files")
             .map_err(to_mcp_error)?;
+        if params.action == FileQueryAction::Search {
+            return self.query_files_search(params).await;
+        }
+
         let action = params.action.as_str();
         let grep_max_results =
             (params.action == FileQueryAction::Grep).then_some(params.max_results as usize);
@@ -1943,6 +1965,13 @@ fn output_message_with_record_limit(mut output: P4CommandOutput, max_records: us
     }
 }
 
+fn is_no_such_file_error(error: &P4McpError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("no such file(s)")
+}
+
 fn json_invocation(args: Vec<String>, stdin: Option<String>) -> P4Invocation {
     P4Invocation {
         args,
@@ -2516,6 +2545,103 @@ mod tests {
                 "default".to_string(),
                 "//depot/main/file.txt".to_string(),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_search_recursive_base_aggregates_and_caps_results() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/proj/root.rs"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![
+                    json!({"depotFile": "//depot/proj/src/lib.rs"}),
+                    json!({"depotFile": "//depot/proj/src/main.rs"}),
+                ],
+                text: json!({}),
+            },
+        ]));
+        let server = P4McpServer::with_executor(test_config(false), executor.clone());
+
+        let response = server
+            .query_files(Parameters(QueryFilesParams {
+                action: FileQueryAction::Search,
+                file_path: "//depot/proj/...".to_string(),
+                file2: None,
+                diff2: true,
+                max_results: 2,
+                pattern: Some("*.rs".to_string()),
+                case_insensitive: false,
+            }))
+            .await
+            .expect("recursive search should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "search");
+        assert_eq!(
+            response.0.message,
+            json!([
+                {"depotFile": "//depot/proj/root.rs"},
+                {"depotFile": "//depot/proj/src/lib.rs"},
+            ])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["files", "-m", "2", "//depot/proj/*.rs"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["files", "-m", "2", "//depot/proj/.../*.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_search_ignores_no_such_file_for_one_pattern() {
+        let executor = Arc::new(QueuedExecutor::results(vec![
+            Err(P4McpError::P4Command {
+                message: "p4 exited with failure; stderr: no such file(s)".to_string(),
+            }),
+            Ok(P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/proj/src/lib.rs"})],
+                text: json!({}),
+            }),
+        ]));
+        let server = P4McpServer::with_executor(test_config(false), executor.clone());
+
+        let response = server
+            .query_files(Parameters(QueryFilesParams {
+                action: FileQueryAction::Search,
+                file_path: "//depot/proj/...".to_string(),
+                file2: None,
+                diff2: true,
+                max_results: 10,
+                pattern: Some("*.rs".to_string()),
+                case_insensitive: false,
+            }))
+            .await
+            .expect("one no-such pattern should be ignored");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "search");
+        assert_eq!(
+            response.0.message,
+            json!([{"depotFile": "//depot/proj/src/lib.rs"}])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["files", "-m", "10", "//depot/proj/*.rs"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["files", "-m", "10", "//depot/proj/.../*.rs"]
         );
     }
 

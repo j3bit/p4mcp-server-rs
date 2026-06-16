@@ -8,7 +8,9 @@ use p4mcp_server_rs::{
     permissions::{Access, SafetyPolicy},
     tools::{
         changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
-        files::{build_file_invocation, build_file_modify_invocation},
+        files::{
+            build_file_invocation, build_file_modify_invocation, build_file_search_invocations,
+        },
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
             ChangelistModifyAction, ChangelistQueryAction, FileModifyAction, FileQueryAction,
@@ -295,6 +297,68 @@ fn query_file_grep_maps_pattern() {
         vec!["grep", "-n", "-i", "-e", "needle", "//depot/main/..."]
     );
     assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn query_file_search_recursive_base_builds_root_and_recursive_specs() {
+    let params = QueryFilesParams {
+        action: FileQueryAction::Search,
+        file_path: "//depot/proj/...".to_string(),
+        file2: None,
+        diff2: true,
+        max_results: 5,
+        pattern: Some("*.rs".to_string()),
+        case_insensitive: false,
+    };
+
+    let invocations = build_file_search_invocations(&params).unwrap();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0],
+        P4Invocation {
+            args: vec![
+                "files".into(),
+                "-m".into(),
+                "5".into(),
+                "//depot/proj/*.rs".into()
+            ],
+            stdin: None,
+            mode: OutputMode::JsonLines,
+        }
+    );
+    assert_eq!(
+        invocations[1],
+        P4Invocation {
+            args: vec![
+                "files".into(),
+                "-m".into(),
+                "5".into(),
+                "//depot/proj/.../*.rs".into()
+            ],
+            stdin: None,
+            mode: OutputMode::JsonLines,
+        }
+    );
+}
+
+#[test]
+fn query_file_search_non_recursive_base_builds_one_spec() {
+    let params = QueryFilesParams {
+        action: FileQueryAction::Search,
+        file_path: "//depot/proj".to_string(),
+        file2: None,
+        diff2: true,
+        max_results: 10,
+        pattern: Some("*.rs".to_string()),
+        case_insensitive: false,
+    };
+
+    let invocations = build_file_search_invocations(&params).unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(
+        invocations[0].args,
+        vec!["files", "-m", "10", "//depot/proj/*.rs"]
+    );
 }
 
 #[test]
