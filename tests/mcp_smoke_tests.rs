@@ -1,7 +1,9 @@
 use std::{
     collections::VecDeque,
+    env,
+    ffi::OsString,
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use async_trait::async_trait;
@@ -25,6 +27,48 @@ use rmcp::model::Tool;
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+static REVIEW_AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct ReviewAuthEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    p4passwd: Option<OsString>,
+    p4config: Option<OsString>,
+}
+
+impl ReviewAuthEnvGuard {
+    fn new(p4passwd: &str) -> Self {
+        let lock = REVIEW_AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_p4passwd = env::var_os("P4PASSWD");
+        let previous_p4config = env::var_os("P4CONFIG");
+        unsafe {
+            env::set_var("P4PASSWD", p4passwd);
+            env::remove_var("P4CONFIG");
+        }
+        Self {
+            _lock: lock,
+            p4passwd: previous_p4passwd,
+            p4config: previous_p4config,
+        }
+    }
+}
+
+impl Drop for ReviewAuthEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.p4passwd {
+                Some(value) => env::set_var("P4PASSWD", value),
+                None => env::remove_var("P4PASSWD"),
+            }
+            match &self.p4config {
+                Some(value) => env::set_var("P4CONFIG", value),
+                None => env::remove_var("P4CONFIG"),
+            }
+        }
+    }
+}
 
 fn test_config() -> AppConfig {
     AppConfig {
@@ -1021,6 +1065,67 @@ async fn query_reviews_executes_review_api_request() {
             records: Vec::new(),
             text: json!({
                 "stdout": "perforce:1666 (alice) ticket-123\n",
+                "stderr": ""
+            }),
+        },
+    ]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_reviews(Parameters(QueryReviewsParams {
+            max_results: 5,
+            ..query_reviews_params(ReviewQueryAction::List)
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "list");
+    assert_eq!(response.0.message, json!({ "reviews": [123] }));
+
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 3);
+    assert_eq!(invocations[0].args, ["info"]);
+    assert_eq!(
+        invocations[1].args,
+        ["property", "-l", "-n", "P4.Swarm.URL"]
+    );
+    assert_eq!(invocations[2].args, ["tickets"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_reviews_uses_p4passwd_when_tickets_are_empty() {
+    let _env = ReviewAuthEnvGuard::new("password-123");
+    let swarm = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v11/reviews"))
+        .and(query_param("max", "5"))
+        .and(header("authorization", "Basic YWxpY2U6cGFzc3dvcmQtMTIz"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "reviews": [123]
+        })))
+        .expect(1)
+        .mount(&swarm)
+        .await;
+
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({
+                "userName": "alice",
+                "serverAddress": "perforce:1666"
+            })],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({
+                "value": swarm.uri()
+            })],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: Vec::new(),
+            text: json!({
+                "stdout": "",
                 "stderr": ""
             }),
         },

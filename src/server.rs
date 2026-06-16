@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -46,7 +49,7 @@ use crate::{
         response::ToolResponse,
         reviews::{
             BuiltReviewRequest, ModifyReviewsParams, QueryReviewsParams, ReviewApiConfig,
-            ReviewHttpClient,
+            ReviewHttpClient, configured_p4_password,
         },
         server::{QueryServerParams, build_server_invocation},
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
@@ -185,9 +188,18 @@ impl P4McpServer {
             .get("stdout")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let api_config =
-            ReviewApiConfig::from_p4(&info.records, &swarm_property.records, tickets_stdout, None)
-                .map_err(to_mcp_error)?;
+        let p4passwd = std::env::var("P4PASSWD").ok();
+        let p4config = std::env::var("P4CONFIG").ok();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let configured_password =
+            configured_p4_password(p4passwd.as_deref(), p4config.as_deref(), &cwd);
+        let api_config = ReviewApiConfig::from_p4(
+            &info.records,
+            &swarm_property.records,
+            tickets_stdout,
+            configured_password.as_deref(),
+        )
+        .map_err(to_mcp_error)?;
 
         ReviewHttpClient::new_with_ssl_verify(
             api_config.api_base,
