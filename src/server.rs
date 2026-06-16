@@ -37,10 +37,11 @@ use crate::{
         files::{build_file_invocation, build_file_modify_invocation},
         jobs::{build_job_modify_invocation, build_job_query_invocation},
         params::{
-            ChangelistModifyAction, FileQueryAction, ModifyChangelistsParams, ModifyFilesParams,
-            ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams, ModifyWorkspacesParams,
-            QueryChangelistsParams, QueryFilesParams, QueryJobsParams, QueryShelvesParams,
-            QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction, WorkspaceModifyAction,
+            ChangelistModifyAction, FileModifyAction, FileQueryAction, ModifyChangelistsParams,
+            ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams,
+            ModifyWorkspacesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
+            QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction,
+            WorkspaceModifyAction,
         },
         response::ToolResponse,
         reviews::{
@@ -143,6 +144,22 @@ impl P4McpServer {
     ) -> McpResult<Json<ToolResponse>> {
         let output = self.run_p4(invocation).await?;
         Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn call_p4_tool_with_benign_success(
+        &self,
+        action: &str,
+        invocation: P4Invocation,
+        benign_message: &str,
+        success_message: Value,
+    ) -> McpResult<Json<ToolResponse>> {
+        match self.executor.run(invocation, P4Env::new()).await {
+            Ok(output) => Ok(Json(ToolResponse::success(action, output_message(output)))),
+            Err(error) if error.to_string().contains(benign_message) => {
+                Ok(Json(ToolResponse::success(action, success_message)))
+            }
+            Err(error) => Err(to_mcp_error(error)),
+        }
     }
 
     async fn review_http_client_from_p4(&self) -> McpResult<ReviewHttpClient> {
@@ -611,6 +628,16 @@ impl P4McpServer {
             .await?
         {
             return Ok(response);
+        }
+        if params.action == FileModifyAction::Sync {
+            return self
+                .call_p4_tool_with_benign_success(
+                    action,
+                    invocation,
+                    "File(s) up-to-date",
+                    json!("Workspace is already up-to-date"),
+                )
+                .await;
         }
         self.call_p4_tool(action, invocation).await
     }
@@ -2394,6 +2421,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modify_files_sync_up_to_date_after_approval_returns_success() {
+        let executor = Arc::new(QueuedExecutor::results(vec![Err(P4McpError::P4Command {
+            message: "p4 exited with failure; status: exit status: 1; stdout: ; stderr: File(s) up-to-date\n"
+                .to_string(),
+        })]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let params = modify_files_params(Some("approved-token"));
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("up-to-date sync should be successful");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "sync");
+        assert_eq!(response.0.message, json!("Workspace is already up-to-date"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["sync", "-f", "//depot/main/file.txt"]);
+    }
+
+    #[tokio::test]
+    async fn modify_files_sync_other_p4_error_remains_internal_error() {
+        let executor = Arc::new(QueuedExecutor::results(vec![Err(P4McpError::P4Command {
+            message: "p4 exited with failure; stderr: no such file(s)".to_string(),
+        })]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server =
+            P4McpServer::with_executor_and_approval(test_config(false), executor, approval_gate);
+        let params = modify_files_params(Some("approved-token"));
+
+        let err = match server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("non-benign sync errors should still fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::internal_error("", None).code);
+        assert!(err.message.contains("p4 command failed"));
+        assert!(err.message.contains("no such file"));
+    }
+
+    #[tokio::test]
     async fn modify_files_edit_preview_includes_p4_edit() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"depotFile": "//depot/main/file.txt"})],
@@ -3741,6 +3818,13 @@ Stream: //streams/old
         fn success(outputs: Vec<P4CommandOutput>) -> Self {
             Self {
                 outputs: Mutex::new(outputs.into_iter().map(Ok).collect()),
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn results(outputs: Vec<crate::error::Result<P4CommandOutput>>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into()),
                 invocations: Mutex::new(Vec::new()),
             }
         }
