@@ -28,6 +28,7 @@ pub struct ApprovalPreview {
     pub stream: Option<String>,
     pub review: Option<String>,
     pub command: Option<Vec<String>>,
+    pub commands: Option<Vec<Vec<String>>>,
     pub request: Option<HttpPreview>,
 }
 
@@ -298,8 +299,12 @@ fn format_elicitation_message(preview: &ApprovalPreview) -> String {
     if let Some(review) = &preview.review {
         lines.push(format!("Review: {review}"));
     }
-    if let Some(command) = &preview.command {
-        lines.push(format!("Command: {}", command.join(" ")));
+    if let Some(commands) = &preview.commands {
+        for (index, command) in commands.iter().enumerate() {
+            lines.push(format!("Command {}: {}", index + 1, format_command(command)));
+        }
+    } else if let Some(command) = &preview.command {
+        lines.push(format!("Command: {}", format_command(command)));
     }
     if let Some(request) = &preview.request {
         lines.push(format!("Request: {} {}", request.method, request.path));
@@ -307,6 +312,29 @@ fn format_elicitation_message(preview: &ApprovalPreview) -> String {
 
     lines.push("Choose PROCEED to execute this write or CANCEL to leave it unchanged.".to_string());
     lines.join("\n")
+}
+
+fn format_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|argument| format_command_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_command_argument(argument: &str) -> String {
+    if !needs_shell_quote(argument) {
+        return argument.to_string();
+    }
+
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+fn needs_shell_quote(argument: &str) -> bool {
+    argument.is_empty()
+        || argument
+            .chars()
+            .any(|ch| !ch.is_ascii_alphanumeric() && !matches!(ch, '/' | '.' | '_' | '-' | ':'))
 }
 
 fn elicitation_outcome(
@@ -559,12 +587,91 @@ mod tests {
                     "//depot/main/a.txt".to_string(),
                     "//depot/main/b.txt".to_string(),
                 ]),
+                commands: None,
                 request: Some(HttpPreview {
                     method: "POST".to_string(),
                     path: "/mcp/tools/modify_files".to_string(),
                 }),
             },
         }
+    }
+
+    #[test]
+    fn format_elicitation_message_lists_multiple_commands() {
+        let mut preview = sample_request().preview;
+        preview.command = None;
+        preview.commands = Some(vec![
+            vec![
+                "p4".to_string(),
+                "move".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/a.txt".to_string(),
+                "//depot/dev/a.txt".to_string(),
+            ],
+            vec![
+                "p4".to_string(),
+                "move".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/b.txt".to_string(),
+                "//depot/dev/b.txt".to_string(),
+            ],
+        ]);
+
+        let message = format_elicitation_message(&preview);
+
+        assert!(message.contains(
+            "Command 1: p4 move -c 123 //depot/main/a.txt //depot/dev/a.txt"
+        ));
+        assert!(message.contains(
+            "Command 2: p4 move -c 123 //depot/main/b.txt //depot/dev/b.txt"
+        ));
+    }
+
+    #[test]
+    fn format_elicitation_message_prefers_commands_over_command() {
+        let mut preview = sample_request().preview;
+        preview.command = Some(vec![
+            "p4".to_string(),
+            "sync".to_string(),
+            "//depot/main/single.txt".to_string(),
+        ]);
+        preview.commands = Some(vec![vec![
+            "p4".to_string(),
+            "move".to_string(),
+            "-c".to_string(),
+            "123".to_string(),
+            "//depot/main/a.txt".to_string(),
+            "//depot/dev/a.txt".to_string(),
+        ]]);
+
+        let message = format_elicitation_message(&preview);
+
+        assert!(message.contains(
+            "Command 1: p4 move -c 123 //depot/main/a.txt //depot/dev/a.txt"
+        ));
+        assert!(!message.contains("Command: p4 sync //depot/main/single.txt"));
+    }
+
+    #[test]
+    fn format_elicitation_message_quotes_spaced_command_arguments() {
+        let mut preview = sample_request().preview;
+        preview.command = None;
+        preview.commands = Some(vec![vec![
+            "p4".to_string(),
+            "move".to_string(),
+            "-c".to_string(),
+            "123".to_string(),
+            "//depot/main/file with space.txt".to_string(),
+            "//depot/dev/file with space.txt".to_string(),
+        ]]);
+
+        let message = format_elicitation_message(&preview);
+
+        assert!(message.contains(
+            "Command 1: p4 move -c 123 '//depot/main/file with space.txt' '//depot/dev/file with space.txt'"
+        ));
     }
 
     async fn require_approval(

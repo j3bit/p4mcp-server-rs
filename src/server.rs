@@ -1164,6 +1164,7 @@ impl P4McpServer {
             stream: context.stream,
             review: None,
             command: Some(command_preview(&self.config.p4_bin, context.invocation)),
+            commands: None,
             request: None,
         }
     }
@@ -1224,6 +1225,7 @@ impl P4McpServer {
                 stream: None,
                 review,
                 command: None,
+                commands: None,
                 request: Some(HttpPreview {
                     method: built.method.clone(),
                     path: built.path.clone(),
