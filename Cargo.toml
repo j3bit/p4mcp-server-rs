@@ -1,0 +1,41 @@
+[package]
+name = "p4mcp-server-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust MCP server for Perforce P4 using the p4 CLI"
+license = "MIT"
+repository = "https://github.com/perforce/p4mcp-server"
+
+[[bin]]
+name = "p4-mcp-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "1.7", features = ["server", "macros", "schemars", "elicitation", "transport-io", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "io-std", "fs"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

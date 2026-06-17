@@ -1,0 +1,6278 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use anyhow::Result;
+use clap::Parser;
+use rmcp::{
+    ErrorData, Json, Peer, RoleServer, ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters,
+    model::Tool,
+    tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::{
+    approval::{
+        ApprovalChannel, ApprovalDecision, ApprovalPreview, ApprovalRequest,
+        DefaultWriteApprovalGate, HttpPreview, WriteApprovalGate,
+    },
+    config::{AppConfig, Cli, Toolset, TransportMode},
+    error::P4McpError,
+    p4::{
+        forms::{
+            StreamFormPatch, StreamWorkspaceFormPatch, WorkspaceFormPatch, change_form,
+            patch_change_description_form, patch_stream_form, patch_stream_workspace_form,
+            patch_workspace_form,
+        },
+        runner::{OutputMode, P4CommandOutput, P4Env, P4Executor, P4Invocation, TokioP4Executor},
+    },
+    permissions::{Access, SafetyPolicy},
+    tools::{
+        changelists::{build_changelist_modify_invocation, build_changelist_query_invocation},
+        files::{
+            build_file_invocation, build_file_modify_invocation, build_file_move_invocations,
+            build_file_search_invocations,
+        },
+        jobs::{build_job_modify_invocation, build_job_query_invocation},
+        params::{
+            ChangelistModifyAction, FileModifyAction, FileQueryAction, ModifyChangelistsParams,
+            ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams,
+            ModifyWorkspacesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
+            QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction,
+        },
+        response::ToolResponse,
+        reviews::{
+            BuiltReviewRequest, ModifyReviewsParams, QueryReviewsParams, ReviewApiConfig,
+            ReviewHttpClient, configured_p4_password,
+        },
+        server::{QueryServerParams, build_server_invocation},
+        shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
+        streams::{
+            StreamModifyCommand, StreamQueryCommand, build_stream_modify_command,
+            build_stream_query_command, client_spec_invocation, interchanges_invocation,
+            opened_for_stream_validation_invocation, stream_children_invocation,
+            stream_get_invocation, stream_get_workspace_invocation,
+            stream_list_workspaces_invocation, stream_resolve_preview_invocation,
+            stream_spec_with_view_invocation,
+        },
+        workspaces::{
+            WorkspaceModifyCommand, build_workspace_exists_invocation,
+            build_workspace_modify_command, build_workspace_query_invocation,
+            required_workspace_name,
+        },
+    },
+};
+
+pub struct P4McpServer {
+    config: Arc<AppConfig>,
+    executor: Arc<dyn P4Executor>,
+    approval_gate: Arc<dyn WriteApprovalGate>,
+    active_client: Arc<RwLock<Option<String>>>,
+}
+
+struct P4ApprovalContext<'a> {
+    tool: &'static str,
+    action: &'a str,
+    targets: Vec<String>,
+    changelist: Option<String>,
+    workspace: Option<String>,
+    stream: Option<String>,
+    invocation: &'a P4Invocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamExistence {
+    Active,
+    Deleted,
+    Missing,
+}
+
+impl P4McpServer {
+    pub fn new(config: AppConfig) -> Self {
+        let executor = Arc::new(TokioP4Executor::new(config.p4_bin.clone()));
+        Self::with_executor_and_approval(
+            config,
+            executor,
+            Arc::new(DefaultWriteApprovalGate::new()),
+        )
+    }
+
+    pub fn with_executor(config: AppConfig, executor: Arc<dyn P4Executor>) -> Self {
+        Self::with_executor_and_approval(
+            config,
+            executor,
+            Arc::new(DefaultWriteApprovalGate::new()),
+        )
+    }
+
+    pub fn with_executor_and_approval(
+        config: AppConfig,
+        executor: Arc<dyn P4Executor>,
+        approval_gate: Arc<dyn WriteApprovalGate>,
+    ) -> Self {
+        Self {
+            config: Arc::new(config),
+            executor,
+            approval_gate,
+            active_client: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    pub fn policy(&self) -> SafetyPolicy {
+        SafetyPolicy::new(self.config.readonly, self.config.toolsets.clone())
+    }
+
+    pub fn tool_names() -> Vec<String> {
+        Self::tools()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
+
+    pub fn tools() -> Vec<Tool> {
+        Self::tool_router().list_all()
+    }
+
+    async fn p4_env(&self) -> P4Env {
+        let mut env = P4Env::new();
+        if let Some(client) = self.active_client.read().await.clone() {
+            env.insert("P4CLIENT".to_string(), client);
+        }
+        env
+    }
+
+    async fn set_active_client(&self, workspace_name: String) {
+        *self.active_client.write().await = Some(workspace_name);
+    }
+
+    async fn run_p4(&self, invocation: P4Invocation) -> McpResult<P4CommandOutput> {
+        let env = self.p4_env().await;
+        self.executor
+            .run(invocation, env)
+            .await
+            .map_err(to_mcp_error)
+    }
+
+    async fn run_p4_with_env(
+        &self,
+        invocation: P4Invocation,
+        env: P4Env,
+    ) -> McpResult<P4CommandOutput> {
+        self.executor
+            .run(invocation, env)
+            .await
+            .map_err(to_mcp_error)
+    }
+
+    async fn call_p4_tool(
+        &self,
+        action: &str,
+        invocation: P4Invocation,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self.run_p4(invocation).await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn call_p4_tool_with_env(
+        &self,
+        action: &str,
+        invocation: P4Invocation,
+        env: P4Env,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self.run_p4_with_env(invocation, env).await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn call_p4_tool_with_benign_success(
+        &self,
+        action: &str,
+        invocation: P4Invocation,
+        benign_message: &str,
+        success_message: Value,
+    ) -> McpResult<Json<ToolResponse>> {
+        let env = self.p4_env().await;
+        match self.executor.run(invocation, env).await {
+            Ok(output) => Ok(Json(ToolResponse::success(action, output_message(output)))),
+            Err(error) if error.to_string().contains(benign_message) => {
+                Ok(Json(ToolResponse::success(action, success_message)))
+            }
+            Err(error) => Err(to_mcp_error(error)),
+        }
+    }
+
+    async fn call_p4_sequence_tool(
+        &self,
+        action: &str,
+        invocations: Vec<P4Invocation>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let mut messages = Vec::new();
+        for invocation in invocations {
+            let env = self.p4_env().await;
+            let output = self
+                .executor
+                .run(invocation, env)
+                .await
+                .map_err(to_mcp_error)?;
+            messages.push(output_message(output));
+        }
+
+        Ok(Json(ToolResponse::success(action, Value::Array(messages))))
+    }
+
+    async fn review_http_client_from_p4(&self) -> McpResult<ReviewHttpClient> {
+        let info = self
+            .run_p4(json_invocation(vec!["info".to_string()], None))
+            .await?;
+        let swarm_property = self
+            .run_p4(json_invocation(
+                vec![
+                    "property".to_string(),
+                    "-l".to_string(),
+                    "-n".to_string(),
+                    "P4.Swarm.URL".to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        let tickets = self
+            .run_p4(text_invocation(vec!["tickets".to_string()]))
+            .await?;
+        let tickets_stdout = tickets
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let p4passwd = std::env::var("P4PASSWD").ok();
+        let p4config = std::env::var("P4CONFIG").ok();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let configured_password =
+            configured_p4_password(p4passwd.as_deref(), p4config.as_deref(), &cwd);
+        let api_config = ReviewApiConfig::from_p4(
+            &info.records,
+            &swarm_property.records,
+            tickets_stdout,
+            configured_password.as_deref(),
+        )
+        .map_err(to_mcp_error)?;
+
+        ReviewHttpClient::new_with_ssl_verify(
+            api_config.api_base,
+            api_config.username,
+            api_config.ticket,
+            &self.config.ssl_verify,
+        )
+        .map_err(review_api_error)
+    }
+
+    async fn require_existing_workspace(&self, workspace_name: &str) -> McpResult<()> {
+        let output = self
+            .run_p4(build_workspace_exists_invocation(workspace_name).map_err(to_mcp_error)?)
+            .await?;
+        if output.records.is_empty() {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace_name}' does not exist"
+            ))));
+        }
+        Ok(())
+    }
+
+    async fn stream_existence(&self, stream_name: &str) -> McpResult<StreamExistence> {
+        let active = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if !active.records.is_empty() {
+            return Ok(StreamExistence::Active);
+        }
+
+        let including_deleted = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-a".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if including_deleted.records.is_empty() {
+            Ok(StreamExistence::Missing)
+        } else {
+            Ok(StreamExistence::Deleted)
+        }
+    }
+
+    async fn require_active_stream(&self, stream_name: &str, label: &str) -> McpResult<()> {
+        let subject = if label == "Stream" {
+            label.to_string()
+        } else {
+            format!("{label} stream")
+        };
+        match self.stream_existence(stream_name).await? {
+            StreamExistence::Active => Ok(()),
+            StreamExistence::Deleted => Err(to_mcp_error(invalid_input(format!(
+                "{subject} '{stream_name}' has been deleted"
+            )))),
+            StreamExistence::Missing => Err(to_mcp_error(invalid_input(format!(
+                "{subject} '{stream_name}' does not exist"
+            )))),
+        }
+    }
+
+    async fn fetch_stream_form(&self, stream_name: &str) -> McpResult<String> {
+        let output = self
+            .run_p4(text_invocation(vec![
+                "stream".to_string(),
+                "-o".to_string(),
+                stream_name.to_string(),
+            ]))
+            .await?;
+        output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 stream -o did not return stdout")))
+    }
+
+    async fn save_stream_form(
+        &self,
+        action: &str,
+        patched: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.call_p4_tool(
+            action,
+            json_invocation(vec!["stream".to_string(), "-i".to_string()], Some(patched)),
+        )
+        .await
+    }
+
+    async fn execute_stream_create(
+        &self,
+        params: &ModifyStreamsParams,
+        stream_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let stream_type = required_option(params.stream_type.as_deref(), "stream_type", "create")?;
+        if !is_valid_stream_type(&stream_type) {
+            return Err(to_mcp_error(invalid_input(format!(
+                "invalid stream_type: {stream_type}. Valid stream types: mainline, development, sparsedev, release, sparserel, task, virtual"
+            ))));
+        }
+
+        match self.stream_existence(&stream_name).await? {
+            StreamExistence::Active => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Stream '{stream_name}' already exists"
+                ))));
+            }
+            StreamExistence::Deleted => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Stream '{stream_name}' has been deleted"
+                ))));
+            }
+            StreamExistence::Missing => {}
+        }
+
+        let parent = if is_mainline_stream_type(&stream_type) {
+            "none".to_string()
+        } else {
+            let parent = required_option(params.parent.as_deref(), "Parent stream", "create")?;
+            self.require_active_stream(&parent, "Parent").await?;
+            parent
+        };
+
+        let current_form = self.fetch_stream_form(&stream_name).await?;
+        let options = if stream_type == "virtual"
+            && params
+                .options
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            virtual_stream_default_options(&current_form)
+        } else {
+            params.options.clone()
+        };
+        let patch = StreamFormPatch {
+            stream: Some(stream_name),
+            stream_type: Some(stream_type),
+            parent: Some(parent),
+            name: params.name.clone(),
+            description: params.description.clone(),
+            options,
+            parent_view: params.parent_view.clone(),
+            paths: params.paths.clone(),
+            remapped: params.remapped.clone(),
+            ignored: params.ignored.clone(),
+        };
+        let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
+        self.save_stream_form("create", patched).await
+    }
+
+    async fn stream_bound_workspaces(&self, stream_name: &str) -> McpResult<Vec<String>> {
+        let output = self
+            .run_p4(json_invocation(
+                vec![
+                    "clients".to_string(),
+                    "-S".to_string(),
+                    stream_name.to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        Ok(output
+            .records
+            .iter()
+            .filter_map(|record| {
+                record_string_field(record, "client")
+                    .or_else(|| record_string_field(record, "Client"))
+            })
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn opened_files_for_workspace(&self, workspace: &str) -> McpResult<Vec<Value>> {
+        let output = self
+            .run_p4(json_invocation(
+                vec![
+                    "opened".to_string(),
+                    "-C".to_string(),
+                    workspace.to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        Ok(output.records)
+    }
+
+    async fn reject_view_update_when_workspaces_have_open_files(
+        &self,
+        stream_name: &str,
+    ) -> McpResult<()> {
+        let workspaces = self.stream_bound_workspaces(stream_name).await?;
+        for workspace in workspaces {
+            let opened = self.opened_files_for_workspace(&workspace).await?;
+            if !opened.is_empty() {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Cannot modify stream view: workspace '{workspace}' has {} open file(s). Submit or revert changes first.",
+                    opened.len()
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_stream_update(
+        &self,
+        params: &ModifyStreamsParams,
+        stream_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_active_stream(&stream_name, "Stream").await?;
+
+        let current_form = self.fetch_stream_form(&stream_name).await?;
+        if stream_options_are_locked(&current_form) {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Stream '{stream_name}' is locked. Force update is not supported."
+            ))));
+        }
+
+        let env = self.p4_env().await;
+        let resolve_preview = self
+            .executor
+            .run(
+                json_invocation(
+                    vec![
+                        "stream".to_string(),
+                        "resolve".to_string(),
+                        "-n".to_string(),
+                    ],
+                    None,
+                ),
+                env,
+            )
+            .await;
+        match resolve_preview {
+            Ok(resolve_preview) if !resolve_preview.records.is_empty() => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Stream '{stream_name}' has pending spec conflicts that must be resolved before editing"
+                ))));
+            }
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("No file(s) to resolve") => {}
+            Err(error) => return Err(to_mcp_error(error)),
+        }
+
+        if stream_update_is_view_affecting(params) {
+            self.reject_view_update_when_workspaces_have_open_files(&stream_name)
+                .await?;
+        }
+
+        let parent_view =
+            normalized_parent_view(params.parent_view.as_deref()).map_err(to_mcp_error)?;
+        let patch = StreamFormPatch {
+            stream: Some(stream_name.clone()),
+            stream_type: params.stream_type.clone(),
+            parent: params.parent.clone(),
+            name: params.name.clone(),
+            description: params.description.clone(),
+            options: params.options.clone(),
+            parent_view: None,
+            paths: params.paths.clone(),
+            remapped: params.remapped.clone(),
+            ignored: params.ignored.clone(),
+        };
+        let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
+        let parent_view_requested = parent_view.is_some();
+        let patched = if parent_view_requested {
+            remove_stream_parent_view_field(&patched)
+        } else {
+            patched
+        };
+        let save_response = self.save_stream_form("update", patched).await?;
+
+        if let Some(parent_view) = parent_view {
+            self.run_p4(json_invocation(
+                vec![
+                    "stream".to_string(),
+                    "parentview".to_string(),
+                    format!("--{parent_view}"),
+                    stream_name,
+                ],
+                None,
+            ))
+            .await?;
+        }
+
+        Ok(save_response)
+    }
+
+    async fn current_workspace_record(&self, workspace: Option<&str>) -> McpResult<Value> {
+        let mut args = vec!["client".to_string(), "-o".to_string()];
+        if let Some(workspace) = workspace.filter(|value| !value.trim().is_empty()) {
+            args.push(workspace.to_string());
+        }
+        let output = self.run_p4(json_invocation(args, None)).await?;
+        output
+            .records
+            .into_iter()
+            .next()
+            .ok_or_else(|| to_mcp_error(invalid_input("Workspace not found")))
+    }
+
+    async fn execute_stream_switch(
+        &self,
+        stream_name: String,
+        workspace: Option<String>,
+        preview: bool,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_record = self.current_workspace_record(workspace.as_deref()).await?;
+        let sync_workspace = workspace
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                record_string_field(&workspace_record, "Client")
+                    .or_else(|| record_string_field(&workspace_record, "client"))
+                    .map(str::to_string)
+            });
+        let workspace_name = sync_workspace
+            .clone()
+            .unwrap_or_else(|| "current".to_string());
+
+        let exists = record_string_field(&workspace_record, "Update").is_some()
+            || record_string_field(&workspace_record, "Access").is_some();
+        if !exists {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace_name}' does not exist"
+            ))));
+        }
+
+        let current_stream = record_string_field(&workspace_record, "Stream")
+            .ok_or_else(|| {
+                to_mcp_error(invalid_input(format!(
+                    "Workspace '{workspace_name}' is not stream-based. Cannot switch streams on a classic workspace."
+                )))
+            })?
+            .to_string();
+
+        match self.stream_existence(&stream_name).await? {
+            StreamExistence::Active => {}
+            StreamExistence::Deleted => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Target stream '{stream_name}' has been deleted. Cannot switch to a deleted stream."
+                ))));
+            }
+            StreamExistence::Missing => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Target stream '{stream_name}' does not exist"
+                ))));
+            }
+        }
+
+        let opened = self.opened_files_for_workspace(&workspace_name).await?;
+        if !opened.is_empty() {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Cannot switch stream: workspace '{workspace_name}' has {} open file(s). Revert or submit changes before switching.",
+                opened.len()
+            ))));
+        }
+
+        if preview {
+            let target = self
+                .run_p4(json_invocation(
+                    vec!["stream".to_string(), "-o".to_string(), stream_name.clone()],
+                    None,
+                ))
+                .await?;
+            let first = target.records.first();
+            return Ok(Json(ToolResponse::success(
+                "switch",
+                json!({
+                    "preview": true,
+                    "current_stream": current_stream,
+                    "target_stream": stream_name,
+                    "workspace": workspace_name,
+                    "target_stream_type": first.and_then(|record| record_string_field(record, "Type")),
+                    "target_stream_parent": first.and_then(|record| record_string_field(record, "Parent")),
+                }),
+            )));
+        }
+
+        let mut args = vec![
+            "client".to_string(),
+            "-s".to_string(),
+            "-S".to_string(),
+            stream_name.clone(),
+        ];
+        if let Some(workspace) = workspace {
+            args.push(workspace);
+        }
+        let result = self.run_p4(json_invocation(args, None)).await?;
+        let mut sync_env = P4Env::new();
+        if let Some(workspace) = sync_workspace {
+            sync_env.insert("P4CLIENT".to_string(), workspace);
+        }
+        self.call_p4_tool_with_env(
+            "sync",
+            json_invocation(
+                vec![
+                    "sync".to_string(),
+                    "-k".to_string(),
+                    format!("{stream_name}/..."),
+                ],
+                None,
+            ),
+            sync_env,
+        )
+        .await?;
+
+        Ok(Json(ToolResponse::success(
+            "switch",
+            json!({
+                "message": format!("Workspace '{workspace_name}' switched from '{current_stream}' to stream '{stream_name}'"),
+                "result": output_message(result),
+            }),
+        )))
+    }
+
+    async fn query_workspace_get(
+        &self,
+        workspace_name: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_name =
+            require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+        self.require_existing_workspace(&workspace_name).await?;
+        let invocation = build_workspace_query_invocation("get", Some(&workspace_name), None, 100)
+            .map_err(to_mcp_error)?;
+        let output = self.run_p4(invocation).await?;
+        Ok(Json(ToolResponse::success("get", output_message(output))))
+    }
+
+    async fn query_workspace_type(
+        &self,
+        workspace_name: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_name =
+            require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+        self.require_existing_workspace(&workspace_name).await?;
+        let invocation = build_workspace_query_invocation("type", Some(&workspace_name), None, 100)
+            .map_err(to_mcp_error)?;
+        let output = self.run_p4(invocation).await?;
+        Ok(Json(ToolResponse::success(
+            "type",
+            json!({"workspace_type": workspace_type_from_records(&output.records)}),
+        )))
+    }
+
+    async fn query_workspace_status(
+        &self,
+        workspace_name: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_name =
+            require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+        self.require_existing_workspace(&workspace_name).await?;
+
+        let workspace_spec = self
+            .run_workspace_status_command(
+                json_invocation(vec!["client".into(), "-o".into(), workspace_name], None),
+                None,
+            )
+            .await?;
+        let opened = self
+            .run_workspace_status_command(json_invocation(vec!["opened".into()], None), None)
+            .await?;
+        let out_of_sync = self
+            .run_workspace_status_command(
+                json_invocation(vec!["sync".into(), "-n".into()], None),
+                Some("File(s) up-to-date"),
+            )
+            .await?;
+        let pending_resolves = self
+            .run_workspace_status_command(
+                json_invocation(vec!["resolve".into(), "-n".into()], None),
+                Some("No file(s) to resolve"),
+            )
+            .await?;
+        let synced_changes = self
+            .run_workspace_status_command(
+                json_invocation(vec!["changes".into(), "-m1".into(), "#have".into()], None),
+                None,
+            )
+            .await?;
+
+        Ok(Json(ToolResponse::success(
+            "status",
+            workspace_status_message(
+                &workspace_spec.records,
+                &opened.records,
+                &out_of_sync.records,
+                &pending_resolves.records,
+                &synced_changes.records,
+            ),
+        )))
+    }
+
+    async fn query_stream_parent(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let output = self
+            .run_p4(json_invocation(
+                vec!["stream".into(), "-o".into(), stream_name.into()],
+                None,
+            ))
+            .await?;
+        let parent = output
+            .records
+            .first()
+            .and_then(|record| record.get("Parent"))
+            .cloned()
+            .unwrap_or(json!(null));
+        Ok(Json(ToolResponse::success(action, parent)))
+    }
+
+    async fn query_stream_get(
+        &self,
+        action: &str,
+        stream_name: Option<&str>,
+        view_without_edit: bool,
+        at_change: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let effective_stream = self.resolve_current_stream(stream_name).await?;
+        if at_change.is_none() {
+            self.require_existing_stream(&effective_stream).await?;
+        }
+        let output = self
+            .run_p4(stream_get_invocation(
+                &effective_stream,
+                view_without_edit,
+                at_change,
+            ))
+            .await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn resolve_current_stream(&self, stream_name: Option<&str>) -> McpResult<String> {
+        if let Some(stream_name) = stream_name
+            .map(str::trim)
+            .filter(|stream_name| !stream_name.is_empty())
+        {
+            return Ok(stream_name.to_string());
+        }
+
+        let client = self.run_p4(client_spec_invocation(None)).await?;
+        required_record_field(&client.records, "Stream").map_err(|_| {
+            to_mcp_error(invalid_input(
+                "No stream specified and current workspace is not stream-based",
+            ))
+        })
+    }
+
+    async fn query_stream_children(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let output = self.run_p4(stream_children_invocation(stream_name)).await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn query_stream_get_workspace(
+        &self,
+        action: &str,
+        workspace: Option<&str>,
+        stream_name: Option<&str>,
+        template: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self
+            .run_p4(stream_get_workspace_invocation(
+                workspace,
+                stream_name,
+                template,
+            ))
+            .await?;
+        if let Some(workspace) = workspace
+            && !client_spec_is_existing_workspace(&output.records)
+        {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace}' does not exist"
+            ))));
+        }
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn query_stream_list_workspaces(
+        &self,
+        action: &str,
+        stream_name: Option<&str>,
+        user: Option<&str>,
+        unloaded: bool,
+        max_results: u16,
+    ) -> McpResult<Json<ToolResponse>> {
+        if let Some(stream_name) = stream_name {
+            self.require_existing_stream(stream_name).await?;
+        }
+        let output = self
+            .run_p4(stream_list_workspaces_invocation(
+                stream_name,
+                user,
+                unloaded,
+                max_results,
+            ))
+            .await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
+    async fn query_stream_graph(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let stream = self
+            .run_p4(json_invocation(
+                vec!["stream".into(), "-o".into(), stream_name.into()],
+                None,
+            ))
+            .await?;
+        let children = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-F".into(),
+                    format!("Parent={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        let parent = stream
+            .records
+            .first()
+            .and_then(|record| record.get("Parent"))
+            .cloned()
+            .unwrap_or(json!(null));
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "stream": stream_name,
+                "parent": parent,
+                "children": children.records
+            }),
+        )))
+    }
+
+    async fn query_stream_validate_file(
+        &self,
+        action: &str,
+        workspace: Option<&str>,
+        file_paths: &[String],
+    ) -> McpResult<Json<ToolResponse>> {
+        let client = self.run_p4(client_spec_invocation(workspace)).await?;
+        let stream = required_record_field(&client.records, "Stream").map_err(to_mcp_error)?;
+        let stream_spec = self
+            .run_p4(stream_spec_with_view_invocation(&stream))
+            .await?;
+        let paths = collect_record_strings(&stream_spec.records, "Paths");
+        let ignored = collect_record_strings(&stream_spec.records, "Ignored");
+        let results = file_paths
+            .iter()
+            .map(|file| classify_stream_file(file, &stream, &paths, &ignored))
+            .collect::<Vec<_>>();
+        let all_allowed = results
+            .iter()
+            .all(|result| result.get("allowed").and_then(Value::as_bool) == Some(true));
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "status": "success",
+                "all_allowed": all_allowed,
+                "stream": stream,
+                "workspace": workspace,
+                "file_count": file_paths.len(),
+                "results": results
+            }),
+        )))
+    }
+
+    async fn query_stream_validate_submit(
+        &self,
+        action: &str,
+        workspace: Option<&str>,
+        changelist: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let client = self.run_p4(client_spec_invocation(workspace)).await?;
+        let stream = required_record_field(&client.records, "Stream").map_err(to_mcp_error)?;
+        let opened = self
+            .run_p4(opened_for_stream_validation_invocation(
+                workspace, changelist,
+            ))
+            .await?;
+        let stream_spec = self
+            .run_p4(stream_spec_with_view_invocation(&stream))
+            .await?;
+        let paths = collect_record_strings(&stream_spec.records, "Paths");
+        let ignored = collect_record_strings(&stream_spec.records, "Ignored");
+        let results = opened
+            .records
+            .iter()
+            .filter_map(|record| record.get("depotFile").and_then(Value::as_str))
+            .map(|file| classify_stream_file(file, &stream, &paths, &ignored))
+            .collect::<Vec<_>>();
+        let submittable = results
+            .iter()
+            .all(|result| result.get("allowed").and_then(Value::as_bool) == Some(true));
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "status": "success",
+                "submittable": submittable,
+                "stream": stream,
+                "workspace": workspace,
+                "file_count": results.len(),
+                "results": results
+            }),
+        )))
+    }
+
+    async fn query_stream_check_resolve(
+        &self,
+        action: &str,
+        stream_name: &str,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_existing_stream(stream_name).await?;
+        let preview = self.run_p4(stream_resolve_preview_invocation()).await?;
+        Ok(Json(ToolResponse::success(
+            action,
+            json!({
+                "status": "success",
+                "resolve_needed": !preview.records.is_empty(),
+                "stream": stream_name,
+                "conflicts": preview.records
+            }),
+        )))
+    }
+
+    async fn query_stream_interchanges(
+        &self,
+        action: &str,
+        stream_name: &str,
+        reverse: bool,
+        file_paths: &[String],
+        long_output: bool,
+        limit: Option<u16>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let client = self.run_p4(client_spec_invocation(None)).await?;
+        let workspace_stream = required_workspace_stream(&client.records).map_err(to_mcp_error)?;
+        self.require_existing_stream(stream_name).await?;
+        let output = self
+            .run_p4(interchanges_invocation(
+                stream_name,
+                reverse,
+                file_paths,
+                long_output,
+            ))
+            .await?;
+        let changelists = match limit {
+            Some(limit) => output.records.into_iter().take(limit as usize).collect(),
+            None => output.records,
+        };
+        let message =
+            stream_interchanges_message(stream_name, &workspace_stream, reverse, changelists.len());
+        let source_stream = if reverse {
+            workspace_stream.clone()
+        } else {
+            stream_name.to_string()
+        };
+        let message = json!({
+            "changelists": changelists,
+            "count": message.0,
+            "source_stream": source_stream,
+            "workspace_stream": workspace_stream,
+            "direction": if reverse { "reverse" } else { "forward" },
+            "message": message.1
+        });
+        Ok(Json(ToolResponse::success(action, message)))
+    }
+
+    async fn require_existing_stream(&self, stream_name: &str) -> McpResult<()> {
+        let active = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if !active.records.is_empty() {
+            return Ok(());
+        }
+
+        let including_deleted = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-a".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if including_deleted.records.is_empty() {
+            return Err(to_mcp_error(invalid_input(format!(
+                "stream does not exist: {stream_name}"
+            ))));
+        }
+
+        Ok(())
+    }
+
+    async fn run_workspace_status_command(
+        &self,
+        invocation: P4Invocation,
+        benign_empty_message: Option<&str>,
+    ) -> McpResult<P4CommandOutput> {
+        let env = self.p4_env().await;
+        match self.executor.run(invocation, env).await {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                if benign_empty_message.is_some_and(|message| error.to_string().contains(message)) {
+                    Ok(empty_p4_output())
+                } else {
+                    Err(to_mcp_error(error))
+                }
+            }
+        }
+    }
+
+    async fn require_write_approval(
+        &self,
+        channel: ApprovalChannel,
+        request: ApprovalRequest,
+        approval_token: Option<&str>,
+    ) -> McpResult<Option<Json<ToolResponse>>> {
+        match self
+            .approval_gate
+            .approve(channel, request, approval_token)
+            .await
+            .map_err(to_mcp_error)?
+        {
+            ApprovalDecision::Approved => Ok(None),
+            ApprovalDecision::Response(response) => Ok(Some(Json(response))),
+        }
+    }
+
+    async fn modify_files_inner(
+        &self,
+        params: ModifyFilesParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Files, "modify_files")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        let invocations = if params.action == FileModifyAction::Move {
+            build_file_move_invocations(&params).map_err(to_mcp_error)?
+        } else {
+            vec![build_file_modify_invocation(&params).map_err(to_mcp_error)?]
+        };
+        let request = self.modify_files_approval_request(&params, &invocations);
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        if params.action == FileModifyAction::Sync {
+            let invocation = invocations
+                .into_iter()
+                .next()
+                .expect("sync builds exactly one invocation");
+            return self
+                .call_p4_tool_with_benign_success(
+                    action,
+                    invocation,
+                    "File(s) up-to-date",
+                    json!("Workspace is already up-to-date"),
+                )
+                .await;
+        }
+        if params.action == FileModifyAction::Move {
+            return self.call_p4_sequence_tool(action, invocations).await;
+        }
+        let invocation = invocations
+            .into_iter()
+            .next()
+            .expect("non-move file action builds exactly one invocation");
+        self.call_p4_tool(action, invocation).await
+    }
+
+    fn modify_files_approval_request(
+        &self,
+        params: &ModifyFilesParams,
+        invocations: &[P4Invocation],
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let targets = modify_files_targets(params);
+        let action = params.action.as_str().to_string();
+
+        ApprovalRequest {
+            tool: "modify_files".to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify files params serialize to JSON"),
+            preview: self.p4_file_approval_preview(
+                &action,
+                targets,
+                Some(params.changelist.clone()),
+                invocations,
+            ),
+        }
+    }
+
+    async fn modify_changelists_inner(
+        &self,
+        params: ModifyChangelistsParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Changelists, "modify_changelists")
+            .map_err(to_mcp_error)?;
+
+        let action = params.action.as_str().to_string();
+        let changelist_id = match params.action {
+            ChangelistModifyAction::Create => Some("new".to_string()),
+            ChangelistModifyAction::Update
+            | ChangelistModifyAction::Submit
+            | ChangelistModifyAction::Delete
+            | ChangelistModifyAction::MoveFiles => Some(required_option(
+                params.changelist_id.as_deref(),
+                "changelist_id",
+                &action,
+            )?),
+        };
+        let description = match params.action {
+            ChangelistModifyAction::Create | ChangelistModifyAction::Update => Some(
+                required_option(params.description.as_deref(), "description", &action)?,
+            ),
+            ChangelistModifyAction::Submit
+            | ChangelistModifyAction::Delete
+            | ChangelistModifyAction::MoveFiles => None,
+        };
+        let stdin = match params.action {
+            ChangelistModifyAction::Create => Some(change_form(
+                description
+                    .as_deref()
+                    .expect("create description was required"),
+                &[],
+            )),
+            ChangelistModifyAction::Update => {
+                Some("Description:\n\tapproval preview placeholder\n".to_string())
+            }
+            ChangelistModifyAction::Submit
+            | ChangelistModifyAction::Delete
+            | ChangelistModifyAction::MoveFiles => None,
+        };
+        let invocation =
+            build_changelist_modify_invocation(&params, stdin).map_err(to_mcp_error)?;
+        let request = self.modify_changelists_approval_request(
+            &params,
+            P4ApprovalContext {
+                tool: "modify_changelists",
+                action: &action,
+                targets: changelist_modify_targets(&params, changelist_id.as_deref()),
+                changelist: changelist_id.clone(),
+                workspace: None,
+                stream: None,
+                invocation: &invocation,
+            },
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+
+        let invocation = if params.action == ChangelistModifyAction::Update {
+            let changelist_id = changelist_id.expect("update changelist id was required");
+            let output = self
+                .run_p4(text_invocation(vec![
+                    "change".to_string(),
+                    "-o".to_string(),
+                    changelist_id,
+                ]))
+                .await?;
+            let existing = output
+                .text
+                .get("stdout")
+                .and_then(Value::as_str)
+                .ok_or_else(|| to_mcp_error(invalid_input("p4 change -o did not return stdout")))?;
+            let patched = patch_change_description_form(
+                existing,
+                description
+                    .as_deref()
+                    .expect("update description was required"),
+            )
+            .map_err(to_mcp_error)?;
+            build_changelist_modify_invocation(&params, Some(patched)).map_err(to_mcp_error)?
+        } else {
+            invocation
+        };
+        self.call_p4_tool(&action, invocation).await
+    }
+
+    async fn modify_shelves_inner(
+        &self,
+        params: ModifyShelvesParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Shelves, "modify_shelves")
+            .map_err(to_mcp_error)?;
+        let invocation = build_shelf_modify_invocation(&params).map_err(to_mcp_error)?;
+        let action = params.action.as_str().to_string();
+        let request = self.modify_shelves_approval_request(
+            &params,
+            P4ApprovalContext {
+                tool: "modify_shelves",
+                action: &action,
+                targets: shelf_modify_targets(&params),
+                changelist: Some(params.changelist_id.clone()),
+                workspace: None,
+                stream: None,
+                invocation: &invocation,
+            },
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&action, invocation).await
+    }
+
+    async fn modify_workspaces_inner(
+        &self,
+        params: ModifyWorkspacesParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Workspaces, "modify_workspaces")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str().to_string();
+        let command = build_workspace_modify_command(&params).map_err(to_mcp_error)?;
+        let request = match &command {
+            WorkspaceModifyCommand::Create { workspace_name }
+            | WorkspaceModifyCommand::Update { workspace_name }
+            | WorkspaceModifyCommand::Switch { workspace_name } => self
+                .modify_workspaces_context_approval_request(
+                    &params,
+                    &action,
+                    workspace_name.clone(),
+                ),
+            WorkspaceModifyCommand::Delete(invocation) => {
+                let workspace_name =
+                    required_workspace_name(&params.workspace_name, params.action.as_str())
+                        .map_err(to_mcp_error)?;
+                self.modify_workspaces_approval_request(
+                    &params,
+                    P4ApprovalContext {
+                        tool: "modify_workspaces",
+                        action: &action,
+                        targets: vec![workspace_name.clone()],
+                        changelist: None,
+                        workspace: Some(workspace_name),
+                        stream: None,
+                        invocation,
+                    },
+                )
+            }
+        };
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        match command {
+            WorkspaceModifyCommand::Create { workspace_name } => {
+                self.execute_workspace_create(&params, workspace_name).await
+            }
+            WorkspaceModifyCommand::Update { workspace_name } => {
+                self.execute_workspace_update(&params, workspace_name).await
+            }
+            WorkspaceModifyCommand::Delete(invocation) => {
+                self.call_p4_tool(&action, invocation).await
+            }
+            WorkspaceModifyCommand::Switch { workspace_name } => {
+                self.execute_workspace_switch(workspace_name).await
+            }
+        }
+    }
+
+    async fn execute_workspace_create(
+        &self,
+        params: &ModifyWorkspacesParams,
+        workspace_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self
+            .run_p4(text_invocation(vec![
+                "client".to_string(),
+                "-o".to_string(),
+                workspace_name,
+            ]))
+            .await?;
+        let existing = output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 client -o did not return stdout")))?;
+        let patched =
+            patch_workspace_form(existing, &workspace_form_patch(params)).map_err(to_mcp_error)?;
+        self.call_p4_tool(
+            "create",
+            json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched)),
+        )
+        .await
+    }
+
+    async fn execute_workspace_update(
+        &self,
+        params: &ModifyWorkspacesParams,
+        workspace_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let _info = self
+            .run_p4(json_invocation(vec!["info".to_string()], None))
+            .await?;
+        let output = self
+            .run_p4(text_invocation(vec![
+                "client".to_string(),
+                "-o".to_string(),
+                workspace_name,
+            ]))
+            .await?;
+        let existing = output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 client -o did not return stdout")))?;
+        let patched =
+            patch_workspace_form(existing, &workspace_form_patch(params)).map_err(to_mcp_error)?;
+        self.call_p4_tool(
+            "update",
+            json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched)),
+        )
+        .await
+    }
+
+    async fn execute_workspace_switch(
+        &self,
+        workspace_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let _info = self
+            .run_p4(json_invocation(vec!["info".to_string()], None))
+            .await?;
+        let output = self
+            .run_p4(text_invocation(vec![
+                "client".to_string(),
+                "-o".to_string(),
+                workspace_name.clone(),
+            ]))
+            .await?;
+        let existing = output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 client -o did not return stdout")))?;
+        if !form_has_non_empty_field(existing, "Update")
+            && !form_has_non_empty_field(existing, "Access")
+        {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace_name}' does not exist"
+            ))));
+        }
+
+        self.set_active_client(workspace_name.clone()).await;
+        Ok(Json(ToolResponse::success(
+            "switch",
+            json!(format!("Switched to workspace '{workspace_name}'")),
+        )))
+    }
+
+    async fn modify_jobs_inner(
+        &self,
+        params: ModifyJobsParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Jobs, "modify_jobs")
+            .map_err(to_mcp_error)?;
+        let invocation = build_job_modify_invocation(&params).map_err(to_mcp_error)?;
+        let action = params.action.as_str().to_string();
+        let request = self.modify_jobs_approval_request(
+            &params,
+            P4ApprovalContext {
+                tool: "modify_jobs",
+                action: &action,
+                targets: vec![
+                    format!("job:{}", params.job_id),
+                    format!("changelist:{}", params.changelist_id),
+                ],
+                changelist: Some(params.changelist_id.clone()),
+                workspace: None,
+                stream: None,
+                invocation: &invocation,
+            },
+        );
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        self.call_p4_tool(&action, invocation).await
+    }
+
+    async fn modify_streams_inner(
+        &self,
+        params: ModifyStreamsParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Streams, "modify_streams")
+            .map_err(to_mcp_error)?;
+        reject_update_create_only_fields(&params).map_err(to_mcp_error)?;
+        let action = params.action.as_str().to_string();
+        let command = build_stream_modify_command(&params).map_err(to_mcp_error)?;
+        let preview_invocations = match &command {
+            StreamModifyCommand::Single(invocation) => vec![invocation.clone()],
+            StreamModifyCommand::Create { stream_name } => vec![json_invocation(
+                vec!["stream".to_string(), "-i".to_string()],
+                Some(format!(
+                    "Stream: {stream_name}\n\n<patched after approval>\n"
+                )),
+            )],
+            StreamModifyCommand::Update { stream_name } => {
+                let mut invocations = vec![json_invocation(
+                    vec!["stream".to_string(), "-i".to_string()],
+                    Some(format!(
+                        "Stream: {stream_name}\n\n<patched after approval>\n"
+                    )),
+                )];
+                if let Some(parent_view) =
+                    normalized_parent_view(params.parent_view.as_deref()).map_err(to_mcp_error)?
+                {
+                    invocations.push(json_invocation(
+                        vec![
+                            "stream".to_string(),
+                            "parentview".to_string(),
+                            format!("--{parent_view}"),
+                            stream_name.clone(),
+                        ],
+                        None,
+                    ));
+                }
+                invocations
+            }
+            StreamModifyCommand::Switch {
+                stream_name,
+                workspace,
+                preview,
+            } => {
+                if *preview {
+                    vec![json_invocation(
+                        vec!["stream".to_string(), "-o".to_string(), stream_name.clone()],
+                        None,
+                    )]
+                } else {
+                    let mut switch_args = vec![
+                        "client".to_string(),
+                        "-s".to_string(),
+                        "-S".to_string(),
+                        stream_name.clone(),
+                    ];
+                    if let Some(workspace) = workspace {
+                        switch_args.push(workspace.clone());
+                    }
+                    vec![
+                        json_invocation(switch_args, None),
+                        json_invocation(
+                            vec![
+                                "sync".to_string(),
+                                "-k".to_string(),
+                                format!("{stream_name}/..."),
+                            ],
+                            None,
+                        ),
+                    ]
+                }
+            }
+            StreamModifyCommand::CreateWorkspace {
+                stream_name,
+                workspace_name,
+                root,
+            } => vec![json_invocation(
+                vec!["client".to_string(), "-i".to_string()],
+                Some(format!(
+                    "Client: {workspace_name}\nStream: {stream_name}\nRoot: {root}\n\n<patched after approval>\n"
+                )),
+            )],
+        };
+        let request = self.modify_streams_approval_request(&params, &preview_invocations);
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        match command {
+            StreamModifyCommand::Single(invocation) => self.call_p4_tool(&action, invocation).await,
+            StreamModifyCommand::Create { stream_name } => {
+                self.execute_stream_create(&params, stream_name).await
+            }
+            StreamModifyCommand::Update { stream_name } => {
+                self.execute_stream_update(&params, stream_name).await
+            }
+            StreamModifyCommand::Switch {
+                stream_name,
+                workspace,
+                preview,
+            } => {
+                self.execute_stream_switch(stream_name, workspace, preview)
+                    .await
+            }
+            StreamModifyCommand::CreateWorkspace {
+                stream_name,
+                workspace_name,
+                root,
+            } => {
+                let existing = self
+                    .run_p4(text_invocation(vec![
+                        "client".to_string(),
+                        "-o".to_string(),
+                        workspace_name.clone(),
+                    ]))
+                    .await?;
+                let existing_form = existing
+                    .text
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        to_mcp_error(invalid_input("p4 client -o did not return stdout"))
+                    })?;
+                if form_has_non_empty_field(existing_form, "Update") {
+                    return Err(to_mcp_error(invalid_input(format!(
+                        "Workspace '{workspace_name}' already exists. Use a different name."
+                    ))));
+                }
+
+                let current = self
+                    .run_p4(text_invocation(vec![
+                        "client".to_string(),
+                        "-o".to_string(),
+                        "-S".to_string(),
+                        stream_name.clone(),
+                        workspace_name.clone(),
+                    ]))
+                    .await?;
+                let current_form = current
+                    .text
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        to_mcp_error(invalid_input("p4 client -o did not return stdout"))
+                    })?;
+                let patch = StreamWorkspaceFormPatch {
+                    client: Some(workspace_name),
+                    root: Some(root),
+                    stream: Some(stream_name),
+                    description: params.description.clone(),
+                    options: params.options.clone(),
+                    host: params.host.clone(),
+                    alt_roots: params.alt_roots.clone(),
+                };
+                let patched =
+                    patch_stream_workspace_form(current_form, &patch).map_err(to_mcp_error)?;
+                self.call_p4_tool(
+                    &action,
+                    json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched)),
+                )
+                .await
+            }
+        }
+    }
+
+    fn modify_changelists_approval_request(
+        &self,
+        params: &ModifyChangelistsParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify changelists params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_shelves_approval_request(
+        &self,
+        params: &ModifyShelvesParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify shelves params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_workspaces_approval_request(
+        &self,
+        params: &ModifyWorkspacesParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify workspaces params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_workspaces_context_approval_request(
+        &self,
+        params: &ModifyWorkspacesParams,
+        action: &str,
+        workspace_name: String,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: "modify_workspaces".to_string(),
+            action: action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify workspaces params serialize to JSON"),
+            preview: self.workspace_context_approval_preview(action, workspace_name),
+        }
+    }
+
+    fn modify_jobs_approval_request(
+        &self,
+        params: &ModifyJobsParams,
+        context: P4ApprovalContext<'_>,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify jobs params serialize to JSON"),
+            preview: self.p4_approval_preview(context),
+        }
+    }
+
+    fn modify_streams_approval_request(
+        &self,
+        params: &ModifyStreamsParams,
+        invocations: &[P4Invocation],
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let action = params.action.as_str().to_string();
+        let targets = if matches!(params.action, StreamModifyAction::CreateWorkspace) {
+            named_scope_targets(params.workspace_name.as_deref(), "stream workspace")
+        } else {
+            named_scope_targets(params.stream_name.as_deref(), "stream operation")
+        };
+        let commands: Vec<Vec<String>> = invocations
+            .iter()
+            .map(|invocation| command_preview(&self.config.p4_bin, invocation))
+            .collect();
+        let command = if commands.len() == 1 {
+            commands.first().cloned()
+        } else {
+            None
+        };
+        let commands = if commands.len() > 1 {
+            Some(commands)
+        } else {
+            None
+        };
+
+        ApprovalRequest {
+            tool: "modify_streams".to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify streams params serialize to JSON"),
+            preview: ApprovalPreview {
+                summary: approval_summary(&action, &targets),
+                tool: "modify_streams".to_string(),
+                action,
+                changelist: params.changelist.clone(),
+                workspace: params
+                    .workspace
+                    .clone()
+                    .or_else(|| params.workspace_name.clone()),
+                stream: params.stream_name.clone(),
+                targets,
+                review: None,
+                command,
+                commands,
+                request: None,
+            },
+        }
+    }
+
+    fn p4_approval_preview(&self, context: P4ApprovalContext<'_>) -> ApprovalPreview {
+        let summary = approval_summary(context.action, &context.targets);
+        ApprovalPreview {
+            summary,
+            tool: context.tool.to_string(),
+            action: context.action.to_string(),
+            targets: context.targets,
+            changelist: context.changelist,
+            workspace: context.workspace,
+            stream: context.stream,
+            review: None,
+            command: Some(command_preview(&self.config.p4_bin, context.invocation)),
+            commands: None,
+            request: None,
+        }
+    }
+
+    fn workspace_context_approval_preview(
+        &self,
+        action: &str,
+        workspace_name: String,
+    ) -> ApprovalPreview {
+        let targets = vec![workspace_name.clone()];
+        ApprovalPreview {
+            summary: approval_summary(action, &targets),
+            tool: "modify_workspaces".to_string(),
+            action: action.to_string(),
+            targets,
+            changelist: None,
+            workspace: Some(workspace_name),
+            stream: None,
+            review: None,
+            command: None,
+            commands: None,
+            request: None,
+        }
+    }
+
+    fn p4_file_approval_preview(
+        &self,
+        action: &str,
+        targets: Vec<String>,
+        changelist: Option<String>,
+        invocations: &[P4Invocation],
+    ) -> ApprovalPreview {
+        let commands: Vec<Vec<String>> = invocations
+            .iter()
+            .map(|invocation| command_preview(&self.config.p4_bin, invocation))
+            .collect();
+        let command = if commands.len() == 1 {
+            commands.first().cloned()
+        } else {
+            None
+        };
+        let commands = if commands.len() > 1 {
+            Some(commands)
+        } else {
+            None
+        };
+
+        ApprovalPreview {
+            summary: approval_summary(action, &targets),
+            tool: "modify_files".to_string(),
+            action: action.to_string(),
+            targets,
+            changelist,
+            workspace: None,
+            stream: None,
+            review: None,
+            command,
+            commands,
+            request: None,
+        }
+    }
+
+    async fn modify_reviews_inner(
+        &self,
+        params: ModifyReviewsParams,
+        channel: ApprovalChannel,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Write, Toolset::Reviews, "modify_reviews")
+            .map_err(to_mcp_error)?;
+        let built = params.to_http(None).map_err(to_mcp_error)?;
+        let request = self.modify_reviews_approval_request(&params, &built);
+        if let Some(response) = self
+            .require_write_approval(channel, request, params.approval_token.as_deref())
+            .await?
+        {
+            return Ok(response);
+        }
+        let action = review_modify_action_name(&params);
+        let client = self.review_http_client_from_p4().await?;
+        let built = params
+            .to_http(Some(client.username()))
+            .map_err(to_mcp_error)?;
+        let message = client
+            .execute_approved(built)
+            .await
+            .map_err(review_api_error)?;
+        Ok(Json(ToolResponse::success(&action, message)))
+    }
+
+    fn modify_reviews_approval_request(
+        &self,
+        params: &ModifyReviewsParams,
+        built: &BuiltReviewRequest,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+        let action = review_modify_action_name(params);
+        let review = params.review_id.map(|review_id| review_id.to_string());
+        let targets = review
+            .as_ref()
+            .map(|review| vec![format!("review:{review}")])
+            .unwrap_or_else(|| vec![review_target_from_path(&built.path)]);
+
+        ApprovalRequest {
+            tool: "modify_reviews".to_string(),
+            action: action.clone(),
+            params: serde_json::to_value(approval_params).expect("review params serialize to JSON"),
+            preview: ApprovalPreview {
+                summary: review_approval_summary(&action, built),
+                tool: "modify_reviews".to_string(),
+                action,
+                targets,
+                changelist: None,
+                workspace: None,
+                stream: None,
+                review,
+                command: None,
+                commands: None,
+                request: Some(HttpPreview {
+                    method: built.method.clone(),
+                    path: built.path.clone(),
+                }),
+            },
+        }
+    }
+}
+
+type McpResult<T> = std::result::Result<T, ErrorData>;
+
+#[tool_router]
+impl P4McpServer {
+    #[tool(
+        description = "Query Perforce server metadata",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_server(
+        &self,
+        Parameters(params): Parameters<QueryServerParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let invocation = build_server_invocation(&params);
+        let output = self.run_p4(invocation).await?;
+        Ok(Json(ToolResponse::success(
+            "query_server",
+            Value::Array(output.records),
+        )))
+    }
+
+    async fn query_files_search(&self, params: QueryFilesParams) -> McpResult<Json<ToolResponse>> {
+        let mut records = Vec::new();
+        let invocations = build_file_search_invocations(&params).map_err(to_mcp_error)?;
+
+        for invocation in invocations {
+            let env = self.p4_env().await;
+            match self.executor.run(invocation, env).await {
+                Ok(output) => records.extend(output.records),
+                Err(error) if is_no_such_file_error(&error) => {}
+                Err(error) => return Err(to_mcp_error(error)),
+            }
+        }
+
+        records.truncate(params.max_results as usize);
+        Ok(Json(ToolResponse::success("search", Value::Array(records))))
+    }
+
+    #[tool(
+        description = "Query Perforce files",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_files(
+        &self,
+        Parameters(params): Parameters<QueryFilesParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Files, "query_files")
+            .map_err(to_mcp_error)?;
+        if params.action == FileQueryAction::Search {
+            return self.query_files_search(params).await;
+        }
+
+        let action = params.action.as_str();
+        let grep_max_results =
+            (params.action == FileQueryAction::Grep).then_some(params.max_results as usize);
+        let invocation = build_file_invocation(&params).map_err(to_mcp_error)?;
+        let output = self.run_p4(invocation).await?;
+        let message = if let Some(max_results) = grep_max_results {
+            output_message_with_record_limit(output, max_results)
+        } else {
+            output_message(output)
+        };
+        Ok(Json(ToolResponse::success(action, message)))
+    }
+
+    #[tool(
+        description = "Modify Perforce files",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn modify_files(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyFilesParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_files_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+
+    #[tool(
+        description = "Get changelist information or list changelists",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_changelists(
+        &self,
+        Parameters(params): Parameters<QueryChangelistsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Changelists, "query_changelists")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        let invocation = build_changelist_query_invocation(
+            action,
+            params.changelist_id.as_deref(),
+            params.status.as_deref(),
+            params.workspace_name.as_deref(),
+            params.user.as_deref(),
+            params.depot_path.as_deref(),
+            params.max_results,
+        )
+        .map_err(to_mcp_error)?;
+        self.call_p4_tool(action, invocation).await
+    }
+
+    #[tool(
+        description = "Create, update, submit, or delete changelists",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn modify_changelists(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyChangelistsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_changelists_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+
+    #[tool(
+        description = "List shelves, show shelf diff, or list shelf files",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_shelves(
+        &self,
+        Parameters(params): Parameters<QueryShelvesParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Shelves, "query_shelves")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        let invocation = build_shelf_query_invocation(
+            action,
+            params.changelist_id.as_deref(),
+            params.user.as_deref(),
+            params.max_results,
+        )
+        .map_err(to_mcp_error)?;
+        self.call_p4_tool(action, invocation).await
+    }
+
+    #[tool(
+        description = "Shelve, unshelve, or delete shelved files",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn modify_shelves(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyShelvesParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_shelves_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+
+    #[tool(
+        description = "List, get, classify, or inspect workspace status",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_workspaces(
+        &self,
+        Parameters(params): Parameters<QueryWorkspacesParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Workspaces, "query_workspaces")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        if action == "get" {
+            return self
+                .query_workspace_get(params.workspace_name.as_deref())
+                .await;
+        }
+        if action == "type" {
+            return self
+                .query_workspace_type(params.workspace_name.as_deref())
+                .await;
+        }
+        if action == "status" {
+            return self
+                .query_workspace_status(params.workspace_name.as_deref())
+                .await;
+        }
+        let invocation = build_workspace_query_invocation(
+            action,
+            params.workspace_name.as_deref(),
+            params.user.as_deref(),
+            params.max_results,
+        )
+        .map_err(to_mcp_error)?;
+        self.call_p4_tool(action, invocation).await
+    }
+
+    #[tool(
+        description = "Create, update, or delete workspaces using p4 client forms",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn modify_workspaces(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyWorkspacesParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_workspaces_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+
+    #[tool(
+        description = "List or get jobs and fixes",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_jobs(
+        &self,
+        Parameters(params): Parameters<QueryJobsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Jobs, "query_jobs")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        let invocation = build_job_query_invocation(
+            action,
+            params.changelist_id.as_deref(),
+            params.job_id.as_deref(),
+            params.max_results,
+        )
+        .map_err(to_mcp_error)?;
+        self.call_p4_tool(action, invocation).await
+    }
+
+    #[tool(
+        description = "Attach or detach jobs from changelists",
+        annotations(read_only_hint = false)
+    )]
+    pub async fn modify_jobs(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyJobsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_jobs_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+
+    #[tool(
+        description = "List streams, get stream specs, graph streams, validate stream files, check stream resolves, and inspect stream integration status",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_streams(
+        &self,
+        Parameters(params): Parameters<QueryStreamsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Streams, "query_streams")
+            .map_err(to_mcp_error)?;
+        let action = params.action.as_str();
+        let command = build_stream_query_command(&params).map_err(to_mcp_error)?;
+        match command {
+            StreamQueryCommand::Single(invocation) => self.call_p4_tool(action, invocation).await,
+            StreamQueryCommand::Get {
+                stream_name,
+                view_without_edit,
+                at_change,
+            } => {
+                self.query_stream_get(
+                    action,
+                    stream_name.as_deref(),
+                    view_without_edit,
+                    at_change.as_deref(),
+                )
+                .await
+            }
+            StreamQueryCommand::Children { stream_name } => {
+                self.query_stream_children(action, &stream_name).await
+            }
+            StreamQueryCommand::Parent { stream_name } => {
+                self.query_stream_parent(action, &stream_name).await
+            }
+            StreamQueryCommand::Graph { stream_name } => {
+                self.query_stream_graph(action, &stream_name).await
+            }
+            StreamQueryCommand::ValidateFile {
+                workspace,
+                file_paths,
+            } => {
+                self.query_stream_validate_file(action, workspace.as_deref(), &file_paths)
+                    .await
+            }
+            StreamQueryCommand::ValidateSubmit {
+                workspace,
+                changelist,
+            } => {
+                self.query_stream_validate_submit(
+                    action,
+                    workspace.as_deref(),
+                    changelist.as_deref(),
+                )
+                .await
+            }
+            StreamQueryCommand::CheckResolve { stream_name } => {
+                self.query_stream_check_resolve(action, &stream_name).await
+            }
+            StreamQueryCommand::Interchanges {
+                stream_name,
+                reverse,
+                file_paths,
+                long_output,
+                limit,
+            } => {
+                self.query_stream_interchanges(
+                    action,
+                    &stream_name,
+                    reverse,
+                    &file_paths,
+                    long_output,
+                    limit,
+                )
+                .await
+            }
+            StreamQueryCommand::GetWorkspace {
+                workspace,
+                stream_name,
+                template,
+            } => {
+                self.query_stream_get_workspace(
+                    action,
+                    workspace.as_deref(),
+                    stream_name.as_deref(),
+                    template.as_deref(),
+                )
+                .await
+            }
+            StreamQueryCommand::ListWorkspaces {
+                stream_name,
+                user,
+                unloaded,
+                max_results,
+            } => {
+                self.query_stream_list_workspaces(
+                    action,
+                    stream_name.as_deref(),
+                    user.as_deref(),
+                    unloaded,
+                    max_results,
+                )
+                .await
+            }
+        }
+    }
+
+    #[tool(
+        description = "Create, update, or delete stream specs",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn modify_streams(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyStreamsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_streams_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+
+    #[tool(
+        description = "Query P4 Code Review / Swarm reviews",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn query_reviews(
+        &self,
+        Parameters(params): Parameters<QueryReviewsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.policy()
+            .check(Access::Read, Toolset::Reviews, "query_reviews")
+            .map_err(to_mcp_error)?;
+        let built = params.to_http().map_err(to_mcp_error)?;
+        let action = review_query_action_name(&params);
+        let client = self.review_http_client_from_p4().await?;
+        let message = client.execute(built).await.map_err(review_api_error)?;
+        Ok(Json(ToolResponse::success(&action, message)))
+    }
+
+    #[tool(
+        description = "Modify P4 Code Review / Swarm reviews",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    pub async fn modify_reviews(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ModifyReviewsParams>,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.modify_reviews_inner(params, ApprovalChannel::Elicitation(peer))
+            .await
+    }
+}
+
+#[tool_handler(
+    name = "p4-mcp-server",
+    version = "0.1.0",
+    instructions = "MCP server for Perforce P4."
+)]
+impl ServerHandler for P4McpServer {}
+
+pub async fn run_from_cli() -> Result<()> {
+    let config = Cli::parse().into_config()?;
+    let _logging_guard = init_logging(config.log_dir.as_deref())?;
+
+    match config.transport {
+        TransportMode::Stdio => run_stdio(config).await,
+        TransportMode::Http => run_http(config).await,
+    }
+}
+
+pub async fn run_stdio(config: AppConfig) -> Result<()> {
+    let service = P4McpServer::new(config)
+        .serve(rmcp::transport::stdio())
+        .await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+pub async fn run_http(config: AppConfig) -> Result<()> {
+    let host = config.host;
+    let port = config.port;
+    let config = Arc::new(config);
+    let ct = CancellationToken::new();
+    let service: StreamableHttpService<P4McpServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(P4McpServer::new((*config).clone())),
+            Default::default(),
+            StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+        );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let addr = (host, port);
+    let listener = TcpListener::bind(addr).await?;
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            ct.cancel();
+        })
+        .await?;
+    Ok(())
+}
+
+fn output_message(output: P4CommandOutput) -> Value {
+    if output.records.is_empty() {
+        output.text
+    } else {
+        Value::Array(output.records)
+    }
+}
+
+fn workspace_type_from_records(records: &[Value]) -> &'static str {
+    if records
+        .iter()
+        .any(|record| non_empty_string_field(record, "Stream").is_some())
+    {
+        return "stream";
+    }
+
+    if records.iter().any(record_has_depot_view) {
+        return "standard";
+    }
+
+    "custom"
+}
+
+fn workspace_status_message(
+    _workspace_spec: &[Value],
+    opened: &[Value],
+    out_of_sync: &[Value],
+    pending_resolves: &[Value],
+    synced_changes: &[Value],
+) -> Value {
+    json!({
+        "opened_files": collect_string_field(opened, "depotFile"),
+        "out_of_sync_files": collect_string_field(out_of_sync, "depotFile"),
+        "sync_warnings": collect_string_values(out_of_sync),
+        "pending_resolves": collect_string_field(pending_resolves, "fromFile"),
+        "last_synced_cl": synced_changes
+            .first()
+            .and_then(|record| non_empty_string_field(record, "change")),
+    })
+}
+
+fn collect_string_field(records: &[Value], field: &str) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|record| non_empty_string_field(record, field))
+        .collect()
+}
+
+fn required_record_field(records: &[Value], field: &str) -> crate::error::Result<String> {
+    records
+        .first()
+        .and_then(|record| non_empty_string_field(record, field))
+        .ok_or_else(|| P4McpError::InvalidInput {
+            message: format!("{field} is required"),
+        })
+}
+
+fn required_workspace_stream(records: &[Value]) -> crate::error::Result<String> {
+    required_record_field(records, "Stream").map_err(|_| P4McpError::InvalidInput {
+        message: "interchanges requires a stream-based workspace".to_string(),
+    })
+}
+
+fn collect_record_strings(records: &[Value], field: &str) -> Vec<String> {
+    let mut values = Vec::new();
+
+    for record in records {
+        if let Some(value) = record.get(field) {
+            push_record_strings(value, &mut values);
+        }
+
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        let mut indexed = object
+            .iter()
+            .filter_map(|(key, value)| {
+                let suffix = key.strip_prefix(field)?;
+                if suffix.is_empty() {
+                    return None;
+                }
+                Some((suffix.parse::<usize>().ok(), suffix.to_string(), value))
+            })
+            .collect::<Vec<_>>();
+        indexed.sort_by(
+            |(left_index, left_suffix, _), (right_index, right_suffix, _)| match (
+                left_index,
+                right_index,
+            ) {
+                (Some(left), Some(right)) => left.cmp(right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left_suffix.cmp(right_suffix),
+            },
+        );
+        for (_, _, value) in indexed {
+            push_record_strings(value, &mut values);
+        }
+    }
+
+    values
+}
+
+fn push_record_strings(value: &Value, values: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            values.extend(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        Value::String(value) => {
+            let value = value.trim();
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stream_interchanges_message(
+    stream_name: &str,
+    workspace_stream: &str,
+    reverse: bool,
+    count: usize,
+) -> (usize, String) {
+    if count == 0 {
+        return (
+            count,
+            format!(
+                "Streams are in sync; no outstanding changelists between '{stream_name}' and '{workspace_stream}'"
+            ),
+        );
+    }
+
+    let message = if reverse {
+        format!(
+            "{count} outstanding changelist(s) in '{workspace_stream}' not yet propagated to '{stream_name}'"
+        )
+    } else {
+        format!(
+            "{count} outstanding changelist(s) in '{stream_name}' not yet merged into '{workspace_stream}'"
+        )
+    };
+
+    (count, message)
+}
+
+fn stream_rule_result(path_type: &str) -> (bool, String) {
+    match path_type {
+        "exclude" => (false, "excluded".to_string()),
+        "import" => (false, "import_readonly".to_string()),
+        "share" | "isolate" | "import+" => (true, path_type.to_string()),
+        other => (false, other.to_string()),
+    }
+}
+
+fn p4_pattern_matches(pattern: &str, file: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("/...") {
+        return file == prefix || file.starts_with(&format!("{prefix}/"));
+    }
+    wildcard_match(pattern.as_bytes(), file.as_bytes())
+}
+
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern.starts_with(b"...") {
+        return wildcard_match(&pattern[3..], text)
+            || (!text.is_empty() && wildcard_match(pattern, &text[1..]));
+    }
+    if pattern[0] == b'*' {
+        return wildcard_match(&pattern[1..], text)
+            || (!text.is_empty() && text[0] != b'/' && wildcard_match(pattern, &text[1..]));
+    }
+    if text.first() == Some(&pattern[0]) {
+        return wildcard_match(&pattern[1..], &text[1..]);
+    }
+    false
+}
+
+fn stream_pattern_matches(file: &str, stream: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let depot_pattern = if pattern.starts_with("//") {
+        pattern.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            stream.trim_end_matches('/'),
+            pattern.trim_start_matches('/')
+        )
+    };
+    p4_pattern_matches(&depot_pattern, file)
+}
+
+fn classify_stream_file(file: &str, stream: &str, paths: &[String], ignored: &[String]) -> Value {
+    if ignored
+        .iter()
+        .any(|pattern| stream_pattern_matches(file, stream, pattern))
+    {
+        return json!({
+            "file": file,
+            "allowed": false,
+            "rule": "ignored"
+        });
+    }
+
+    let mut matched_rule = None;
+    for path in paths {
+        let mut parts = path.split_whitespace();
+        let path_type = parts.next().unwrap_or_default();
+        let pattern = parts.next().unwrap_or_default();
+        if stream_pattern_matches(file, stream, pattern) {
+            matched_rule = Some(stream_rule_result(path_type));
+        }
+    }
+
+    if let Some((allowed, rule)) = matched_rule {
+        return json!({
+            "file": file,
+            "allowed": allowed,
+            "rule": rule
+        });
+    }
+
+    json!({
+        "file": file,
+        "allowed": false,
+        "rule": "outside_view"
+    })
+}
+
+fn collect_string_values(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn empty_p4_output() -> P4CommandOutput {
+    P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }
+}
+
+fn require_non_blank(value: Option<&str>, name: &str) -> std::result::Result<String, P4McpError> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => Err(invalid_input(format!("{name} is required"))),
+    }
+}
+
+fn record_has_depot_view(record: &Value) -> bool {
+    let Some(object) = record.as_object() else {
+        return false;
+    };
+
+    object.iter().any(|(key, value)| {
+        (key == "View" || key.starts_with("View"))
+            && value.as_str().is_some_and(|view| view.contains("//depot/"))
+    })
+}
+
+fn non_empty_string_field(record: &Value, field: &str) -> Option<String> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn client_spec_is_existing_workspace(records: &[Value]) -> bool {
+    records.first().is_some_and(|record| {
+        non_empty_string_field(record, "Update").is_some()
+            || non_empty_string_field(record, "Access").is_some()
+    })
+}
+
+fn output_message_with_record_limit(mut output: P4CommandOutput, max_records: usize) -> Value {
+    if output.records.is_empty() {
+        output.text
+    } else {
+        output.records.truncate(max_records);
+        Value::Array(output.records)
+    }
+}
+
+fn workspace_form_patch(params: &ModifyWorkspacesParams) -> WorkspaceFormPatch {
+    WorkspaceFormPatch {
+        root: params.workspace_root.clone(),
+        description: params.workspace_description.clone(),
+        options: params.workspace_options.clone(),
+        line_end: params.workspace_line_end.clone(),
+        view: params.workspace_view.clone(),
+    }
+}
+
+fn is_no_such_file_error(error: &P4McpError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("no such file(s)")
+}
+
+fn json_invocation(args: Vec<String>, stdin: Option<String>) -> P4Invocation {
+    P4Invocation {
+        args,
+        stdin,
+        mode: OutputMode::JsonLines,
+    }
+}
+
+fn text_invocation(args: Vec<String>) -> P4Invocation {
+    P4Invocation {
+        args,
+        stdin: None,
+        mode: OutputMode::Text,
+    }
+}
+
+fn modify_files_targets(params: &ModifyFilesParams) -> Vec<String> {
+    let mut targets = Vec::new();
+    if let Some(file_paths) = &params.file_paths {
+        targets.extend(file_paths.iter().cloned());
+    }
+    if let Some(source_paths) = &params.source_paths {
+        targets.extend(source_paths.iter().cloned());
+    }
+    if let Some(target_paths) = &params.target_paths {
+        targets.extend(target_paths.iter().cloned());
+    }
+    targets
+}
+
+fn changelist_targets(changelist_id: &str) -> Vec<String> {
+    vec![format!("changelist:{changelist_id}")]
+}
+
+fn changelist_modify_targets(
+    params: &ModifyChangelistsParams,
+    changelist_id: Option<&str>,
+) -> Vec<String> {
+    let mut targets = changelist_id.map(changelist_targets).unwrap_or_default();
+    if params.action == ChangelistModifyAction::MoveFiles
+        && let Some(file_paths) = &params.file_paths
+    {
+        targets.extend(file_paths.iter().cloned());
+    }
+    targets
+}
+
+fn shelf_targets(changelist_id: &str) -> Vec<String> {
+    vec![format!("shelf:{changelist_id}")]
+}
+
+fn shelf_modify_targets(params: &ModifyShelvesParams) -> Vec<String> {
+    let mut targets = shelf_targets(&params.changelist_id);
+    if let Some(file_paths) = &params.file_paths {
+        targets.extend(file_paths.iter().cloned());
+    }
+    targets
+}
+
+fn named_scope_targets(name: Option<&str>, fallback: &str) -> Vec<String> {
+    match name.filter(|value| !value.trim().is_empty()) {
+        Some(name) => vec![name.to_string()],
+        None => vec![fallback.to_string()],
+    }
+}
+
+fn form_has_non_empty_field(form: &str, field: &str) -> bool {
+    let prefix = format!("{field}:");
+    form.lines().any(|line| {
+        line.strip_prefix(&prefix)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn record_string_field<'a>(record: &'a Value, field: &str) -> Option<&'a str> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn stream_update_is_view_affecting(params: &ModifyStreamsParams) -> bool {
+    params.paths.is_some()
+        || params.remapped.is_some()
+        || params.ignored.is_some()
+        || params
+            .parent_view
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn reject_update_create_only_fields(
+    params: &ModifyStreamsParams,
+) -> std::result::Result<(), P4McpError> {
+    if matches!(params.action, StreamModifyAction::Update) {
+        if params
+            .stream_type
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(invalid_input("stream_type is only supported for create"));
+        }
+        if params
+            .parent
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(invalid_input("parent is only supported for create"));
+        }
+    }
+    Ok(())
+}
+
+fn virtual_stream_default_options(form: &str) -> Option<String> {
+    form.lines()
+        .find_map(|line| line.strip_prefix("Options:"))
+        .map(|options| {
+            options
+                .split_whitespace()
+                .map(|token| match token {
+                    "toparent" => "notoparent",
+                    "fromparent" => "nofromparent",
+                    other => other,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|options| !options.is_empty())
+}
+
+fn normalized_parent_view(parent_view: Option<&str>) -> Result<Option<&str>, P4McpError> {
+    let Some(value) = parent_view.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    match value {
+        "inherit" | "noinherit" => Ok(Some(value)),
+        _ => Err(invalid_input(format!(
+            "invalid parent_view '{value}': expected 'inherit' or 'noinherit'"
+        ))),
+    }
+}
+
+fn remove_stream_parent_view_field(form: &str) -> String {
+    let mut output = String::with_capacity(form.len());
+    for line in form.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let line_without_terminator = line_without_newline
+            .strip_suffix('\r')
+            .unwrap_or(line_without_newline);
+        if !line_without_terminator.starts_with("ParentView:") {
+            output.push_str(line);
+        }
+    }
+    output
+}
+
+fn stream_options_are_locked(form: &str) -> bool {
+    form.lines()
+        .find_map(|line| line.strip_prefix("Options:"))
+        .is_some_and(|options| {
+            let lower = options.to_ascii_lowercase();
+            lower.contains("locked") && !lower.contains("unlocked")
+        })
+}
+
+fn is_valid_stream_type(stream_type: &str) -> bool {
+    matches!(
+        stream_type,
+        "mainline" | "development" | "sparsedev" | "release" | "sparserel" | "task" | "virtual"
+    )
+}
+
+fn is_mainline_stream_type(stream_type: &str) -> bool {
+    stream_type == "mainline"
+}
+
+fn approval_summary(action: &str, targets: &[String]) -> String {
+    if targets.is_empty() {
+        format!("Run p4 {action}")
+    } else {
+        format!("Run p4 {action} on {}", targets.join(", "))
+    }
+}
+
+fn review_query_action_name(params: &QueryReviewsParams) -> String {
+    params.action.as_str().to_string()
+}
+
+fn review_modify_action_name(params: &ModifyReviewsParams) -> String {
+    params.action.as_str().to_string()
+}
+
+fn review_approval_summary(action: &str, built: &BuiltReviewRequest) -> String {
+    let mut summary = format!("Review API {} {}", built.method, built.path);
+    if matches!(action, "join" | "leave") {
+        summary.push_str("; current P4 user resolved after approval");
+    }
+    summary
+}
+
+fn review_target_from_path(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
+fn command_preview(p4_bin: &std::path::Path, invocation: &P4Invocation) -> Vec<String> {
+    let mut command = vec![p4_bin.to_string_lossy().into_owned()];
+    command.extend(invocation.args.iter().cloned());
+    command
+}
+
+fn required_option(value: Option<&str>, name: &str, action: &str) -> McpResult<String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => Err(to_mcp_error(P4McpError::InvalidInput {
+            message: format!("{name} is required for {action}"),
+        })),
+    }
+}
+
+fn invalid_input(message: impl Into<String>) -> P4McpError {
+    P4McpError::InvalidInput {
+        message: message.into(),
+    }
+}
+
+fn to_mcp_error(error: P4McpError) -> ErrorData {
+    match error {
+        P4McpError::InvalidInput { .. }
+        | P4McpError::ToolsetDisabled { .. }
+        | P4McpError::Readonly => ErrorData::invalid_params(error.to_string(), None),
+        P4McpError::P4Command { .. } | P4McpError::P4Json { .. } => {
+            ErrorData::internal_error(error.to_string(), None)
+        }
+    }
+}
+
+fn review_api_error(error: anyhow::Error) -> ErrorData {
+    ErrorData::internal_error(format!("review API request failed: {error}"), None)
+}
+
+#[must_use]
+struct LoggingGuard {
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+fn init_logging(log_dir: Option<&Path>) -> Result<LoggingGuard> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    if let Some(log_dir) = log_dir {
+        let file_appender = configured_log_file(log_dir)?;
+        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer);
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .with(file_layer)
+            .try_init();
+
+        Ok(LoggingGuard {
+            _file_guard: Some(file_guard),
+        })
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .try_init();
+
+        Ok(LoggingGuard { _file_guard: None })
+    }
+}
+
+fn configured_log_file(log_dir: &Path) -> Result<tracing_appender::rolling::RollingFileAppender> {
+    std::fs::create_dir_all(log_dir)?;
+    Ok(tracing_appender::rolling::never(log_dir, "p4mcp.log"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        io::Write,
+        net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Mutex},
+    };
+
+    use async_trait::async_trait;
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::{
+        approval::{ApprovalChannel, ApprovalDecision, ApprovalRequest, WriteApprovalGate},
+        config::{SslVerify, TransportMode},
+        p4::runner::{P4CommandOutput, P4Env},
+        tools::params::{
+            ChangelistModifyAction, FileModifyAction, JobModifyAction, ShelfModifyAction,
+            StreamModifyAction, WorkspaceModifyAction,
+        },
+        tools::reviews::{ModifyReviewsParams, ReviewModifyAction},
+    };
+
+    use super::*;
+
+    #[test]
+    fn configured_log_file_writes_to_p4mcp_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = configured_log_file(dir.path()).unwrap();
+
+        writeln!(writer, "log-dir smoke").unwrap();
+        drop(writer);
+
+        let contents = std::fs::read_to_string(dir.path().join("p4mcp.log")).unwrap();
+        assert!(contents.contains("log-dir smoke"));
+    }
+
+    #[test]
+    fn workspace_type_from_records_classifies_standard_workspace() {
+        let records = vec![json!({
+            "Client": "ws-standard",
+            "View0": "//depot/main/... //ws-standard/main/..."
+        })];
+
+        assert_eq!(workspace_type_from_records(&records), "standard");
+    }
+
+    #[test]
+    fn workspace_type_from_records_classifies_custom_workspace() {
+        let records = vec![json!({
+            "Client": "ws-custom",
+            "View0": "//streams/main/... //ws-custom/main/..."
+        })];
+
+        assert_eq!(workspace_type_from_records(&records), "custom");
+    }
+
+    fn test_config(readonly: bool) -> AppConfig {
+        AppConfig {
+            readonly,
+            allow_usage: false,
+            toolsets: Toolset::default_set(),
+            transport: TransportMode::Stdio,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8000,
+            p4_bin: "p4".into(),
+            log_dir: None,
+            ssl_verify: SslVerify::Enabled,
+        }
+    }
+
+    fn modify_files_params(approval_token: Option<&str>) -> ModifyFilesParams {
+        ModifyFilesParams {
+            action: FileModifyAction::Sync,
+            file_paths: Some(vec!["//depot/main/file.txt".to_string()]),
+            changelist: "default".to_string(),
+            source_paths: None,
+            target_paths: None,
+            mode: "auto".to_string(),
+            force: true,
+            approval_token: approval_token.map(str::to_string),
+        }
+    }
+
+    fn modify_streams_params(action: StreamModifyAction) -> ModifyStreamsParams {
+        ModifyStreamsParams {
+            action,
+            stream_name: None,
+            stream_type: None,
+            parent: None,
+            name: None,
+            description: None,
+            options: None,
+            parent_view: None,
+            paths: None,
+            remapped: None,
+            ignored: None,
+            changelist: None,
+            resolve_mode: None,
+            target_changelist: None,
+            parent_stream: None,
+            branch: None,
+            file_paths: None,
+            preview: false,
+            force: false,
+            reverse: false,
+            quiet: false,
+            max_files: None,
+            output_base: false,
+            virtual_stream: false,
+            schedule_branch_resolve: false,
+            integrate_around_deleted: false,
+            skip_cherry_picked: false,
+            source_path: None,
+            target_path: None,
+            workspace: None,
+            workspace_name: None,
+            root: None,
+            host: None,
+            alt_roots: None,
+            approval_token: None,
+        }
+    }
+
+    fn modify_changelists_params(action: ChangelistModifyAction) -> ModifyChangelistsParams {
+        ModifyChangelistsParams {
+            action,
+            changelist_id: None,
+            description: None,
+            file_paths: None,
+            approval_token: None,
+        }
+    }
+
+    fn modify_shelves_params(action: ShelfModifyAction) -> ModifyShelvesParams {
+        ModifyShelvesParams {
+            action,
+            changelist_id: "123".to_string(),
+            file_paths: None,
+            target_changelist: "default".to_string(),
+            force: false,
+            approval_token: None,
+        }
+    }
+
+    fn modify_workspaces_params(action: WorkspaceModifyAction) -> ModifyWorkspacesParams {
+        ModifyWorkspacesParams {
+            action,
+            workspace_name: "ws-main".to_string(),
+            workspace_root: None,
+            workspace_description: None,
+            workspace_options: None,
+            workspace_line_end: None,
+            workspace_view: None,
+            approval_token: None,
+        }
+    }
+
+    fn modify_jobs_params(action: JobModifyAction) -> ModifyJobsParams {
+        ModifyJobsParams {
+            action,
+            changelist_id: "123".to_string(),
+            job_id: "job000001".to_string(),
+            approval_token: None,
+        }
+    }
+
+    fn review_modify_params(approval_token: Option<&str>) -> ModifyReviewsParams {
+        ModifyReviewsParams {
+            action: ReviewModifyAction::Vote,
+            review_id: Some(123),
+            change_id: None,
+            description: None,
+            reviewers: None,
+            required_reviewers: None,
+            reviewer_group_names: None,
+            reviewer_groups_required: None,
+            comment_file_path: None,
+            comment_left_line: None,
+            comment_right_line: None,
+            comment_version: None,
+            vote_value: Some("up".to_string()),
+            version: Some(2),
+            transition: None,
+            jobs: None,
+            fix_status: None,
+            cleanup: None,
+            participant_user_names: None,
+            participant_users_required: None,
+            participant_group_names: None,
+            participant_groups_required: None,
+            body: None,
+            task_state: None,
+            notify: None,
+            comment_id: None,
+            not_updated_since: None,
+            max_reviews: 0,
+            new_author: None,
+            new_description: None,
+            approval_token: approval_token.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_files_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_files_inner(modify_files_params(None), ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert_eq!(response.0.action, "sync");
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].approval_token, None);
+        assert_eq!(calls[0].request.tool, "modify_files");
+        assert_eq!(calls[0].request.action, "sync");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.tool, "modify_files");
+        assert_eq!(calls[0].request.preview.action, "sync");
+        assert_eq!(calls[0].request.preview.targets, ["//depot/main/file.txt"]);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "sync".to_string(),
+                "-f".to_string(),
+                "//depot/main/file.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_files_sync_without_files_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_files_params(None);
+        params.file_paths = None;
+
+        let err = match server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("sync without file_paths should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("file_paths is required for sync"));
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_files_after_approval_calls_executor_once() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_files_inner(
+                modify_files_params(Some("approved-token")),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+            .expect("approved write should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "sync");
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["sync", "-f", "//depot/main/file.txt"]);
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_files_sync_up_to_date_after_approval_returns_success() {
+        let executor = Arc::new(QueuedExecutor::results(vec![Err(P4McpError::P4Command {
+            message: "p4 exited with failure; status: exit status: 1; stdout: ; stderr: File(s) up-to-date\n"
+                .to_string(),
+        })]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let params = modify_files_params(Some("approved-token"));
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("up-to-date sync should be successful");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "sync");
+        assert_eq!(response.0.message, json!("Workspace is already up-to-date"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["sync", "-f", "//depot/main/file.txt"]);
+    }
+
+    #[tokio::test]
+    async fn modify_files_sync_other_p4_error_remains_internal_error() {
+        let executor = Arc::new(QueuedExecutor::results(vec![Err(P4McpError::P4Command {
+            message: "p4 exited with failure; stderr: no such file(s)".to_string(),
+        })]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server =
+            P4McpServer::with_executor_and_approval(test_config(false), executor, approval_gate);
+        let params = modify_files_params(Some("approved-token"));
+
+        let err = match server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("non-benign sync errors should still fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::internal_error("", None).code);
+        assert!(err.message.contains("p4 command failed"));
+        assert!(err.message.contains("no such file"));
+    }
+
+    #[tokio::test]
+    async fn modify_files_edit_preview_includes_p4_edit() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_files_params(None);
+        params.action = FileModifyAction::Edit;
+        params.force = false;
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "edit".to_string(),
+                "-c".to_string(),
+                "default".to_string(),
+                "//depot/main/file.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_files_move_without_approval_previews_all_move_commands() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_files_params(None);
+        params.action = FileModifyAction::Move;
+        params.force = false;
+        params.file_paths = None;
+        params.changelist = "123".to_string();
+        params.source_paths = Some(vec![
+            "//depot/main/a.txt".to_string(),
+            "//depot/main/b.txt".to_string(),
+        ]);
+        params.target_paths = Some(vec![
+            "//depot/dev/a.txt".to_string(),
+            "//depot/dev/b.txt".to_string(),
+        ]);
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.tool, "modify_files");
+        assert_eq!(calls[0].request.action, "move");
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0].request.preview.commands,
+            Some(vec![
+                vec![
+                    "p4".to_string(),
+                    "move".to_string(),
+                    "-c".to_string(),
+                    "123".to_string(),
+                    "//depot/main/a.txt".to_string(),
+                    "//depot/dev/a.txt".to_string(),
+                ],
+                vec![
+                    "p4".to_string(),
+                    "move".to_string(),
+                    "-c".to_string(),
+                    "123".to_string(),
+                    "//depot/main/b.txt".to_string(),
+                    "//depot/dev/b.txt".to_string(),
+                ],
+            ])
+        );
+        assert_eq!(
+            calls[0].request.preview.targets,
+            [
+                "//depot/main/a.txt",
+                "//depot/main/b.txt",
+                "//depot/dev/a.txt",
+                "//depot/dev/b.txt",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_files_move_after_approval_executes_all_pairs() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/dev/a.txt"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/dev/b.txt"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_files_params(Some("approved-token"));
+        params.action = FileModifyAction::Move;
+        params.force = false;
+        params.file_paths = None;
+        params.changelist = "123".to_string();
+        params.source_paths = Some(vec![
+            "//depot/main/a.txt".to_string(),
+            "//depot/main/b.txt".to_string(),
+        ]);
+        params.target_paths = Some(vec![
+            "//depot/dev/a.txt".to_string(),
+            "//depot/dev/b.txt".to_string(),
+        ]);
+
+        let response = server
+            .modify_files_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved batch move should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "move");
+        assert_eq!(
+            response.0.message,
+            json!([
+                [{"depotFile": "//depot/dev/a.txt"}],
+                [{"depotFile": "//depot/dev/b.txt"}],
+            ])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            [
+                "move",
+                "-c",
+                "123",
+                "//depot/main/a.txt",
+                "//depot/dev/a.txt"
+            ]
+        );
+        assert_eq!(
+            invocations[1].args,
+            [
+                "move",
+                "-c",
+                "123",
+                "//depot/main/b.txt",
+                "//depot/dev/b.txt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_search_recursive_base_aggregates_and_caps_results() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/proj/root.rs"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![
+                    json!({"depotFile": "//depot/proj/src/lib.rs"}),
+                    json!({"depotFile": "//depot/proj/src/main.rs"}),
+                ],
+                text: json!({}),
+            },
+        ]));
+        let server = P4McpServer::with_executor(test_config(false), executor.clone());
+
+        let response = server
+            .query_files(Parameters(QueryFilesParams {
+                action: FileQueryAction::Search,
+                file_path: "//depot/proj/...".to_string(),
+                file2: None,
+                diff2: true,
+                max_results: 2,
+                pattern: Some("*.rs".to_string()),
+                case_insensitive: false,
+            }))
+            .await
+            .expect("recursive search should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "search");
+        assert_eq!(
+            response.0.message,
+            json!([
+                {"depotFile": "//depot/proj/root.rs"},
+                {"depotFile": "//depot/proj/src/lib.rs"},
+            ])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["files", "-m", "2", "//depot/proj/*.rs"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["files", "-m", "2", "//depot/proj/.../*.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_search_ignores_no_such_file_for_one_pattern() {
+        let executor = Arc::new(QueuedExecutor::results(vec![
+            Err(P4McpError::P4Command {
+                message: "p4 exited with failure; stderr: no such file(s)".to_string(),
+            }),
+            Ok(P4CommandOutput {
+                records: vec![json!({"depotFile": "//depot/proj/src/lib.rs"})],
+                text: json!({}),
+            }),
+        ]));
+        let server = P4McpServer::with_executor(test_config(false), executor.clone());
+
+        let response = server
+            .query_files(Parameters(QueryFilesParams {
+                action: FileQueryAction::Search,
+                file_path: "//depot/proj/...".to_string(),
+                file2: None,
+                diff2: true,
+                max_results: 10,
+                pattern: Some("*.rs".to_string()),
+                case_insensitive: false,
+            }))
+            .await
+            .expect("one no-such pattern should be ignored");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "search");
+        assert_eq!(
+            response.0.message,
+            json!([{"depotFile": "//depot/proj/src/lib.rs"}])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["files", "-m", "10", "//depot/proj/*.rs"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["files", "-m", "10", "//depot/proj/.../*.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Submit);
+        params.changelist_id = Some("123".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_changelists");
+        assert_eq!(calls[0].request.action, "submit");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.tool, "modify_changelists");
+        assert_eq!(calls[0].request.preview.action, "submit");
+        assert_eq!(calls[0].request.preview.targets, ["changelist:123"]);
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "submit".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_move_files_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/a.rs"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
+        params.changelist_id = Some("123".to_string());
+        params.file_paths = Some(vec![
+            "//depot/main/a.rs".to_string(),
+            "//depot/main/b.rs".to_string(),
+        ]);
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_changelists");
+        assert_eq!(calls[0].request.action, "move_files");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(
+            calls[0].request.preview.targets,
+            ["changelist:123", "//depot/main/a.rs", "//depot/main/b.rs",]
+        );
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "reopen".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/a.rs".to_string(),
+                "//depot/main/b.rs".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_move_files_after_approval_reopens_files() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/a.rs"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::MoveFiles);
+        params.changelist_id = Some("123".to_string());
+        params.file_paths = Some(vec![
+            "//depot/main/a.rs".to_string(),
+            "//depot/main/b.rs".to_string(),
+        ]);
+        params.approval_token = Some("approved-token".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved write should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "move_files");
+        assert_eq!(
+            response.0.message,
+            json!([{"depotFile": "//depot/main/a.rs"}])
+        );
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            [
+                "reopen",
+                "-c",
+                "123",
+                "//depot/main/a.rs",
+                "//depot/main/b.rs",
+            ]
+        );
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_create_without_description_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_changelists_params(ChangelistModifyAction::Create);
+
+        let err = match server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("create without description should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("description is required for create"));
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_update_without_description_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+        params.changelist_id = Some("123".to_string());
+
+        let err = match server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update without description should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("description is required for update"));
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_update_without_approval_does_not_fetch_form() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+        params.changelist_id = Some("123".to_string());
+        params.description = Some("new description".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "change".to_string(),
+                "-i".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_changelists_update_after_approval_patches_existing_form() {
+        let existing_form = "\
+Change: 123
+
+Description:
+\told description
+
+Files:
+\t//depot/main/a.rs
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"change": "123"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_changelists_params(ChangelistModifyAction::Update);
+        params.changelist_id = Some("123".to_string());
+        params.description = Some("new description".to_string());
+
+        let response = server
+            .modify_changelists_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved update should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].args, ["change", "-o", "123"]);
+        assert_eq!(invocations[0].mode, OutputMode::Text);
+        assert_eq!(invocations[1].args, ["change", "-i"]);
+        assert_eq!(
+            invocations[1].stdin.as_deref(),
+            Some(
+                "\
+Change: 123
+
+Description:
+\tnew description
+
+Files:
+\t//depot/main/a.rs
+"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_shelves_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_shelves_params(ShelfModifyAction::Delete);
+        params.file_paths = Some(vec!["//depot/main/file.txt".to_string()]);
+
+        let response = server
+            .modify_shelves_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_shelves");
+        assert_eq!(calls[0].request.action, "delete");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(
+            calls[0].request.preview.targets,
+            ["shelf:123", "//depot/main/file.txt"]
+        );
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "shelve".to_string(),
+                "-d".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/file.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_shelves_delete_after_approval_passes_file_paths_to_p4() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"change": "123"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_shelves_params(ShelfModifyAction::Delete);
+        params.file_paths = Some(vec![
+            "//depot/main/file.txt".to_string(),
+            "//depot/main/other.txt".to_string(),
+        ]);
+
+        let response = server
+            .modify_shelves_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved shelf delete should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "delete");
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            [
+                "shelve",
+                "-d",
+                "-c",
+                "123",
+                "//depot/main/file.txt",
+                "//depot/main/other.txt",
+            ]
+        );
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "shelve".to_string(),
+                "-d".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "//depot/main/file.txt".to_string(),
+                "//depot/main/other.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Delete);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_workspaces");
+        assert_eq!(calls[0].request.action, "delete");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+        assert_eq!(
+            calls[0].request.preview.workspace.as_deref(),
+            Some("ws-main")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "client".to_string(),
+                "-d".to_string(),
+                "ws-main".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_blank_name_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Update);
+        params.workspace_name = " ".to_string();
+
+        let err = match server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("blank workspace_name should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("workspace_name is required for update")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_update_preview_uses_workspace_name() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Update);
+        params.workspace_root = Some("/workspace/root".to_string());
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+    }
+
+    #[tokio::test]
+    async fn active_client_context_applies_to_later_p4_calls() {
+        let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }]));
+        let server = P4McpServer::with_executor(test_config(false), executor.clone());
+
+        server.set_active_client("ws-main".to_string()).await;
+        let response = server
+            .call_p4_tool(
+                "list",
+                json_invocation(
+                    vec!["clients".to_string(), "-m".to_string(), "100".to_string()],
+                    None,
+                ),
+            )
+            .await
+            .expect("query should succeed with active client context");
+
+        assert_eq!(response.0.status, "success");
+        let envs = executor.envs();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].get("P4CLIENT").map(String::as_str), Some("ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_switch_preview_does_not_emit_client_s() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Client": "ws-main", "Owner": "alice"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Switch);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.tool, "modify_workspaces");
+        assert_eq!(calls[0].request.action, "switch");
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+        assert_eq!(
+            calls[0].request.preview.workspace.as_deref(),
+            Some("ws-main")
+        );
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(calls[0].request.preview.commands, None);
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_switch_sets_active_client_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"userName": "alice"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "Client: ws-main\nOwner: alice\nUpdate: 2026/06/17 00:00:00\nRoot: /workspace/root\n"
+                }),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Switch);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("switch should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        assert_eq!(response.0.message, json!("Switched to workspace 'ws-main'"));
+
+        let query_response = server
+            .call_p4_tool(
+                "list",
+                json_invocation(
+                    vec!["clients".to_string(), "-m".to_string(), "100".to_string()],
+                    None,
+                ),
+            )
+            .await
+            .expect("later p4 call should use switched active client");
+        assert_eq!(query_response.0.status, "success");
+
+        let invocations = executor.invocations();
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|invocation| invocation.args.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["info"],
+                vec!["client", "-o", "ws-main"],
+                vec!["clients", "-m", "100"],
+            ]
+        );
+        let envs = executor.envs();
+        assert_eq!(envs[0].get("P4CLIENT"), None);
+        assert_eq!(envs[1].get("P4CLIENT"), None);
+        assert_eq!(envs[2].get("P4CLIENT").map(String::as_str), Some("ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_create_without_spec_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Create);
+
+        let err = match server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("create without spec fields should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("workspace specification fields are required for create")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_update_without_spec_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Update);
+
+        let err = match server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update without spec fields should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("workspace specification fields are required for update")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_create_fetches_and_saves_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "Client: ws-main\nRoot: /old/root\nOptions: noallwrite noclobber nocompress unlocked nomodtime normdir\nLineEnd: local\nView:\n\t//depot/... //ws-main/...\n"
+                }),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Create);
+        params.workspace_root = Some("/workspace/root".to_string());
+        params.workspace_view = Some(vec!["//depot/main/... //ws-main/main/...".to_string()]);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("create should save patched client form");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create");
+        let invocations = executor.invocations();
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|invocation| invocation.args.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["client", "-o", "ws-main"], vec!["client", "-i"]]
+        );
+        assert!(
+            invocations[1]
+                .stdin
+                .as_deref()
+                .expect("client -i should receive patched form")
+                .contains("Root: /workspace/root")
+        );
+        assert!(
+            invocations[1]
+                .stdin
+                .as_deref()
+                .expect("client -i should receive patched form")
+                .contains("//depot/main/... //ws-main/main/...")
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_update_fetches_info_then_saves_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"userName": "alice"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "Client: ws-main\nOwner: bob\nRoot: /old/root\nOptions: noallwrite noclobber nocompress unlocked nomodtime normdir\nLineEnd: local\nView:\n\t//depot/... //ws-main/...\n"
+                }),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Update);
+        params.workspace_description = Some("Updated workspace".to_string());
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("update should save patched client form");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|invocation| invocation.args.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["info"],
+                vec!["client", "-o", "ws-main"],
+                vec!["client", "-i"]
+            ]
+        );
+        assert!(
+            invocations[2]
+                .stdin
+                .as_deref()
+                .expect("client -i should receive patched form")
+                .contains("Description:\n\tUpdated workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_jobs_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Job": "job000001"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_jobs_params(JobModifyAction::LinkJob);
+
+        let response = server
+            .modify_jobs_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_jobs");
+        assert_eq!(calls[0].request.action, "link_job");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(
+            calls[0].request.preview.targets,
+            ["job:job000001", "changelist:123"]
+        );
+        assert_eq!(calls[0].request.preview.changelist.as_deref(), Some("123"));
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "fix".to_string(),
+                "-c".to_string(),
+                "123".to_string(),
+                "job000001".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_without_approval_does_not_call_executor() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Delete);
+        params.stream_name = Some("//streams/dev".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "delete");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//streams/dev"]);
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/dev")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "stream".to_string(),
+                "-d".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_integrate_preview_uses_lowercase_force_without_executor_call() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Integrate);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.force = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "integrate");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//streams/dev"]);
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/dev")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "integrate".to_string(),
+                "-f".to_string(),
+                "-S".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_populate_preview_uses_lowercase_force_without_executor_call() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Populate);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.force = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "populate");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+        assert_eq!(calls[0].request.preview.targets, ["//streams/dev"]);
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/dev")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "populate".to_string(),
+                "-f".to_string(),
+                "-S".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_and_update_require_stream_name_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let create_result = server
+            .modify_streams_inner(
+                modify_streams_params(StreamModifyAction::Create),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await;
+        let create_error = match create_result {
+            Ok(_) => panic!("create without stream_name should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            create_error
+                .message
+                .contains("stream_name is required for create")
+        );
+
+        let update_result = server
+            .modify_streams_inner(
+                modify_streams_params(StreamModifyAction::Update),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await;
+        let update_error = match update_result {
+            Ok(_) => panic!("update without stream_name should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            update_error
+                .message
+                .contains("stream_name is required for update")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_create_only_fields_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let mut stream_type_params = modify_streams_params(StreamModifyAction::Update);
+        stream_type_params.stream_name = Some("//streams/dev".to_string());
+        stream_type_params.stream_type = Some("development".to_string());
+
+        let stream_type_error = match server
+            .modify_streams_inner(stream_type_params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update with stream_type should be rejected before approval"),
+            Err(error) => error,
+        };
+        assert!(
+            stream_type_error
+                .message
+                .contains("stream_type is only supported for create")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+
+        let mut parent_params = modify_streams_params(StreamModifyAction::Update);
+        parent_params.stream_name = Some("//streams/dev".to_string());
+        parent_params.parent = Some("//streams/main".to_string());
+
+        let parent_error = match server
+            .modify_streams_inner(parent_params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update with parent should be rejected before approval"),
+            Err(error) => error,
+        };
+        assert!(
+            parent_error
+                .message
+                .contains("parent is only supported for create")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_parent_view_approval_preview_lists_both_writes() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.parent_view = Some(" noinherit ".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "update");
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0].request.preview.commands,
+            Some(vec![
+                vec!["p4".to_string(), "stream".to_string(), "-i".to_string()],
+                vec![
+                    "p4".to_string(),
+                    "stream".to_string(),
+                    "parentview".to_string(),
+                    "--noinherit".to_string(),
+                    "//streams/dev".to_string(),
+                ],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_rejects_existing_stream_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        }]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.stream_type = Some("mainline".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("duplicate stream create should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message
+                .contains("Stream '//streams/dev' already exists")
+        );
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[0].mode, OutputMode::JsonLines);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_rejects_missing_parent_for_child_stream_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.stream_type = Some("development".to_string());
+        params.parent = Some("//streams/main".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("child stream create with missing parent should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message
+                .contains("Parent stream '//streams/main' does not exist")
+        );
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(
+            invocations[2].args,
+            ["streams", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(
+            invocations[3].args,
+            ["streams", "-a", "-F", "Stream=//streams/main"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_saves_new_mainline_stream_after_approval() {
+        let template_form = "\
+Stream: //streams/dev
+Type: development
+Parent: //streams/main
+Name: old
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": template_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/main".to_string());
+        params.stream_type = Some("mainline".to_string());
+        params.name = Some("Main".to_string());
+        params.description = Some("mainline stream".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved stream create should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(invocations[2].args, ["stream", "-o", "//streams/main"]);
+        assert_eq!(invocations[2].mode, OutputMode::Text);
+        assert_eq!(invocations[3].args, ["stream", "-i"]);
+        let saved_form = invocations[3]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(saved_form.contains("Stream: //streams/main"));
+        assert!(saved_form.contains("Type: mainline"));
+        assert!(saved_form.contains("Parent: none"));
+        assert!(saved_form.contains("Name: Main"));
+        assert!(saved_form.contains("Description:\n\tmainline stream"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_virtual_defaults_parent_flow_options_after_approval() {
+        let template_form = "\
+Stream: //streams/virtual
+Type: development
+Parent: //streams/main
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/main"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": template_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/virtual"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/virtual".to_string());
+        params.stream_type = Some("virtual".to_string());
+        params.parent = Some("//streams/main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved virtual stream create should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/virtual"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/virtual"]
+        );
+        assert_eq!(
+            invocations[2].args,
+            ["streams", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(invocations[3].args, ["stream", "-o", "//streams/virtual"]);
+        assert_eq!(invocations[4].args, ["stream", "-i"]);
+        let saved_form = invocations[4]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(saved_form.contains("Options: allsubmit unlocked notoparent nofromparent"));
+        assert!(!saved_form.contains("Options: allsubmit unlocked toparent fromparent"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_fetches_and_saves_stream_form_after_approval() {
+        let existing_form = "\
+Stream: //streams/dev
+Name: old name
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.name = Some("Dev".to_string());
+        params.description = Some("new description".to_string());
+        params.options = Some("ownersubmit unlocked toparent fromparent".to_string());
+        params.paths = Some(vec![
+            "share ...".to_string(),
+            "isolate generated/...".to_string(),
+        ]);
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved stream update should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[1].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[1].mode, OutputMode::Text);
+        assert_eq!(invocations[2].args, ["stream", "resolve", "-n"]);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert_eq!(invocations[4].args, ["stream", "-i"]);
+        let saved_form = invocations[4]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(saved_form.contains("Stream: //streams/dev"));
+        assert!(saved_form.contains("Name: Dev"));
+        assert!(saved_form.contains("Description:\n\tnew description"));
+        assert!(saved_form.contains("Options: ownersubmit unlocked toparent fromparent"));
+        assert!(saved_form.contains("Paths:\n\tshare ...\n\tisolate generated/..."));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_resolve_preview_error_before_save() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::results(vec![
+            Ok(P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            }),
+            Ok(P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            }),
+            Err(P4McpError::P4Command {
+                message: "resolve preview failed".to_string(),
+            }),
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("resolve preview errors should reject stream update before save"),
+            Err(err) => err,
+        };
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[1].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[1].mode, OutputMode::Text);
+        assert_eq!(invocations[2].args, ["stream", "resolve", "-n"]);
+        assert!(
+            !invocations
+                .iter()
+                .any(|invocation| invocation.args.as_slice() == ["stream", "-i"])
+        );
+        assert!(err.message.contains("resolve preview failed"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_treats_no_files_to_resolve_as_noop() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::results(vec![
+            Ok(P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            }),
+            Ok(P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            }),
+            Err(P4McpError::P4Command {
+                message: "No file(s) to resolve".to_string(),
+            }),
+            Ok(P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            }),
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("No file(s) to resolve should be treated as a no-op");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[1].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[2].args, ["stream", "resolve", "-n"]);
+        assert_eq!(invocations[3].args, ["stream", "-i"]);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_missing_stream_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/missing".to_string());
+        params.description = Some("new description".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("missing stream update should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message
+                .contains("Stream '//streams/missing' does not exist")
+        );
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/missing"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/missing"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_view_change_when_bound_workspace_has_open_files() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//streams/dev/file.txt"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.paths = Some(vec![
+            "share ...".to_string(),
+            "isolate generated/...".to_string(),
+        ]);
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("view-affecting update with open files should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("Cannot modify stream view"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert_eq!(invocations[4].args, ["opened", "-C", "ws-dev"]);
+    }
+
+    #[test]
+    fn modify_streams_update_blank_parent_view_is_not_view_affecting() {
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.parent_view = Some(" \t ".to_string());
+
+        assert!(!stream_update_is_view_affecting(&params));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_invalid_parent_view_before_save() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+ParentView: inherit
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+        params.parent_view = Some("bogus".to_string());
+
+        let err = match server
+            .execute_stream_update(&params, "//streams/dev".to_string())
+            .await
+        {
+            Ok(_) => panic!("invalid parent_view should be rejected before save"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("invalid parent_view"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert!(
+            !invocations
+                .iter()
+                .any(|invocation| invocation.args.as_slice() == ["stream", "-i"])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_changes_parent_view_with_parentview_command() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+ParentView: inherit
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+        params.parent_view = Some(" noinherit ".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved parent_view update should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 6);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert_eq!(invocations[4].args, ["stream", "-i"]);
+        let saved_form = invocations[4]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(
+            !saved_form.contains("ParentView:"),
+            "saved form should not contain ParentView, got:\n{saved_form}"
+        );
+        assert_eq!(
+            invocations[5].args,
+            ["stream", "parentview", "--noinherit", "//streams/dev"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_preview_is_read_only_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "Client": "ws-main",
+                    "Update": "2026/06/17 10:00:00",
+                    "Stream": "//streams/main"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({
+                    "Stream": "//streams/dev",
+                    "Type": "development",
+                    "Parent": "//streams/main"
+                })],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+        params.preview = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved switch preview should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        assert_eq!(response.0.message["preview"], json!(true));
+        assert_eq!(
+            response.0.message["current_stream"],
+            json!("//streams/main")
+        );
+        assert_eq!(response.0.message["target_stream"], json!("//streams/dev"));
+        assert_eq!(response.0.message["workspace"], json!("ws-main"));
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[2].args, ["opened", "-C", "ws-main"]);
+        assert_eq!(invocations[3].args, ["stream", "-o", "//streams/dev"]);
+        assert!(invocations.iter().all(
+            |invocation| invocation.args != ["client", "-s", "-S", "//streams/dev", "ws-main"]
+        ));
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "stream".to_string(),
+                "-o".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_rejects_open_files_before_switching() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "Client": "ws-main",
+                    "Update": "2026/06/17 10:00:00",
+                    "Stream": "//streams/main"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//streams/main/file.txt"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("switch with open files should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("Cannot switch stream"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[2].args, ["opened", "-C", "ws-main"]);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_executes_client_switch_and_have_table_sync_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "Client": "ws-main",
+                    "Update": "2026/06/17 10:00:00",
+                    "Stream": "//streams/main"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Client": "ws-main"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"synced": true})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved switch should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[3].args,
+            ["client", "-s", "-S", "//streams/dev", "ws-main"]
+        );
+        assert_eq!(invocations[4].args, ["sync", "-k", "//streams/dev/..."]);
+        let envs = executor.envs();
+        assert_eq!(envs[4].get("P4CLIENT").map(String::as_str), Some("ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_approval_preview_lists_switch_and_sync_writes() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0].request.preview.commands,
+            Some(vec![
+                vec![
+                    "p4".to_string(),
+                    "client".to_string(),
+                    "-s".to_string(),
+                    "-S".to_string(),
+                    "//streams/dev".to_string(),
+                    "ws-main".to_string(),
+                ],
+                vec![
+                    "p4".to_string(),
+                    "sync".to_string(),
+                    "-k".to_string(),
+                    "//streams/dev/...".to_string(),
+                ],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_workspace_previews_client_i_without_fetching_form() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::CreateWorkspace);
+        params.stream_name = Some("//streams/main".to_string());
+        params.workspace_name = Some("ws-main".to_string());
+        params.root = Some("/work/ws-main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+        assert_eq!(
+            calls[0].request.preview.workspace.as_deref(),
+            Some("ws-main")
+        );
+        assert_eq!(
+            calls[0].request.preview.stream.as_deref(),
+            Some("//streams/main")
+        );
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "client".to_string(),
+                "-i".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_workspace_fetches_and_saves_client_form_after_approval() {
+        let existing_form = "\
+Client: old-client
+Root: /old/root
+Options: noallwrite noclobber nocompress unlocked nomodtime normdir
+
+Stream: //streams/old
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": "Client: ws-main\n", "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::CreateWorkspace);
+        params.stream_name = Some("//streams/main".to_string());
+        params.workspace_name = Some("ws-main".to_string());
+        params.root = Some("/work/ws-main".to_string());
+        params.description = Some("stream workspace".to_string());
+        params.options =
+            Some("allwrite noclobber nocompress unlocked nomodtime normdir".to_string());
+        params.host = Some("build-host".to_string());
+        params.alt_roots = Some(vec!["/mnt/ws-main".to_string()]);
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved create_workspace should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create_workspace");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
+        assert_eq!(invocations[0].mode, OutputMode::Text);
+        assert_eq!(
+            invocations[1].args,
+            ["client", "-o", "-S", "//streams/main", "ws-main"]
+        );
+        assert_eq!(invocations[1].mode, OutputMode::Text);
+        assert_eq!(invocations[2].args, ["client", "-i"]);
+        let saved_form = invocations[2]
+            .stdin
+            .as_deref()
+            .expect("client -i should receive patched form");
+        assert!(saved_form.contains("Client: ws-main"));
+        assert!(saved_form.contains("Root: /work/ws-main"));
+        assert!(saved_form.contains("Stream: //streams/main"));
+        assert!(saved_form.contains("Description:\n\tstream workspace"));
+        assert!(
+            saved_form
+                .contains("Options: allwrite noclobber nocompress unlocked nomodtime normdir")
+        );
+        assert!(saved_form.contains("Host: build-host"));
+        assert!(saved_form.contains("AltRoots:\n\t/mnt/ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_workspace_rejects_existing_client_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+            records: Vec::new(),
+            text: json!({"stdout": "Client: ws-main\nUpdate: 2026/06/15 10:00:00\n", "stderr": ""}),
+        }]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::CreateWorkspace);
+        params.stream_name = Some("//streams/main".to_string());
+        params.workspace_name = Some("ws-main".to_string());
+        params.root = Some("/work/ws-main".to_string());
+
+        let result = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("existing workspace should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("Workspace 'ws-main' already exists"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_without_approval_does_not_return_write_dry_run() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(review_modify_params(None), ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert_ne!(response.0.status, "dry_run");
+        assert!(response.0.message.get("method").is_none());
+        assert!(response.0.message.get("path").is_none());
+        assert!(executor.invocations().is_empty());
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].approval_token, None);
+        assert_eq!(calls[0].request.tool, "modify_reviews");
+        assert_eq!(calls[0].request.action, "vote");
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_after_approval_executes_review_api_request() {
+        let swarm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v11/reviews/123/vote"))
+            .and(header("authorization", "Basic YWxpY2U6dGlja2V0LTEyMw=="))
+            .and(body_json(json!({"vote": "up", "version": 2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "vote": "recorded"
+            })))
+            .expect(1)
+            .mount(&swarm)
+            .await;
+
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "userName": "alice",
+                    "serverAddress": "perforce:1666"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({
+                    "value": swarm.uri()
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "perforce:1666 (alice) ticket-123\n",
+                    "stderr": ""
+                }),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(
+                review_modify_params(Some("approved-token")),
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+            .expect("approved review write should execute");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "vote");
+        assert_eq!(response.0.message, json!({"vote": "recorded"}));
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].args, ["info"]);
+        assert_eq!(
+            invocations[1].args,
+            ["property", "-l", "-n", "P4.Swarm.URL"]
+        );
+        assert_eq!(invocations[2].args, ["tickets"]);
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+        assert_eq!(calls[0].request.params["approval_token"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_comment_read_uses_comment_id_after_approval() {
+        let swarm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v11/comments/987/read"))
+            .and(header("authorization", "Basic YWxpY2U6dGlja2V0LTEyMw=="))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "comment": "read"
+            })))
+            .expect(1)
+            .mount(&swarm)
+            .await;
+
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "userName": "alice",
+                    "serverAddress": "perforce:1666"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({
+                    "value": swarm.uri()
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "perforce:1666 (alice) ticket-123\n",
+                    "stderr": ""
+                }),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor,
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(
+                ModifyReviewsParams {
+                    action: ReviewModifyAction::MarkCommentRead,
+                    review_id: None,
+                    vote_value: None,
+                    version: None,
+                    comment_id: Some(987),
+                    approval_token: Some("approved-token".to_string()),
+                    ..review_modify_params(None)
+                },
+                ApprovalChannel::FallbackOnly,
+            )
+            .await
+            .expect("approved comment read should execute");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "mark_comment_read");
+        assert_eq!(response.0.message, json!({"comment": "read"}));
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].approval_token.as_deref(), Some("approved-token"));
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_approval_preview_uses_method_and_path() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let response = server
+            .modify_reviews_inner(review_modify_params(None), ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.preview.tool, "modify_reviews");
+        assert_eq!(calls[0].request.preview.action, "vote");
+        assert_eq!(calls[0].request.preview.targets, ["review:123"]);
+        assert_eq!(calls[0].request.preview.review.as_deref(), Some("123"));
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0]
+                .request
+                .preview
+                .request
+                .as_ref()
+                .map(|request| (request.method.as_str(), request.path.as_str(),)),
+            Some(("POST", "/reviews/123/vote"))
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_reviews_join_approval_preview_mentions_current_user_after_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        for action in [ReviewModifyAction::Join, ReviewModifyAction::Leave] {
+            let response = server
+                .modify_reviews_inner(
+                    ModifyReviewsParams {
+                        action,
+                        vote_value: None,
+                        version: None,
+                        ..review_modify_params(None)
+                    },
+                    ApprovalChannel::FallbackOnly,
+                )
+                .await
+                .expect("approval response should be returned");
+
+            assert_eq!(response.0.status, "approval_required");
+        }
+
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].request.preview.action, "join");
+        assert!(calls[0].request.preview.summary.contains("current P4 user"));
+        assert!(
+            calls[0]
+                .request
+                .preview
+                .summary
+                .contains("resolved after approval")
+        );
+        assert_eq!(
+            calls[0]
+                .request
+                .preview
+                .request
+                .as_ref()
+                .map(|request| (request.method.as_str(), request.path.as_str())),
+            Some(("POST", "/reviews/123/join"))
+        );
+        assert_eq!(calls[1].request.preview.action, "leave");
+        assert!(calls[1].request.preview.summary.contains("current P4 user"));
+        assert!(
+            calls[1]
+                .request
+                .preview
+                .summary
+                .contains("resolved after approval")
+        );
+        assert_eq!(
+            calls[1]
+                .request
+                .preview
+                .request
+                .as_ref()
+                .map(|request| (request.method.as_str(), request.path.as_str())),
+            Some(("DELETE", "/reviews/123/leave"))
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_before_approval_gate() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"depotFile": "//depot/main/file.txt"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(true),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let err = match server
+            .modify_files_inner(modify_files_params(None), ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("readonly mode should reject the write"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(err.message.contains("read-only mode"));
+        assert!(approval_gate.calls().is_empty());
+        assert!(executor.invocations().is_empty());
+    }
+
+    #[derive(Clone)]
+    struct FakeApprovalCall {
+        fallback_only: bool,
+        request: ApprovalRequest,
+        approval_token: Option<String>,
+    }
+
+    struct FakeApprovalGate {
+        decision: ApprovalDecision,
+        calls: Mutex<Vec<FakeApprovalCall>>,
+    }
+
+    impl FakeApprovalGate {
+        fn approval_required() -> Self {
+            Self {
+                decision: ApprovalDecision::Response(ToolResponse::approval_required(
+                    "sync",
+                    json!({"reason": "approval required"}),
+                )),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn approved() -> Self {
+            Self {
+                decision: ApprovalDecision::Approved,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<FakeApprovalCall> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl WriteApprovalGate for FakeApprovalGate {
+        async fn approve(
+            &self,
+            channel: ApprovalChannel,
+            request: ApprovalRequest,
+            approval_token: Option<&str>,
+        ) -> crate::error::Result<ApprovalDecision> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(FakeApprovalCall {
+                    fallback_only: matches!(channel, ApprovalChannel::FallbackOnly),
+                    request,
+                    approval_token: approval_token.map(str::to_string),
+                });
+            Ok(self.decision.clone())
+        }
+    }
+
+    struct QueuedExecutor {
+        outputs: Mutex<VecDeque<crate::error::Result<P4CommandOutput>>>,
+        invocations: Mutex<Vec<P4Invocation>>,
+        envs: Mutex<Vec<P4Env>>,
+    }
+
+    impl QueuedExecutor {
+        fn success(outputs: Vec<P4CommandOutput>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().map(Ok).collect()),
+                invocations: Mutex::new(Vec::new()),
+                envs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn results(outputs: Vec<crate::error::Result<P4CommandOutput>>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into()),
+                invocations: Mutex::new(Vec::new()),
+                envs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> Vec<P4Invocation> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn envs(&self) -> Vec<P4Env> {
+            self.envs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl P4Executor for QueuedExecutor {
+        async fn run(
+            &self,
+            invocation: P4Invocation,
+            env: P4Env,
+        ) -> crate::error::Result<P4CommandOutput> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(invocation);
+            self.envs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(env);
+
+            self.outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(P4McpError::P4Command {
+                        message: "queued executor exhausted".to_string(),
+                    })
+                })
+        }
+    }
+
+    struct FakeExecutor {
+        output: P4CommandOutput,
+        invocations: Mutex<Vec<P4Invocation>>,
+    }
+
+    impl FakeExecutor {
+        fn success(output: P4CommandOutput) -> Self {
+            Self {
+                output,
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> Vec<P4Invocation> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl P4Executor for FakeExecutor {
+        async fn run(
+            &self,
+            invocation: P4Invocation,
+            _env: P4Env,
+        ) -> crate::error::Result<P4CommandOutput> {
+            self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(invocation);
+            Ok(self.output.clone())
+        }
+    }
+}

@@ -12,7 +12,7 @@
 
 ## Assumptions
 
-- The local directory starts empty and is not a Git repository.
+- The local directory is already a Git repository.
 - The target binary name is `p4-mcp-server`, matching upstream deployment examples.
 - `p4` is already installed on the machine that runs the MCP server. The Rust binary does not bundle P4Python, CPython, `uv`, Docker images, or a local `p4d`.
 - `P4PORT`, `P4USER`, `P4CLIENT`, `P4CONFIG`, `.p4tickets`, and `P4PASSWD` are inherited from the MCP launch environment. The server may pass non-secret overrides to the `p4` process, but it must not persist passwords or tickets.
@@ -75,19 +75,19 @@
 - Create: `src/main.rs`
 - Create: `README.md`
 
-- [ ] **Step 1: Initialize Git and Cargo**
+- [ ] **Step 1: Verify Git and initialize Cargo**
 
 Run:
 
 ```bash
-git init
+git rev-parse --is-inside-work-tree
 cargo init --bin --name p4mcp-server-rs .
 ```
 
 Expected:
 
 ```text
-Initialized empty Git repository
+true
 Created binary (application) package
 ```
 
