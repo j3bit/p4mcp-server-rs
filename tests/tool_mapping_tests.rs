@@ -25,7 +25,8 @@ use p4mcp_server_rs::{
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
         streams::{StreamModifyCommand, build_stream_modify_command, build_stream_query_command},
         workspaces::{
-            build_workspace_delete_invocation, build_workspace_exists_invocation,
+            WorkspaceModifyCommand, build_workspace_delete_invocation,
+            build_workspace_exists_invocation, build_workspace_modify_command,
             build_workspace_query_invocation,
         },
     },
@@ -1117,6 +1118,92 @@ fn modify_workspaces_blank_name_delete_errors() {
         .to_string();
 
     assert!(error.contains("workspace_name is required for delete"));
+}
+
+#[test]
+fn modify_workspaces_switch_builds_context_command() {
+    let params = ModifyWorkspacesParams {
+        action: WorkspaceModifyAction::Switch,
+        workspace_name: "ws-main".to_string(),
+        workspace_root: None,
+        workspace_description: None,
+        workspace_options: None,
+        workspace_line_end: None,
+        workspace_view: None,
+        approval_token: None,
+    };
+
+    let command = build_workspace_modify_command(&params).unwrap();
+
+    assert_eq!(
+        command,
+        WorkspaceModifyCommand::Switch {
+            workspace_name: "ws-main".to_string(),
+        }
+    );
+}
+
+#[test]
+fn modify_workspaces_create_requires_workspace_spec_fields() {
+    let params = ModifyWorkspacesParams {
+        action: WorkspaceModifyAction::Create,
+        workspace_name: "ws-main".to_string(),
+        workspace_root: None,
+        workspace_description: None,
+        workspace_options: None,
+        workspace_line_end: None,
+        workspace_view: None,
+        approval_token: None,
+    };
+
+    let error = build_workspace_modify_command(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("workspace specification fields are required for create"));
+}
+
+#[test]
+fn modify_workspaces_update_requires_workspace_spec_fields() {
+    let params = ModifyWorkspacesParams {
+        action: WorkspaceModifyAction::Update,
+        workspace_name: "ws-main".to_string(),
+        workspace_root: None,
+        workspace_description: None,
+        workspace_options: None,
+        workspace_line_end: None,
+        workspace_view: None,
+        approval_token: None,
+    };
+
+    let error = build_workspace_modify_command(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("workspace specification fields are required for update"));
+}
+
+#[test]
+fn modify_workspaces_create_builds_create_command_when_spec_fields_exist() {
+    let params = ModifyWorkspacesParams {
+        action: WorkspaceModifyAction::Create,
+        workspace_name: "ws-main".to_string(),
+        workspace_root: Some("/workspace/root".to_string()),
+        workspace_description: None,
+        workspace_options: None,
+        workspace_line_end: None,
+        workspace_view: None,
+        approval_token: None,
+    };
+
+    let command = build_workspace_modify_command(&params).unwrap();
+
+    assert_eq!(
+        command,
+        WorkspaceModifyCommand::Create {
+            workspace_name: "ws-main".to_string(),
+        }
+    );
 }
 
 #[test]
