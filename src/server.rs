@@ -467,6 +467,8 @@ impl P4McpServer {
                 .await?;
         }
 
+        let parent_view =
+            normalized_parent_view(params.parent_view.as_deref()).map_err(to_mcp_error)?;
         let patch = StreamFormPatch {
             stream: Some(stream_name.clone()),
             stream_type: params.stream_type.clone(),
@@ -480,10 +482,7 @@ impl P4McpServer {
             ignored: params.ignored.clone(),
         };
         let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
-        let parent_view_requested = params
-            .parent_view
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty());
+        let parent_view_requested = parent_view.is_some();
         let patched = if parent_view_requested {
             remove_stream_parent_view_field(&patched)
         } else {
@@ -491,11 +490,7 @@ impl P4McpServer {
         };
         let save_response = self.save_stream_form("update", patched).await?;
 
-        if let Some(parent_view) = params
-            .parent_view
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
+        if let Some(parent_view) = parent_view {
             self.run_p4(json_invocation(
                 vec![
                     "stream".to_string(),
@@ -1271,10 +1266,8 @@ impl P4McpServer {
                         "Stream: {stream_name}\n\n<patched after approval>\n"
                     )),
                 )];
-                if let Some(parent_view) = params
-                    .parent_view
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
+                if let Some(parent_view) =
+                    normalized_parent_view(params.parent_view.as_deref()).map_err(to_mcp_error)?
                 {
                     invocations.push(json_invocation(
                         vec![
@@ -2499,6 +2492,19 @@ fn stream_update_is_view_affecting(params: &ModifyStreamsParams) -> bool {
             .parent_view
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn normalized_parent_view(parent_view: Option<&str>) -> Result<Option<&str>, P4McpError> {
+    let Some(value) = parent_view.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    match value {
+        "inherit" | "noinherit" => Ok(Some(value)),
+        _ => Err(invalid_input(format!(
+            "invalid parent_view '{value}': expected 'inherit' or 'noinherit'"
+        ))),
+    }
 }
 
 fn remove_stream_parent_view_field(form: &str) -> String {
@@ -4057,7 +4063,7 @@ Files:
         );
         let mut params = modify_streams_params(StreamModifyAction::Update);
         params.stream_name = Some("//streams/dev".to_string());
-        params.parent_view = Some("noinherit".to_string());
+        params.parent_view = Some(" noinherit ".to_string());
 
         let response = server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
@@ -4516,6 +4522,64 @@ Paths:
     }
 
     #[tokio::test]
+    async fn modify_streams_update_rejects_invalid_parent_view_before_save() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+ParentView: inherit
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+        params.parent_view = Some("bogus".to_string());
+
+        let err = match server
+            .execute_stream_update(&params, "//streams/dev".to_string())
+            .await
+        {
+            Ok(_) => panic!("invalid parent_view should be rejected before save"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("invalid parent_view"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert!(
+            !invocations
+                .iter()
+                .any(|invocation| invocation.args.as_slice() == ["stream", "-i"])
+        );
+    }
+
+    #[tokio::test]
     async fn modify_streams_update_changes_parent_view_with_parentview_command() {
         let existing_form = "\
 Stream: //streams/dev
@@ -4560,7 +4624,7 @@ Paths:
         let mut params = modify_streams_params(StreamModifyAction::Update);
         params.stream_name = Some("//streams/dev".to_string());
         params.description = Some("new description".to_string());
-        params.parent_view = Some("noinherit".to_string());
+        params.parent_view = Some(" noinherit ".to_string());
 
         let response = server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
