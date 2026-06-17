@@ -284,13 +284,18 @@ impl P4McpServer {
     }
 
     async fn require_active_stream(&self, stream_name: &str, label: &str) -> McpResult<()> {
+        let subject = if label == "Stream" {
+            label.to_string()
+        } else {
+            format!("{label} stream")
+        };
         match self.stream_existence(stream_name).await? {
             StreamExistence::Active => Ok(()),
             StreamExistence::Deleted => Err(to_mcp_error(invalid_input(format!(
-                "{label} stream '{stream_name}' has been deleted"
+                "{subject} '{stream_name}' has been deleted"
             )))),
             StreamExistence::Missing => Err(to_mcp_error(invalid_input(format!(
-                "{label} stream '{stream_name}' does not exist"
+                "{subject} '{stream_name}' does not exist"
             )))),
         }
     }
@@ -372,6 +377,135 @@ impl P4McpServer {
         };
         let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
         self.save_stream_form("create", patched).await
+    }
+
+    async fn stream_bound_workspaces(&self, stream_name: &str) -> McpResult<Vec<String>> {
+        let output = self
+            .run_p4(json_invocation(
+                vec![
+                    "clients".to_string(),
+                    "-S".to_string(),
+                    stream_name.to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        Ok(output
+            .records
+            .iter()
+            .filter_map(|record| {
+                record_string_field(record, "client")
+                    .or_else(|| record_string_field(record, "Client"))
+            })
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn opened_files_for_workspace(&self, workspace: &str) -> McpResult<Vec<Value>> {
+        let output = self
+            .run_p4(json_invocation(
+                vec![
+                    "opened".to_string(),
+                    "-C".to_string(),
+                    workspace.to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        Ok(output.records)
+    }
+
+    async fn reject_view_update_when_workspaces_have_open_files(
+        &self,
+        stream_name: &str,
+    ) -> McpResult<()> {
+        let workspaces = self.stream_bound_workspaces(stream_name).await?;
+        for workspace in workspaces {
+            let opened = self.opened_files_for_workspace(&workspace).await?;
+            if !opened.is_empty() {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Cannot modify stream view: workspace '{workspace}' has {} open file(s). Submit or revert changes first.",
+                    opened.len()
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_stream_update(
+        &self,
+        params: &ModifyStreamsParams,
+        stream_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.require_active_stream(&stream_name, "Stream").await?;
+
+        let current_form = self.fetch_stream_form(&stream_name).await?;
+        if stream_options_are_locked(&current_form) {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Stream '{stream_name}' is locked. Force update is not supported."
+            ))));
+        }
+
+        let resolve_preview = self
+            .executor
+            .run(
+                json_invocation(
+                    vec![
+                        "stream".to_string(),
+                        "resolve".to_string(),
+                        "-n".to_string(),
+                    ],
+                    None,
+                ),
+                P4Env::new(),
+            )
+            .await;
+        if let Ok(output) = resolve_preview
+            && !output.records.is_empty()
+        {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Stream '{stream_name}' has pending spec conflicts that must be resolved before editing"
+            ))));
+        }
+
+        if stream_update_is_view_affecting(params) {
+            self.reject_view_update_when_workspaces_have_open_files(&stream_name)
+                .await?;
+        }
+
+        let patch = StreamFormPatch {
+            stream: Some(stream_name.clone()),
+            stream_type: params.stream_type.clone(),
+            parent: params.parent.clone(),
+            name: params.name.clone(),
+            description: params.description.clone(),
+            options: params.options.clone(),
+            parent_view: None,
+            paths: params.paths.clone(),
+            remapped: params.remapped.clone(),
+            ignored: params.ignored.clone(),
+        };
+        let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
+        let save_response = self.save_stream_form("update", patched).await?;
+
+        if let Some(parent_view) = params
+            .parent_view
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.run_p4(json_invocation(
+                vec![
+                    "stream".to_string(),
+                    "parentview".to_string(),
+                    format!("--{parent_view}"),
+                    stream_name,
+                ],
+                None,
+            ))
+            .await?;
+        }
+
+        Ok(save_response)
     }
 
     async fn query_workspace_get(
@@ -1175,38 +1309,7 @@ impl P4McpServer {
                 self.execute_stream_create(&params, stream_name).await
             }
             StreamModifyCommand::Update { stream_name } => {
-                let current = self
-                    .run_p4(text_invocation(vec![
-                        "stream".to_string(),
-                        "-o".to_string(),
-                        stream_name.clone(),
-                    ]))
-                    .await?;
-                let current_form = current
-                    .text
-                    .get("stdout")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        to_mcp_error(invalid_input("p4 stream -o did not return stdout"))
-                    })?;
-                let patch = StreamFormPatch {
-                    stream: Some(stream_name),
-                    stream_type: params.stream_type.clone(),
-                    parent: params.parent.clone(),
-                    name: params.name.clone(),
-                    description: params.description.clone(),
-                    options: params.options.clone(),
-                    parent_view: params.parent_view.clone(),
-                    paths: params.paths.clone(),
-                    remapped: params.remapped.clone(),
-                    ignored: params.ignored.clone(),
-                };
-                let patched = patch_stream_form(current_form, &patch).map_err(to_mcp_error)?;
-                self.call_p4_tool(
-                    &action,
-                    json_invocation(vec!["stream".to_string(), "-i".to_string()], Some(patched)),
-                )
-                .await
+                self.execute_stream_update(&params, stream_name).await
             }
             StreamModifyCommand::Switch {
                 stream_name,
@@ -2334,6 +2437,29 @@ fn form_has_non_empty_field(form: &str, field: &str) -> bool {
         line.strip_prefix(&prefix)
             .is_some_and(|value| !value.trim().is_empty())
     })
+}
+
+fn record_string_field<'a>(record: &'a Value, field: &str) -> Option<&'a str> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn stream_update_is_view_affecting(params: &ModifyStreamsParams) -> bool {
+    params.paths.is_some()
+        || params.remapped.is_some()
+        || params.ignored.is_some()
+        || params.parent_view.is_some()
+}
+
+fn stream_options_are_locked(form: &str) -> bool {
+    form.lines()
+        .find_map(|line| line.strip_prefix("Options:"))
+        .is_some_and(|options| {
+            let lower = options.to_ascii_lowercase();
+            lower.contains("locked") && !lower.contains("unlocked")
+        })
 }
 
 fn is_valid_stream_type(stream_type: &str) -> bool {
@@ -4045,8 +4171,20 @@ Paths:
 ";
         let executor = Arc::new(QueuedExecutor::success(vec![
             P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
                 records: Vec::new(),
                 text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
             },
             P4CommandOutput {
                 records: vec![json!({"Stream": "//streams/dev"})],
@@ -4077,11 +4215,17 @@ Paths:
         assert_eq!(response.0.status, "success");
         assert_eq!(response.0.action, "update");
         let invocations = executor.invocations();
-        assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[0].args, ["stream", "-o", "//streams/dev"]);
-        assert_eq!(invocations[0].mode, OutputMode::Text);
-        assert_eq!(invocations[1].args, ["stream", "-i"]);
-        let saved_form = invocations[1]
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[1].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[1].mode, OutputMode::Text);
+        assert_eq!(invocations[2].args, ["stream", "resolve", "-n"]);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert_eq!(invocations[4].args, ["stream", "-i"]);
+        let saved_form = invocations[4]
             .stdin
             .as_deref()
             .expect("stream -i should receive patched form");
@@ -4090,6 +4234,180 @@ Paths:
         assert!(saved_form.contains("Description:\n\tnew description"));
         assert!(saved_form.contains("Options: ownersubmit unlocked toparent fromparent"));
         assert!(saved_form.contains("Paths:\n\tshare ...\n\tisolate generated/..."));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_missing_stream_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/missing".to_string());
+        params.description = Some("new description".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("missing stream update should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message
+                .contains("Stream '//streams/missing' does not exist")
+        );
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/missing"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/missing"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_view_change_when_bound_workspace_has_open_files() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//streams/dev/file.txt"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.paths = Some(vec![
+            "share ...".to_string(),
+            "isolate generated/...".to_string(),
+        ]);
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("view-affecting update with open files should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("Cannot modify stream view"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert_eq!(invocations[4].args, ["opened", "-C", "ws-dev"]);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_changes_parent_view_with_parentview_command() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+ParentView: inherit
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+        params.parent_view = Some("noinherit".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved parent_view update should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 6);
+        assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
+        assert_eq!(invocations[4].args, ["stream", "-i"]);
+        let saved_form = invocations[4]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(!saved_form.contains("ParentView: noinherit"));
+        assert_eq!(
+            invocations[5].args,
+            ["stream", "parentview", "--noinherit", "//streams/dev"]
+        );
     }
 
     #[tokio::test]
