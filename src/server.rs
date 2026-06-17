@@ -48,7 +48,6 @@ use crate::{
             ModifyFilesParams, ModifyJobsParams, ModifyShelvesParams, ModifyStreamsParams,
             ModifyWorkspacesParams, QueryChangelistsParams, QueryFilesParams, QueryJobsParams,
             QueryShelvesParams, QueryStreamsParams, QueryWorkspacesParams, StreamModifyAction,
-            WorkspaceModifyAction,
         },
         response::ToolResponse,
         reviews::{
@@ -66,8 +65,9 @@ use crate::{
             stream_spec_with_view_invocation,
         },
         workspaces::{
-            build_workspace_delete_invocation, build_workspace_exists_invocation,
-            build_workspace_query_invocation, required_workspace_name,
+            WorkspaceModifyCommand, build_workspace_exists_invocation,
+            build_workspace_modify_command, build_workspace_query_invocation,
+            required_workspace_name,
         },
     },
 };
@@ -1327,73 +1327,143 @@ impl P4McpServer {
             .check(Access::Write, Toolset::Workspaces, "modify_workspaces")
             .map_err(to_mcp_error)?;
         let action = params.action.as_str().to_string();
-        let workspace_name =
-            required_workspace_name(&params.workspace_name, params.action.as_str())
-                .map_err(to_mcp_error)?;
-        let invocation = match params.action {
-            WorkspaceModifyAction::Create | WorkspaceModifyAction::Update => json_invocation(
-                vec!["client".to_string(), "-i".to_string()],
-                Some("workspace form will be fetched and patched after approval\n".to_string()),
-            ),
-            WorkspaceModifyAction::Delete => {
-                build_workspace_delete_invocation(&params).map_err(to_mcp_error)?
-            }
-            WorkspaceModifyAction::Switch => json_invocation(
-                vec![
-                    "client".to_string(),
-                    "-s".to_string(),
+        let command = build_workspace_modify_command(&params).map_err(to_mcp_error)?;
+        let request = match &command {
+            WorkspaceModifyCommand::Create { workspace_name }
+            | WorkspaceModifyCommand::Update { workspace_name }
+            | WorkspaceModifyCommand::Switch { workspace_name } => self
+                .modify_workspaces_context_approval_request(
+                    &params,
+                    &action,
                     workspace_name.clone(),
-                ],
-                None,
-            ),
+                ),
+            WorkspaceModifyCommand::Delete(invocation) => {
+                let workspace_name =
+                    required_workspace_name(&params.workspace_name, params.action.as_str())
+                        .map_err(to_mcp_error)?;
+                self.modify_workspaces_approval_request(
+                    &params,
+                    P4ApprovalContext {
+                        tool: "modify_workspaces",
+                        action: &action,
+                        targets: vec![workspace_name.clone()],
+                        changelist: None,
+                        workspace: Some(workspace_name),
+                        stream: None,
+                        invocation,
+                    },
+                )
+            }
         };
-        let request = self.modify_workspaces_approval_request(
-            &params,
-            P4ApprovalContext {
-                tool: "modify_workspaces",
-                action: &action,
-                targets: vec![workspace_name.clone()],
-                changelist: None,
-                workspace: Some(workspace_name.clone()),
-                stream: None,
-                invocation: &invocation,
-            },
-        );
         if let Some(response) = self
             .require_write_approval(channel, request, params.approval_token.as_deref())
             .await?
         {
             return Ok(response);
         }
-        let invocation = match params.action {
-            WorkspaceModifyAction::Create | WorkspaceModifyAction::Update => {
-                let output = self
-                    .run_p4(text_invocation(vec![
-                        "client".to_string(),
-                        "-o".to_string(),
-                        workspace_name.clone(),
-                    ]))
-                    .await?;
-                let existing = output
-                    .text
-                    .get("stdout")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        to_mcp_error(invalid_input("p4 client -o did not return stdout"))
-                    })?;
-                let patch = WorkspaceFormPatch {
-                    root: params.workspace_root.clone(),
-                    description: params.workspace_description.clone(),
-                    options: params.workspace_options.clone(),
-                    line_end: params.workspace_line_end.clone(),
-                    view: params.workspace_view.clone(),
-                };
-                let patched = patch_workspace_form(existing, &patch).map_err(to_mcp_error)?;
-                json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched))
+        match command {
+            WorkspaceModifyCommand::Create { workspace_name } => {
+                self.execute_workspace_create(&params, workspace_name).await
             }
-            WorkspaceModifyAction::Delete | WorkspaceModifyAction::Switch => invocation,
-        };
-        self.call_p4_tool(&action, invocation).await
+            WorkspaceModifyCommand::Update { workspace_name } => {
+                self.execute_workspace_update(&params, workspace_name).await
+            }
+            WorkspaceModifyCommand::Delete(invocation) => {
+                self.call_p4_tool(&action, invocation).await
+            }
+            WorkspaceModifyCommand::Switch { workspace_name } => {
+                self.execute_workspace_switch(workspace_name).await
+            }
+        }
+    }
+
+    async fn execute_workspace_create(
+        &self,
+        params: &ModifyWorkspacesParams,
+        workspace_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self
+            .run_p4(text_invocation(vec![
+                "client".to_string(),
+                "-o".to_string(),
+                workspace_name,
+            ]))
+            .await?;
+        let existing = output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 client -o did not return stdout")))?;
+        let patched =
+            patch_workspace_form(existing, &workspace_form_patch(params)).map_err(to_mcp_error)?;
+        self.call_p4_tool(
+            "create",
+            json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched)),
+        )
+        .await
+    }
+
+    async fn execute_workspace_update(
+        &self,
+        params: &ModifyWorkspacesParams,
+        workspace_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let _info = self
+            .run_p4(json_invocation(vec!["info".to_string()], None))
+            .await?;
+        let output = self
+            .run_p4(text_invocation(vec![
+                "client".to_string(),
+                "-o".to_string(),
+                workspace_name,
+            ]))
+            .await?;
+        let existing = output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 client -o did not return stdout")))?;
+        let patched =
+            patch_workspace_form(existing, &workspace_form_patch(params)).map_err(to_mcp_error)?;
+        self.call_p4_tool(
+            "update",
+            json_invocation(vec!["client".to_string(), "-i".to_string()], Some(patched)),
+        )
+        .await
+    }
+
+    async fn execute_workspace_switch(
+        &self,
+        workspace_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let _info = self
+            .run_p4(json_invocation(vec!["info".to_string()], None))
+            .await?;
+        let output = self
+            .run_p4(text_invocation(vec![
+                "client".to_string(),
+                "-o".to_string(),
+                workspace_name.clone(),
+            ]))
+            .await?;
+        let existing = output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 client -o did not return stdout")))?;
+        if !form_has_non_empty_field(existing, "Update")
+            && !form_has_non_empty_field(existing, "Access")
+        {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace_name}' does not exist"
+            ))));
+        }
+
+        self.set_active_client(workspace_name.clone()).await;
+        Ok(Json(ToolResponse::success(
+            "switch",
+            json!(format!("Switched to workspace '{workspace_name}'")),
+        )))
     }
 
     async fn modify_jobs_inner(
@@ -1650,6 +1720,24 @@ impl P4McpServer {
         }
     }
 
+    fn modify_workspaces_context_approval_request(
+        &self,
+        params: &ModifyWorkspacesParams,
+        action: &str,
+        workspace_name: String,
+    ) -> ApprovalRequest {
+        let mut approval_params = params.clone();
+        approval_params.approval_token = None;
+
+        ApprovalRequest {
+            tool: "modify_workspaces".to_string(),
+            action: action.to_string(),
+            params: serde_json::to_value(approval_params)
+                .expect("modify workspaces params serialize to JSON"),
+            preview: self.workspace_context_approval_preview(action, workspace_name),
+        }
+    }
+
     fn modify_jobs_approval_request(
         &self,
         params: &ModifyJobsParams,
@@ -1731,6 +1819,27 @@ impl P4McpServer {
             stream: context.stream,
             review: None,
             command: Some(command_preview(&self.config.p4_bin, context.invocation)),
+            commands: None,
+            request: None,
+        }
+    }
+
+    fn workspace_context_approval_preview(
+        &self,
+        action: &str,
+        workspace_name: String,
+    ) -> ApprovalPreview {
+        let targets = vec![workspace_name.clone()];
+        ApprovalPreview {
+            summary: approval_summary(action, &targets),
+            tool: "modify_workspaces".to_string(),
+            action: action.to_string(),
+            targets,
+            changelist: None,
+            workspace: Some(workspace_name),
+            stream: None,
+            review: None,
+            command: None,
             commands: None,
             request: None,
         }
@@ -2574,6 +2683,16 @@ fn output_message_with_record_limit(mut output: P4CommandOutput, max_records: us
     } else {
         output.records.truncate(max_records);
         Value::Array(output.records)
+    }
+}
+
+fn workspace_form_patch(params: &ModifyWorkspacesParams) -> WorkspaceFormPatch {
+    WorkspaceFormPatch {
+        root: params.workspace_root.clone(),
+        description: params.workspace_description.clone(),
+        options: params.workspace_options.clone(),
+        line_end: params.workspace_line_end.clone(),
+        view: params.workspace_view.clone(),
     }
 }
 
@@ -4025,6 +4144,277 @@ Files:
         let envs = executor.envs();
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].get("P4CLIENT").map(String::as_str), Some("ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_switch_preview_does_not_emit_client_s() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Client": "ws-main", "Owner": "alice"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Switch);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.tool, "modify_workspaces");
+        assert_eq!(calls[0].request.action, "switch");
+        assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+        assert_eq!(
+            calls[0].request.preview.workspace.as_deref(),
+            Some("ws-main")
+        );
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(calls[0].request.preview.commands, None);
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_switch_sets_active_client_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"userName": "alice"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "Client: ws-main\nOwner: alice\nUpdate: 2026/06/17 00:00:00\nRoot: /workspace/root\n"
+                }),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Switch);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("switch should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        assert_eq!(response.0.message, json!("Switched to workspace 'ws-main'"));
+
+        let query_response = server
+            .call_p4_tool(
+                "list",
+                json_invocation(
+                    vec!["clients".to_string(), "-m".to_string(), "100".to_string()],
+                    None,
+                ),
+            )
+            .await
+            .expect("later p4 call should use switched active client");
+        assert_eq!(query_response.0.status, "success");
+
+        let invocations = executor.invocations();
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|invocation| invocation.args.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["info"],
+                vec!["client", "-o", "ws-main"],
+                vec!["clients", "-m", "100"],
+            ]
+        );
+        let envs = executor.envs();
+        assert_eq!(envs[0].get("P4CLIENT"), None);
+        assert_eq!(envs[1].get("P4CLIENT"), None);
+        assert_eq!(envs[2].get("P4CLIENT").map(String::as_str), Some("ws-main"));
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_create_without_spec_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Create);
+
+        let err = match server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("create without spec fields should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("workspace specification fields are required for create")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_update_without_spec_rejects_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let params = modify_workspaces_params(WorkspaceModifyAction::Update);
+
+        let err = match server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update without spec fields should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+        assert!(
+            err.message
+                .contains("workspace specification fields are required for update")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_create_fetches_and_saves_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "Client: ws-main\nRoot: /old/root\nOptions: noallwrite noclobber nocompress unlocked nomodtime normdir\nLineEnd: local\nView:\n\t//depot/... //ws-main/...\n"
+                }),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Create);
+        params.workspace_root = Some("/workspace/root".to_string());
+        params.workspace_view = Some(vec!["//depot/main/... //ws-main/main/...".to_string()]);
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("create should save patched client form");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create");
+        let invocations = executor.invocations();
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|invocation| invocation.args.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["client", "-o", "ws-main"], vec!["client", "-i"]]
+        );
+        assert!(
+            invocations[1]
+                .stdin
+                .as_deref()
+                .expect("client -i should receive patched form")
+                .contains("Root: /workspace/root")
+        );
+        assert!(
+            invocations[1]
+                .stdin
+                .as_deref()
+                .expect("client -i should receive patched form")
+                .contains("//depot/main/... //ws-main/main/...")
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_workspaces_update_fetches_info_then_saves_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({"userName": "alice"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({
+                    "stdout": "Client: ws-main\nOwner: bob\nRoot: /old/root\nOptions: noallwrite noclobber nocompress unlocked nomodtime normdir\nLineEnd: local\nView:\n\t//depot/... //ws-main/...\n"
+                }),
+            },
+            P4CommandOutput {
+                records: vec![json!({"client": "ws-main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_workspaces_params(WorkspaceModifyAction::Update);
+        params.workspace_description = Some("Updated workspace".to_string());
+
+        let response = server
+            .modify_workspaces_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("update should save patched client form");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|invocation| invocation.args.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["info"],
+                vec!["client", "-o", "ws-main"],
+                vec!["client", "-i"]
+            ]
+        );
+        assert!(
+            invocations[2]
+                .stdin
+                .as_deref()
+                .expect("client -i should receive patched form")
+                .contains("Description:\n\tUpdated workspace")
+        );
     }
 
     #[tokio::test]
