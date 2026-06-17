@@ -1078,19 +1078,30 @@ impl P4McpServer {
             StreamModifyCommand::Switch {
                 stream_name,
                 workspace,
-                preview: _,
+                preview,
             } => {
-                let mut args = vec![
-                    "client".to_string(),
-                    "-s".to_string(),
-                    "-S".to_string(),
-                    stream_name,
-                ];
-                if let Some(workspace) = workspace {
-                    args.push(workspace);
-                }
-                self.call_p4_tool(&action, json_invocation(args, None))
+                if preview {
+                    self.call_p4_tool(
+                        &action,
+                        json_invocation(
+                            vec!["stream".to_string(), "-o".to_string(), stream_name],
+                            None,
+                        ),
+                    )
                     .await
+                } else {
+                    let mut args = vec![
+                        "client".to_string(),
+                        "-s".to_string(),
+                        "-S".to_string(),
+                        stream_name,
+                    ];
+                    if let Some(workspace) = workspace {
+                        args.push(workspace);
+                    }
+                    self.call_p4_tool(&action, json_invocation(args, None))
+                        .await
+                }
             }
             StreamModifyCommand::CreateWorkspace {
                 stream_name,
@@ -3610,6 +3621,46 @@ Files:
                 "//streams/dev".to_string(),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_preview_executes_read_only_stream_o_after_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-dev".to_string());
+        params.preview = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved switch preview should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "stream".to_string(),
+                "-o".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["stream", "-o", "//streams/dev"]);
     }
 
     #[tokio::test]
