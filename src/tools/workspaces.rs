@@ -27,6 +27,18 @@ pub fn required_workspace_name(value: &str, action: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+pub fn build_workspace_exists_invocation(workspace_name: &str) -> Result<P4Invocation> {
+    Ok(P4Invocation {
+        args: vec![
+            "clients".into(),
+            "-e".into(),
+            required(Some(workspace_name), "workspace_name")?,
+        ],
+        stdin: None,
+        mode: OutputMode::JsonLines,
+    })
+}
+
 pub fn build_workspace_query_invocation(
     action: &str,
     workspace_name: Option<&str>,

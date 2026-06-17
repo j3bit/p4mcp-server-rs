@@ -65,8 +65,8 @@ use crate::{
             stream_spec_with_view_invocation,
         },
         workspaces::{
-            build_workspace_delete_invocation, build_workspace_query_invocation,
-            required_workspace_name,
+            build_workspace_delete_invocation, build_workspace_exists_invocation,
+            build_workspace_query_invocation, required_workspace_name,
         },
     },
 };
@@ -231,11 +231,39 @@ impl P4McpServer {
         .map_err(review_api_error)
     }
 
+    async fn require_existing_workspace(&self, workspace_name: &str) -> McpResult<()> {
+        let output = self
+            .run_p4(build_workspace_exists_invocation(workspace_name).map_err(to_mcp_error)?)
+            .await?;
+        if output.records.is_empty() {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace_name}' does not exist"
+            ))));
+        }
+        Ok(())
+    }
+
+    async fn query_workspace_get(
+        &self,
+        workspace_name: Option<&str>,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_name =
+            require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+        self.require_existing_workspace(&workspace_name).await?;
+        let invocation = build_workspace_query_invocation("get", Some(&workspace_name), None, 100)
+            .map_err(to_mcp_error)?;
+        let output = self.run_p4(invocation).await?;
+        Ok(Json(ToolResponse::success("get", output_message(output))))
+    }
+
     async fn query_workspace_type(
         &self,
         workspace_name: Option<&str>,
     ) -> McpResult<Json<ToolResponse>> {
-        let invocation = build_workspace_query_invocation("type", workspace_name, None, 100)
+        let workspace_name =
+            require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+        self.require_existing_workspace(&workspace_name).await?;
+        let invocation = build_workspace_query_invocation("type", Some(&workspace_name), None, 100)
             .map_err(to_mcp_error)?;
         let output = self.run_p4(invocation).await?;
         Ok(Json(ToolResponse::success(
@@ -250,6 +278,7 @@ impl P4McpServer {
     ) -> McpResult<Json<ToolResponse>> {
         let workspace_name =
             require_non_blank(workspace_name, "workspace_name").map_err(to_mcp_error)?;
+        self.require_existing_workspace(&workspace_name).await?;
 
         let workspace_spec = self
             .run_workspace_status_command(
@@ -1465,6 +1494,11 @@ impl P4McpServer {
             .check(Access::Read, Toolset::Workspaces, "query_workspaces")
             .map_err(to_mcp_error)?;
         let action = params.action.as_str();
+        if action == "get" {
+            return self
+                .query_workspace_get(params.workspace_name.as_deref())
+                .await;
+        }
         if action == "type" {
             return self
                 .query_workspace_type(params.workspace_name.as_deref())

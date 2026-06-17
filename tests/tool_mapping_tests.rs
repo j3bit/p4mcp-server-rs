@@ -24,7 +24,10 @@ use p4mcp_server_rs::{
         server::{QueryServerParams, ServerQueryAction, build_server_invocation},
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
         streams::{build_stream_modify_command, build_stream_query_command},
-        workspaces::{build_workspace_delete_invocation, build_workspace_query_invocation},
+        workspaces::{
+            build_workspace_delete_invocation, build_workspace_exists_invocation,
+            build_workspace_query_invocation,
+        },
     },
 };
 use schemars::JsonSchema;
@@ -295,15 +298,7 @@ fn query_file_grep_maps_pattern_and_suppresses_long_line_errors() {
     let invocation = build_file_invocation(&params).unwrap();
     assert_eq!(
         invocation.args,
-        vec![
-            "grep",
-            "-n",
-            "-s",
-            "-i",
-            "-e",
-            "needle",
-            "//depot/main/..."
-        ]
+        vec!["grep", "-n", "-s", "-i", "-e", "needle", "//depot/main/..."]
     );
     assert_eq!(invocation.mode, OutputMode::JsonLines);
 }
@@ -1247,7 +1242,14 @@ fn workspace_list_by_user_uses_user_filter() {
 }
 
 #[test]
-fn workspace_type_uses_client_spec() {
+fn workspace_exists_uses_clients_exact_filter() {
+    let invocation = build_workspace_exists_invocation("ws-stream").unwrap();
+    assert_eq!(invocation.args, vec!["clients", "-e", "ws-stream"]);
+    assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn workspace_type_uses_client_spec_after_existence_check() {
     let invocation = build_workspace_query_invocation("type", Some("ws-stream"), None, 10).unwrap();
     assert_eq!(invocation.args, vec!["client", "-o", "ws-stream"]);
     assert_eq!(invocation.mode, OutputMode::JsonLines);

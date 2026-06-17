@@ -345,14 +345,21 @@ async fn query_workspaces_list_by_user_calls_injected_executor() {
 }
 
 #[tokio::test]
-async fn query_workspaces_type_classifies_stream_workspace() {
-    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-        records: vec![json!({
-            "Client": "ws-stream",
-            "Stream": "//streams/main"
-        })],
-        text: json!({}),
-    }));
+async fn query_workspaces_type_checks_existence_then_classifies_stream_workspace() {
+    let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"client": "ws-stream"})],
+            text: json!({}),
+        },
+        P4CommandOutput {
+            records: vec![json!({
+                "Client": "ws-stream",
+                "Update": "2026/06/17",
+                "Stream": "//streams/main"
+            })],
+            text: json!({}),
+        },
+    ]));
     let server = P4McpServer::with_executor(test_config(), executor.clone());
 
     let response = server
@@ -368,16 +375,75 @@ async fn query_workspaces_type_classifies_stream_workspace() {
     assert_eq!(response.0.status, "success");
     assert_eq!(response.0.action, "type");
     assert_eq!(response.0.message, json!({"workspace_type": "stream"}));
-    assert_eq!(executor.invocations().len(), 1);
-    assert_eq!(
-        executor.invocations()[0].args,
-        ["client", "-o", "ws-stream"]
-    );
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations[0].args, ["clients", "-e", "ws-stream"]);
+    assert_eq!(invocations[1].args, ["client", "-o", "ws-stream"]);
+}
+
+#[tokio::test]
+async fn query_workspaces_get_rejects_missing_workspace_before_client_form_read() {
+    let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_workspaces(Parameters(QueryWorkspacesParams {
+            action: WorkspaceQueryAction::Get,
+            workspace_name: Some("ghost-ws".to_string()),
+            user: None,
+            max_results: 10,
+        }))
+        .await
+    {
+        Ok(_) => panic!("query_workspaces get should reject missing workspace"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("Workspace 'ghost-ws' does not exist"));
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].args, ["clients", "-e", "ghost-ws"]);
+}
+
+#[tokio::test]
+async fn query_workspaces_status_rejects_missing_workspace_before_status_commands() {
+    let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+        records: Vec::new(),
+        text: json!({}),
+    }]));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let err = match server
+        .query_workspaces(Parameters(QueryWorkspacesParams {
+            action: WorkspaceQueryAction::Status,
+            workspace_name: Some("ghost-ws".to_string()),
+            user: None,
+            max_results: 10,
+        }))
+        .await
+    {
+        Ok(_) => panic!("query_workspaces status should reject missing workspace"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, ErrorData::invalid_params("", None).code);
+    assert!(err.message.contains("Workspace 'ghost-ws' does not exist"));
+    let invocations = executor.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].args, ["clients", "-e", "ghost-ws"]);
 }
 
 #[tokio::test]
 async fn query_workspaces_status_runs_upstream_status_commands() {
     let executor = Arc::new(QueuedExecutor::success(vec![
+        P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        },
         P4CommandOutput {
             records: vec![json!({"Client": "ws-main", "View0": "//depot/... //ws-main/..."})],
             text: json!({}),
@@ -425,12 +491,13 @@ async fn query_workspaces_status_runs_upstream_status_commands() {
     );
 
     let invocations = executor.invocations();
-    assert_eq!(invocations.len(), 5);
-    assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
-    assert_eq!(invocations[1].args, ["opened"]);
-    assert_eq!(invocations[2].args, ["sync", "-n"]);
-    assert_eq!(invocations[3].args, ["resolve", "-n"]);
-    assert_eq!(invocations[4].args, ["changes", "-m1", "#have"]);
+    assert_eq!(invocations.len(), 6);
+    assert_eq!(invocations[0].args, ["clients", "-e", "ws-main"]);
+    assert_eq!(invocations[1].args, ["client", "-o", "ws-main"]);
+    assert_eq!(invocations[2].args, ["opened"]);
+    assert_eq!(invocations[3].args, ["sync", "-n"]);
+    assert_eq!(invocations[4].args, ["resolve", "-n"]);
+    assert_eq!(invocations[5].args, ["changes", "-m1", "#have"]);
 }
 
 #[tokio::test]
