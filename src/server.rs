@@ -447,22 +447,16 @@ impl P4McpServer {
         }
 
         let resolve_preview = self
-            .executor
-            .run(
-                json_invocation(
-                    vec![
-                        "stream".to_string(),
-                        "resolve".to_string(),
-                        "-n".to_string(),
-                    ],
-                    None,
-                ),
-                P4Env::new(),
-            )
-            .await;
-        if let Ok(output) = resolve_preview
-            && !output.records.is_empty()
-        {
+            .run_p4(json_invocation(
+                vec![
+                    "stream".to_string(),
+                    "resolve".to_string(),
+                    "-n".to_string(),
+                ],
+                None,
+            ))
+            .await?;
+        if !resolve_preview.records.is_empty() {
             return Err(to_mcp_error(invalid_input(format!(
                 "Stream '{stream_name}' has pending spec conflicts that must be resolved before editing"
             ))));
@@ -4257,6 +4251,66 @@ Paths:
         assert!(saved_form.contains("Description:\n\tnew description"));
         assert!(saved_form.contains("Options: ownersubmit unlocked toparent fromparent"));
         assert!(saved_form.contains("Paths:\n\tshare ...\n\tisolate generated/..."));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_rejects_resolve_preview_error_before_save() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::results(vec![
+            Ok(P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            }),
+            Ok(P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            }),
+            Err(P4McpError::P4Command {
+                message: "resolve preview failed".to_string(),
+            }),
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("resolve preview errors should reject stream update before save"),
+            Err(err) => err,
+        };
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[1].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[1].mode, OutputMode::Text);
+        assert_eq!(invocations[2].args, ["stream", "resolve", "-n"]);
+        assert!(
+            !invocations
+                .iter()
+                .any(|invocation| invocation.args.as_slice() == ["stream", "-i"])
+        );
+        assert!(err.message.contains("resolve preview failed"));
     }
 
     #[tokio::test]
