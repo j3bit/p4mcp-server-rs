@@ -486,6 +486,15 @@ impl P4McpServer {
             ignored: params.ignored.clone(),
         };
         let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
+        let parent_view_requested = params
+            .parent_view
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let patched = if parent_view_requested {
+            remove_stream_parent_view_field(&patched)
+        } else {
+            patched
+        };
         let save_response = self.save_stream_form("update", patched).await?;
 
         if let Some(parent_view) = params
@@ -2453,6 +2462,20 @@ fn stream_update_is_view_affecting(params: &ModifyStreamsParams) -> bool {
         || params.parent_view.is_some()
 }
 
+fn remove_stream_parent_view_field(form: &str) -> String {
+    let mut output = String::with_capacity(form.len());
+    for line in form.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let line_without_terminator = line_without_newline
+            .strip_suffix('\r')
+            .unwrap_or(line_without_newline);
+        if !line_without_terminator.starts_with("ParentView:") {
+            output.push_str(line);
+        }
+    }
+    output
+}
+
 fn stream_options_are_locked(form: &str) -> bool {
     form.lines()
         .find_map(|line| line.strip_prefix("Options:"))
@@ -4403,7 +4426,10 @@ Paths:
             .stdin
             .as_deref()
             .expect("stream -i should receive patched form");
-        assert!(!saved_form.contains("ParentView: noinherit"));
+        assert!(
+            !saved_form.contains("ParentView:"),
+            "saved form should not contain ParentView, got:\n{saved_form}"
+        );
         assert_eq!(
             invocations[5].args,
             ["stream", "parentview", "--noinherit", "//streams/dev"]
