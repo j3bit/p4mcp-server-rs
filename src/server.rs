@@ -3903,6 +3903,14 @@ Files:
                 records: Vec::new(),
                 text: json!({}),
             },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
         ]));
         let approval_gate = Arc::new(FakeApprovalGate::approved());
         let server = P4McpServer::with_executor_and_approval(
@@ -3913,18 +3921,22 @@ Files:
         let mut params = modify_streams_params(StreamModifyAction::Create);
         params.stream_name = Some("//streams/dev".to_string());
         params.stream_type = Some("development".to_string());
+        params.parent = Some("//streams/main".to_string());
 
         let err = match server
             .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
             .await
         {
-            Ok(_) => panic!("child stream create without parent should be rejected"),
+            Ok(_) => panic!("child stream create with missing parent should be rejected"),
             Err(err) => err,
         };
 
-        assert!(err.message.contains("Parent stream is required"));
+        assert!(
+            err.message
+                .contains("Parent stream '//streams/main' does not exist")
+        );
         let invocations = executor.invocations();
-        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations.len(), 4);
         assert_eq!(
             invocations[0].args,
             ["streams", "-F", "Stream=//streams/dev"]
@@ -3932,6 +3944,14 @@ Files:
         assert_eq!(
             invocations[1].args,
             ["streams", "-a", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(
+            invocations[2].args,
+            ["streams", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(
+            invocations[3].args,
+            ["streams", "-a", "-F", "Stream=//streams/main"]
         );
     }
 
