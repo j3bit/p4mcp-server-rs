@@ -990,12 +990,36 @@ impl P4McpServer {
         let command = build_stream_modify_command(&params).map_err(to_mcp_error)?;
         let preview_invocation = match &command {
             StreamModifyCommand::Single(invocation) => invocation.clone(),
-            StreamModifyCommand::CreateOrUpdate { stream_name } => json_invocation(
+            StreamModifyCommand::Create { stream_name }
+            | StreamModifyCommand::Update { stream_name } => json_invocation(
                 vec!["stream".to_string(), "-i".to_string()],
                 Some(format!(
                     "Stream: {stream_name}\n\n<patched after approval>\n"
                 )),
             ),
+            StreamModifyCommand::Switch {
+                stream_name,
+                workspace,
+                preview,
+            } => {
+                if *preview {
+                    json_invocation(
+                        vec!["stream".to_string(), "-o".to_string(), stream_name.clone()],
+                        None,
+                    )
+                } else {
+                    let mut args = vec![
+                        "client".to_string(),
+                        "-s".to_string(),
+                        "-S".to_string(),
+                        stream_name.clone(),
+                    ];
+                    if let Some(workspace) = workspace {
+                        args.push(workspace.clone());
+                    }
+                    json_invocation(args, None)
+                }
+            }
             StreamModifyCommand::CreateWorkspace {
                 stream_name,
                 workspace_name,
@@ -1016,7 +1040,8 @@ impl P4McpServer {
         }
         match command {
             StreamModifyCommand::Single(invocation) => self.call_p4_tool(&action, invocation).await,
-            StreamModifyCommand::CreateOrUpdate { stream_name } => {
+            StreamModifyCommand::Create { stream_name }
+            | StreamModifyCommand::Update { stream_name } => {
                 let current = self
                     .run_p4(text_invocation(vec![
                         "stream".to_string(),
@@ -1049,6 +1074,23 @@ impl P4McpServer {
                     json_invocation(vec!["stream".to_string(), "-i".to_string()], Some(patched)),
                 )
                 .await
+            }
+            StreamModifyCommand::Switch {
+                stream_name,
+                workspace,
+                preview: _,
+            } => {
+                let mut args = vec![
+                    "client".to_string(),
+                    "-s".to_string(),
+                    "-S".to_string(),
+                    stream_name,
+                ];
+                if let Some(workspace) = workspace {
+                    args.push(workspace);
+                }
+                self.call_p4_tool(&action, json_invocation(args, None))
+                    .await
             }
             StreamModifyCommand::CreateWorkspace {
                 stream_name,

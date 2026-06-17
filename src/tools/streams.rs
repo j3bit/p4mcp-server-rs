@@ -66,8 +66,16 @@ impl StreamQueryCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamModifyCommand {
     Single(P4Invocation),
-    CreateOrUpdate {
+    Create {
         stream_name: String,
+    },
+    Update {
+        stream_name: String,
+    },
+    Switch {
+        stream_name: String,
+        workspace: Option<String>,
+        preview: bool,
     },
     CreateWorkspace {
         stream_name: String,
@@ -80,7 +88,10 @@ impl StreamModifyCommand {
     pub fn into_single_invocation(self) -> Option<P4Invocation> {
         match self {
             Self::Single(invocation) => Some(invocation),
-            Self::CreateOrUpdate { .. } | Self::CreateWorkspace { .. } => None,
+            Self::Create { .. }
+            | Self::Update { .. }
+            | Self::Switch { .. }
+            | Self::CreateWorkspace { .. } => None,
         }
     }
 }
@@ -139,8 +150,14 @@ pub fn build_stream_query_command(params: &QueryStreamsParams) -> Result<StreamQ
 
 pub fn build_stream_modify_command(params: &ModifyStreamsParams) -> Result<StreamModifyCommand> {
     let invocation = match &params.action {
-        StreamModifyAction::Create | StreamModifyAction::Update => {
-            return Ok(StreamModifyCommand::CreateOrUpdate {
+        StreamModifyAction::Create => {
+            let stream_name =
+                required_for_action(params.stream_name.as_deref(), "stream_name", &params.action)?;
+            required_for_action(params.stream_type.as_deref(), "stream_type", &params.action)?;
+            return Ok(StreamModifyCommand::Create { stream_name });
+        }
+        StreamModifyAction::Update => {
+            return Ok(StreamModifyCommand::Update {
                 stream_name: required_for_action(
                     params.stream_name.as_deref(),
                     "stream_name",
@@ -213,16 +230,11 @@ pub fn build_stream_modify_command(params: &ModifyStreamsParams) -> Result<Strea
         StreamModifyAction::Integrate => integrate_invocation(params),
         StreamModifyAction::Populate => populate_invocation(params),
         StreamModifyAction::Switch => {
-            let mut args = vec![
-                "client".to_string(),
-                "-s".to_string(),
-                "-S".to_string(),
-                required(params.stream_name.as_deref(), "stream_name")?,
-            ];
-            if let Some(workspace) = non_blank(params.workspace.as_deref()) {
-                args.push(workspace.to_string());
-            }
-            json_invocation(args)
+            return Ok(StreamModifyCommand::Switch {
+                stream_name: required(params.stream_name.as_deref(), "stream_name")?,
+                workspace: non_blank(params.workspace.as_deref()).map(str::to_string),
+                preview: params.preview,
+            });
         }
     };
     Ok(StreamModifyCommand::Single(invocation))

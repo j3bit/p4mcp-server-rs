@@ -23,7 +23,7 @@ use p4mcp_server_rs::{
         },
         server::{QueryServerParams, ServerQueryAction, build_server_invocation},
         shelves::{build_shelf_modify_invocation, build_shelf_query_invocation},
-        streams::{build_stream_modify_command, build_stream_query_command},
+        streams::{StreamModifyCommand, build_stream_modify_command, build_stream_query_command},
         workspaces::{
             build_workspace_delete_invocation, build_workspace_exists_invocation,
             build_workspace_query_invocation,
@@ -1306,6 +1306,67 @@ fn modify_streams_edit_spec_uses_stream_spec_edit_command() {
 
     assert_eq!(invocation.args, vec!["edit", "-So", "-c", "12345"]);
     assert_eq!(invocation.mode, OutputMode::JsonLines);
+}
+
+#[test]
+fn modify_streams_create_and_update_use_distinct_workflow_commands() {
+    let mut create_params = modify_streams_params(StreamModifyAction::Create);
+    create_params.stream_name = Some("//streams/new".to_string());
+    create_params.stream_type = Some("mainline".to_string());
+
+    let create_command = build_stream_modify_command(&create_params).unwrap();
+    match create_command {
+        StreamModifyCommand::Create { stream_name } => {
+            assert_eq!(stream_name, "//streams/new");
+        }
+        other => panic!("create should use Create workflow, got {other:?}"),
+    }
+
+    let mut update_params = modify_streams_params(StreamModifyAction::Update);
+    update_params.stream_name = Some("//streams/dev".to_string());
+
+    let update_command = build_stream_modify_command(&update_params).unwrap();
+    match update_command {
+        StreamModifyCommand::Update { stream_name } => {
+            assert_eq!(stream_name, "//streams/dev");
+        }
+        other => panic!("update should use Update workflow, got {other:?}"),
+    }
+}
+
+#[test]
+fn modify_streams_create_requires_stream_type_before_approval() {
+    let mut params = modify_streams_params(StreamModifyAction::Create);
+    params.stream_name = Some("//streams/new".to_string());
+
+    let error = build_stream_modify_command(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("stream_type is required for create"));
+}
+
+#[test]
+fn modify_streams_switch_uses_workflow_command_with_preview_flag() {
+    let mut params = modify_streams_params(StreamModifyAction::Switch);
+    params.stream_name = Some("//streams/dev".to_string());
+    params.workspace = Some("ws-main".to_string());
+    params.preview = true;
+
+    let command = build_stream_modify_command(&params).unwrap();
+
+    match command {
+        StreamModifyCommand::Switch {
+            stream_name,
+            workspace,
+            preview,
+        } => {
+            assert_eq!(stream_name, "//streams/dev");
+            assert_eq!(workspace.as_deref(), Some("ws-main"));
+            assert!(preview);
+        }
+        other => panic!("switch should use Switch workflow, got {other:?}"),
+    }
 }
 
 #[test]
