@@ -506,6 +506,123 @@ impl P4McpServer {
         Ok(save_response)
     }
 
+    async fn current_workspace_record(&self, workspace: Option<&str>) -> McpResult<Value> {
+        let mut args = vec!["client".to_string(), "-o".to_string()];
+        if let Some(workspace) = workspace.filter(|value| !value.trim().is_empty()) {
+            args.push(workspace.to_string());
+        }
+        let output = self.run_p4(json_invocation(args, None)).await?;
+        output
+            .records
+            .into_iter()
+            .next()
+            .ok_or_else(|| to_mcp_error(invalid_input("Workspace not found")))
+    }
+
+    async fn execute_stream_switch(
+        &self,
+        stream_name: String,
+        workspace: Option<String>,
+        preview: bool,
+    ) -> McpResult<Json<ToolResponse>> {
+        let workspace_record = self.current_workspace_record(workspace.as_deref()).await?;
+        let workspace_name = workspace
+            .clone()
+            .or_else(|| {
+                record_string_field(&workspace_record, "Client")
+                    .or_else(|| record_string_field(&workspace_record, "client"))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "current".to_string());
+
+        let exists = record_string_field(&workspace_record, "Update").is_some()
+            || record_string_field(&workspace_record, "Access").is_some();
+        if !exists {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Workspace '{workspace_name}' does not exist"
+            ))));
+        }
+
+        let current_stream = record_string_field(&workspace_record, "Stream")
+            .ok_or_else(|| {
+                to_mcp_error(invalid_input(format!(
+                    "Workspace '{workspace_name}' is not stream-based. Cannot switch streams on a classic workspace."
+                )))
+            })?
+            .to_string();
+
+        match self.stream_existence(&stream_name).await? {
+            StreamExistence::Active => {}
+            StreamExistence::Deleted => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Target stream '{stream_name}' has been deleted. Cannot switch to a deleted stream."
+                ))));
+            }
+            StreamExistence::Missing => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Target stream '{stream_name}' does not exist"
+                ))));
+            }
+        }
+
+        let opened = self.opened_files_for_workspace(&workspace_name).await?;
+        if !opened.is_empty() {
+            return Err(to_mcp_error(invalid_input(format!(
+                "Cannot switch stream: workspace '{workspace_name}' has {} open file(s). Revert or submit changes before switching.",
+                opened.len()
+            ))));
+        }
+
+        if preview {
+            let target = self
+                .run_p4(json_invocation(
+                    vec!["stream".to_string(), "-o".to_string(), stream_name.clone()],
+                    None,
+                ))
+                .await?;
+            let first = target.records.first();
+            return Ok(Json(ToolResponse::success(
+                "switch",
+                json!({
+                    "preview": true,
+                    "current_stream": current_stream,
+                    "target_stream": stream_name,
+                    "workspace": workspace_name,
+                    "target_stream_type": first.and_then(|record| record_string_field(record, "Type")),
+                    "target_stream_parent": first.and_then(|record| record_string_field(record, "Parent")),
+                }),
+            )));
+        }
+
+        let mut args = vec![
+            "client".to_string(),
+            "-s".to_string(),
+            "-S".to_string(),
+            stream_name.clone(),
+        ];
+        if let Some(workspace) = workspace {
+            args.push(workspace);
+        }
+        let result = self.run_p4(json_invocation(args, None)).await?;
+        self.run_p4(json_invocation(
+            vec![
+                "sync".to_string(),
+                "-k".to_string(),
+                format!("{stream_name}/..."),
+            ],
+            None,
+        ))
+        .await?;
+
+        Ok(Json(ToolResponse::success(
+            "switch",
+            json!({
+                "message": format!("Workspace '{workspace_name}' switched from '{current_stream}' to stream '{stream_name}'"),
+                "result": output_message(result),
+            }),
+        )))
+    }
+
     async fn query_workspace_get(
         &self,
         workspace_name: Option<&str>,
@@ -1292,16 +1409,26 @@ impl P4McpServer {
                         None,
                     )]
                 } else {
-                    let mut args = vec![
+                    let mut switch_args = vec![
                         "client".to_string(),
                         "-s".to_string(),
                         "-S".to_string(),
                         stream_name.clone(),
                     ];
                     if let Some(workspace) = workspace {
-                        args.push(workspace.clone());
+                        switch_args.push(workspace.clone());
                     }
-                    vec![json_invocation(args, None)]
+                    vec![
+                        json_invocation(switch_args, None),
+                        json_invocation(
+                            vec![
+                                "sync".to_string(),
+                                "-k".to_string(),
+                                format!("{stream_name}/..."),
+                            ],
+                            None,
+                        ),
+                    ]
                 }
             }
             StreamModifyCommand::CreateWorkspace {
@@ -1335,28 +1462,8 @@ impl P4McpServer {
                 workspace,
                 preview,
             } => {
-                if preview {
-                    self.call_p4_tool(
-                        &action,
-                        json_invocation(
-                            vec!["stream".to_string(), "-o".to_string(), stream_name],
-                            None,
-                        ),
-                    )
+                self.execute_stream_switch(stream_name, workspace, preview)
                     .await
-                } else {
-                    let mut args = vec![
-                        "client".to_string(),
-                        "-s".to_string(),
-                        "-S".to_string(),
-                        stream_name,
-                    ];
-                    if let Some(workspace) = workspace {
-                        args.push(workspace);
-                    }
-                    self.call_p4_tool(&action, json_invocation(args, None))
-                        .await
-                }
             }
             StreamModifyCommand::CreateWorkspace {
                 stream_name,
@@ -3962,46 +4069,6 @@ Files:
     }
 
     #[tokio::test]
-    async fn modify_streams_switch_preview_executes_read_only_stream_o_after_approval() {
-        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
-            records: vec![json!({"Stream": "//streams/dev"})],
-            text: json!({}),
-        }));
-        let approval_gate = Arc::new(FakeApprovalGate::approved());
-        let server = P4McpServer::with_executor_and_approval(
-            test_config(false),
-            executor.clone(),
-            approval_gate.clone(),
-        );
-        let mut params = modify_streams_params(StreamModifyAction::Switch);
-        params.stream_name = Some("//streams/dev".to_string());
-        params.workspace = Some("ws-dev".to_string());
-        params.preview = true;
-
-        let response = server
-            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
-            .await
-            .expect("approved switch preview should succeed");
-
-        assert_eq!(response.0.status, "success");
-        assert_eq!(response.0.action, "switch");
-        let calls = approval_gate.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].request.preview.command,
-            Some(vec![
-                "p4".to_string(),
-                "stream".to_string(),
-                "-o".to_string(),
-                "//streams/dev".to_string(),
-            ])
-        );
-        let invocations = executor.invocations();
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].args, ["stream", "-o", "//streams/dev"]);
-    }
-
-    #[tokio::test]
     async fn modify_streams_create_and_update_require_stream_name_before_approval() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: vec![json!({"Stream": "//streams/dev"})],
@@ -4648,6 +4715,231 @@ Paths:
         assert_eq!(
             invocations[5].args,
             ["stream", "parentview", "--noinherit", "//streams/dev"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_preview_is_read_only_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "Client": "ws-main",
+                    "Update": "2026/06/17 10:00:00",
+                    "Stream": "//streams/main"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({
+                    "Stream": "//streams/dev",
+                    "Type": "development",
+                    "Parent": "//streams/main"
+                })],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+        params.preview = true;
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved switch preview should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        assert_eq!(response.0.message["preview"], json!(true));
+        assert_eq!(
+            response.0.message["current_stream"],
+            json!("//streams/main")
+        );
+        assert_eq!(response.0.message["target_stream"], json!("//streams/dev"));
+        assert_eq!(response.0.message["workspace"], json!("ws-main"));
+
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations[0].args, ["client", "-o", "ws-main"]);
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[2].args, ["opened", "-C", "ws-main"]);
+        assert_eq!(invocations[3].args, ["stream", "-o", "//streams/dev"]);
+        assert!(invocations.iter().all(
+            |invocation| invocation.args != ["client", "-s", "-S", "//streams/dev", "ws-main"]
+        ));
+
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.preview.command,
+            Some(vec![
+                "p4".to_string(),
+                "stream".to_string(),
+                "-o".to_string(),
+                "//streams/dev".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_rejects_open_files_before_switching() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "Client": "ws-main",
+                    "Update": "2026/06/17 10:00:00",
+                    "Stream": "//streams/main"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"depotFile": "//streams/main/file.txt"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("switch with open files should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("Cannot switch stream"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[2].args, ["opened", "-C", "ws-main"]);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_executes_client_switch_and_have_table_sync_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: vec![json!({
+                    "Client": "ws-main",
+                    "Update": "2026/06/17 10:00:00",
+                    "Stream": "//streams/main"
+                })],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Client": "ws-main"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"synced": true})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved switch should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "switch");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[3].args,
+            ["client", "-s", "-S", "//streams/dev", "ws-main"]
+        );
+        assert_eq!(invocations[4].args, ["sync", "-k", "//streams/dev/..."]);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_switch_approval_preview_lists_switch_and_sync_writes() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Switch);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.workspace = Some("ws-main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0].request.preview.commands,
+            Some(vec![
+                vec![
+                    "p4".to_string(),
+                    "client".to_string(),
+                    "-s".to_string(),
+                    "-S".to_string(),
+                    "//streams/dev".to_string(),
+                    "ws-main".to_string(),
+                ],
+                vec![
+                    "p4".to_string(),
+                    "sync".to_string(),
+                    "-k".to_string(),
+                    "//streams/dev/...".to_string(),
+                ],
+            ])
         );
     }
 
