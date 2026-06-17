@@ -16,6 +16,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -75,6 +76,7 @@ pub struct P4McpServer {
     config: Arc<AppConfig>,
     executor: Arc<dyn P4Executor>,
     approval_gate: Arc<dyn WriteApprovalGate>,
+    active_client: Arc<RwLock<Option<String>>>,
 }
 
 struct P4ApprovalContext<'a> {
@@ -121,6 +123,7 @@ impl P4McpServer {
             config: Arc::new(config),
             executor,
             approval_gate,
+            active_client: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -143,9 +146,33 @@ impl P4McpServer {
         Self::tool_router().list_all()
     }
 
+    async fn p4_env(&self) -> P4Env {
+        let mut env = P4Env::new();
+        if let Some(client) = self.active_client.read().await.clone() {
+            env.insert("P4CLIENT".to_string(), client);
+        }
+        env
+    }
+
+    async fn set_active_client(&self, workspace_name: String) {
+        *self.active_client.write().await = Some(workspace_name);
+    }
+
     async fn run_p4(&self, invocation: P4Invocation) -> McpResult<P4CommandOutput> {
+        let env = self.p4_env().await;
         self.executor
-            .run(invocation, P4Env::new())
+            .run(invocation, env)
+            .await
+            .map_err(to_mcp_error)
+    }
+
+    async fn run_p4_with_env(
+        &self,
+        invocation: P4Invocation,
+        env: P4Env,
+    ) -> McpResult<P4CommandOutput> {
+        self.executor
+            .run(invocation, env)
             .await
             .map_err(to_mcp_error)
     }
@@ -159,6 +186,16 @@ impl P4McpServer {
         Ok(Json(ToolResponse::success(action, output_message(output))))
     }
 
+    async fn call_p4_tool_with_env(
+        &self,
+        action: &str,
+        invocation: P4Invocation,
+        env: P4Env,
+    ) -> McpResult<Json<ToolResponse>> {
+        let output = self.run_p4_with_env(invocation, env).await?;
+        Ok(Json(ToolResponse::success(action, output_message(output))))
+    }
+
     async fn call_p4_tool_with_benign_success(
         &self,
         action: &str,
@@ -166,7 +203,8 @@ impl P4McpServer {
         benign_message: &str,
         success_message: Value,
     ) -> McpResult<Json<ToolResponse>> {
-        match self.executor.run(invocation, P4Env::new()).await {
+        let env = self.p4_env().await;
+        match self.executor.run(invocation, env).await {
             Ok(output) => Ok(Json(ToolResponse::success(action, output_message(output)))),
             Err(error) if error.to_string().contains(benign_message) => {
                 Ok(Json(ToolResponse::success(action, success_message)))
@@ -182,9 +220,10 @@ impl P4McpServer {
     ) -> McpResult<Json<ToolResponse>> {
         let mut messages = Vec::new();
         for invocation in invocations {
+            let env = self.p4_env().await;
             let output = self
                 .executor
-                .run(invocation, P4Env::new())
+                .run(invocation, env)
                 .await
                 .map_err(to_mcp_error)?;
             messages.push(output_message(output));
@@ -456,6 +495,7 @@ impl P4McpServer {
             ))));
         }
 
+        let env = self.p4_env().await;
         let resolve_preview = self
             .executor
             .run(
@@ -467,7 +507,7 @@ impl P4McpServer {
                     ],
                     None,
                 ),
-                P4Env::new(),
+                env,
             )
             .await;
         match resolve_preview {
@@ -631,20 +671,19 @@ impl P4McpServer {
         if let Some(workspace) = sync_workspace {
             sync_env.insert("P4CLIENT".to_string(), workspace);
         }
-        self.executor
-            .run(
-                json_invocation(
-                    vec![
-                        "sync".to_string(),
-                        "-k".to_string(),
-                        format!("{stream_name}/..."),
-                    ],
-                    None,
-                ),
-                sync_env,
-            )
-            .await
-            .map_err(to_mcp_error)?;
+        self.call_p4_tool_with_env(
+            "sync",
+            json_invocation(
+                vec![
+                    "sync".to_string(),
+                    "-k".to_string(),
+                    format!("{stream_name}/..."),
+                ],
+                None,
+            ),
+            sync_env,
+        )
+        .await?;
 
         Ok(Json(ToolResponse::success(
             "switch",
@@ -1057,7 +1096,8 @@ impl P4McpServer {
         invocation: P4Invocation,
         benign_empty_message: Option<&str>,
     ) -> McpResult<P4CommandOutput> {
-        match self.executor.run(invocation, P4Env::new()).await {
+        let env = self.p4_env().await;
+        match self.executor.run(invocation, env).await {
             Ok(output) => Ok(output),
             Err(error) => {
                 if benign_empty_message.is_some_and(|message| error.to_string().contains(message)) {
@@ -1824,7 +1864,8 @@ impl P4McpServer {
         let invocations = build_file_search_invocations(&params).map_err(to_mcp_error)?;
 
         for invocation in invocations {
-            match self.executor.run(invocation, P4Env::new()).await {
+            let env = self.p4_env().await;
+            match self.executor.run(invocation, env).await {
                 Ok(output) => records.extend(output.records),
                 Err(error) if is_no_such_file_error(&error) => {}
                 Err(error) => return Err(to_mcp_error(error)),
@@ -3958,6 +3999,32 @@ Files:
         let calls = approval_gate.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].request.preview.targets, ["ws-main"]);
+    }
+
+    #[tokio::test]
+    async fn active_client_context_applies_to_later_p4_calls() {
+        let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+            records: vec![json!({"client": "ws-main"})],
+            text: json!({}),
+        }]));
+        let server = P4McpServer::with_executor(test_config(false), executor.clone());
+
+        server.set_active_client("ws-main".to_string()).await;
+        let response = server
+            .call_p4_tool(
+                "list",
+                json_invocation(
+                    vec!["clients".to_string(), "-m".to_string(), "100".to_string()],
+                    None,
+                ),
+            )
+            .await
+            .expect("query should succeed with active client context");
+
+        assert_eq!(response.0.status, "success");
+        let envs = executor.envs();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].get("P4CLIENT").map(String::as_str), Some("ws-main"));
     }
 
     #[tokio::test]
