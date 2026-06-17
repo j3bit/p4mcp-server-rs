@@ -363,13 +363,23 @@ impl P4McpServer {
         };
 
         let current_form = self.fetch_stream_form(&stream_name).await?;
+        let options = if stream_type == "virtual"
+            && params
+                .options
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            virtual_stream_default_options(&current_form)
+        } else {
+            params.options.clone()
+        };
         let patch = StreamFormPatch {
             stream: Some(stream_name),
             stream_type: Some(stream_type),
             parent: Some(parent),
             name: params.name.clone(),
             description: params.description.clone(),
-            options: params.options.clone(),
+            options,
             parent_view: params.parent_view.clone(),
             paths: params.paths.clone(),
             remapped: params.remapped.clone(),
@@ -447,19 +457,28 @@ impl P4McpServer {
         }
 
         let resolve_preview = self
-            .run_p4(json_invocation(
-                vec![
-                    "stream".to_string(),
-                    "resolve".to_string(),
-                    "-n".to_string(),
-                ],
-                None,
-            ))
-            .await?;
-        if !resolve_preview.records.is_empty() {
-            return Err(to_mcp_error(invalid_input(format!(
-                "Stream '{stream_name}' has pending spec conflicts that must be resolved before editing"
-            ))));
+            .executor
+            .run(
+                json_invocation(
+                    vec![
+                        "stream".to_string(),
+                        "resolve".to_string(),
+                        "-n".to_string(),
+                    ],
+                    None,
+                ),
+                P4Env::new(),
+            )
+            .await;
+        match resolve_preview {
+            Ok(resolve_preview) if !resolve_preview.records.is_empty() => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Stream '{stream_name}' has pending spec conflicts that must be resolved before editing"
+                ))));
+            }
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("No file(s) to resolve") => {}
+            Err(error) => return Err(to_mcp_error(error)),
         }
 
         if stream_update_is_view_affecting(params) {
@@ -526,13 +545,17 @@ impl P4McpServer {
         preview: bool,
     ) -> McpResult<Json<ToolResponse>> {
         let workspace_record = self.current_workspace_record(workspace.as_deref()).await?;
-        let workspace_name = workspace
-            .clone()
+        let sync_workspace = workspace
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
             .or_else(|| {
                 record_string_field(&workspace_record, "Client")
                     .or_else(|| record_string_field(&workspace_record, "client"))
                     .map(str::to_string)
-            })
+            });
+        let workspace_name = sync_workspace
+            .clone()
             .unwrap_or_else(|| "current".to_string());
 
         let exists = record_string_field(&workspace_record, "Update").is_some()
@@ -604,15 +627,24 @@ impl P4McpServer {
             args.push(workspace);
         }
         let result = self.run_p4(json_invocation(args, None)).await?;
-        self.run_p4(json_invocation(
-            vec![
-                "sync".to_string(),
-                "-k".to_string(),
-                format!("{stream_name}/..."),
-            ],
-            None,
-        ))
-        .await?;
+        let mut sync_env = P4Env::new();
+        if let Some(workspace) = sync_workspace {
+            sync_env.insert("P4CLIENT".to_string(), workspace);
+        }
+        self.executor
+            .run(
+                json_invocation(
+                    vec![
+                        "sync".to_string(),
+                        "-k".to_string(),
+                        format!("{stream_name}/..."),
+                    ],
+                    None,
+                ),
+                sync_env,
+            )
+            .await
+            .map_err(to_mcp_error)?;
 
         Ok(Json(ToolResponse::success(
             "switch",
@@ -1366,6 +1398,7 @@ impl P4McpServer {
         self.policy()
             .check(Access::Write, Toolset::Streams, "modify_streams")
             .map_err(to_mcp_error)?;
+        reject_update_create_only_fields(&params).map_err(to_mcp_error)?;
         let action = params.action.as_str().to_string();
         let command = build_stream_modify_command(&params).map_err(to_mcp_error)?;
         let preview_invocations = match &command {
@@ -2599,6 +2632,45 @@ fn stream_update_is_view_affecting(params: &ModifyStreamsParams) -> bool {
             .parent_view
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn reject_update_create_only_fields(
+    params: &ModifyStreamsParams,
+) -> std::result::Result<(), P4McpError> {
+    if matches!(params.action, StreamModifyAction::Update) {
+        if params
+            .stream_type
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(invalid_input("stream_type is only supported for create"));
+        }
+        if params
+            .parent
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(invalid_input("parent is only supported for create"));
+        }
+    }
+    Ok(())
+}
+
+fn virtual_stream_default_options(form: &str) -> Option<String> {
+    form.lines()
+        .find_map(|line| line.strip_prefix("Options:"))
+        .map(|options| {
+            options
+                .split_whitespace()
+                .map(|token| match token {
+                    "toparent" => "notoparent",
+                    "fromparent" => "nofromparent",
+                    other => other,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|options| !options.is_empty())
 }
 
 fn normalized_parent_view(parent_view: Option<&str>) -> Result<Option<&str>, P4McpError> {
@@ -4117,6 +4189,58 @@ Files:
     }
 
     #[tokio::test]
+    async fn modify_streams_update_rejects_create_only_fields_before_approval() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+
+        let mut stream_type_params = modify_streams_params(StreamModifyAction::Update);
+        stream_type_params.stream_name = Some("//streams/dev".to_string());
+        stream_type_params.stream_type = Some("development".to_string());
+
+        let stream_type_error = match server
+            .modify_streams_inner(stream_type_params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update with stream_type should be rejected before approval"),
+            Err(error) => error,
+        };
+        assert!(
+            stream_type_error
+                .message
+                .contains("stream_type is only supported for create")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+
+        let mut parent_params = modify_streams_params(StreamModifyAction::Update);
+        parent_params.stream_name = Some("//streams/dev".to_string());
+        parent_params.parent = Some("//streams/main".to_string());
+
+        let parent_error = match server
+            .modify_streams_inner(parent_params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("update with parent should be rejected before approval"),
+            Err(error) => error,
+        };
+        assert!(
+            parent_error
+                .message
+                .contains("parent is only supported for create")
+        );
+        assert!(executor.invocations().is_empty());
+        assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn modify_streams_update_parent_view_approval_preview_lists_both_writes() {
         let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
             records: Vec::new(),
@@ -4336,6 +4460,84 @@ Paths:
     }
 
     #[tokio::test]
+    async fn modify_streams_create_virtual_defaults_parent_flow_options_after_approval() {
+        let template_form = "\
+Stream: //streams/virtual
+Type: development
+Parent: //streams/main
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/main"})],
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": template_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/virtual"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/virtual".to_string());
+        params.stream_type = Some("virtual".to_string());
+        params.parent = Some("//streams/main".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved virtual stream create should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/virtual"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/virtual"]
+        );
+        assert_eq!(
+            invocations[2].args,
+            ["streams", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(invocations[3].args, ["stream", "-o", "//streams/virtual"]);
+        assert_eq!(invocations[4].args, ["stream", "-i"]);
+        let saved_form = invocations[4]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(saved_form.contains("Options: allsubmit unlocked notoparent nofromparent"));
+        assert!(!saved_form.contains("Options: allsubmit unlocked toparent fromparent"));
+    }
+
+    #[tokio::test]
     async fn modify_streams_update_fetches_and_saves_stream_form_after_approval() {
         let existing_form = "\
 Stream: //streams/dev
@@ -4473,6 +4675,63 @@ Paths:
                 .any(|invocation| invocation.args.as_slice() == ["stream", "-i"])
         );
         assert!(err.message.contains("resolve preview failed"));
+    }
+
+    #[tokio::test]
+    async fn modify_streams_update_treats_no_files_to_resolve_as_noop() {
+        let existing_form = "\
+Stream: //streams/dev
+Options: allsubmit unlocked toparent fromparent
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::results(vec![
+            Ok(P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            }),
+            Ok(P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": existing_form, "stderr": ""}),
+            }),
+            Err(P4McpError::P4Command {
+                message: "No file(s) to resolve".to_string(),
+            }),
+            Ok(P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/dev"})],
+                text: json!({}),
+            }),
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.description = Some("new description".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("No file(s) to resolve should be treated as a no-op");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "update");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[1].args, ["stream", "-o", "//streams/dev"]);
+        assert_eq!(invocations[2].args, ["stream", "resolve", "-n"]);
+        assert_eq!(invocations[3].args, ["stream", "-i"]);
     }
 
     #[tokio::test]
@@ -4894,6 +5153,8 @@ Paths:
             ["client", "-s", "-S", "//streams/dev", "ws-main"]
         );
         assert_eq!(invocations[4].args, ["sync", "-k", "//streams/dev/..."]);
+        let envs = executor.envs();
+        assert_eq!(envs[4].get("P4CLIENT").map(String::as_str), Some("ws-main"));
     }
 
     #[tokio::test]
@@ -5459,6 +5720,7 @@ Stream: //streams/old
     struct QueuedExecutor {
         outputs: Mutex<VecDeque<crate::error::Result<P4CommandOutput>>>,
         invocations: Mutex<Vec<P4Invocation>>,
+        envs: Mutex<Vec<P4Env>>,
     }
 
     impl QueuedExecutor {
@@ -5466,6 +5728,7 @@ Stream: //streams/old
             Self {
                 outputs: Mutex::new(outputs.into_iter().map(Ok).collect()),
                 invocations: Mutex::new(Vec::new()),
+                envs: Mutex::new(Vec::new()),
             }
         }
 
@@ -5473,11 +5736,19 @@ Stream: //streams/old
             Self {
                 outputs: Mutex::new(outputs.into()),
                 invocations: Mutex::new(Vec::new()),
+                envs: Mutex::new(Vec::new()),
             }
         }
 
         fn invocations(&self) -> Vec<P4Invocation> {
             self.invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn envs(&self) -> Vec<P4Env> {
+            self.envs
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
@@ -5489,12 +5760,16 @@ Stream: //streams/old
         async fn run(
             &self,
             invocation: P4Invocation,
-            _env: P4Env,
+            env: P4Env,
         ) -> crate::error::Result<P4CommandOutput> {
             self.invocations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(invocation);
+            self.envs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(env);
 
             self.outputs
                 .lock()

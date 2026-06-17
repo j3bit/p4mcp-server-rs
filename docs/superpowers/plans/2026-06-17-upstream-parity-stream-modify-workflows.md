@@ -1573,8 +1573,15 @@ rtk git commit -m "docs: record stream workflow verification"
 ## Execution Evidence
 
 - `rtk cargo test modify_streams_ --test tool_mapping_tests`: PASS, 13 passed.
-- `rtk cargo test modify_streams_`: PASS, 36 passed.
-- `rtk cargo test`: PASS outside sandbox, 253 passed. The first sandbox run failed only because `wiremock` could not bind a local mock-server port.
+- `rtk cargo test modify_streams_update_rejects_create_only_fields_before_approval`: PASS, 1 passed.
+- `rtk cargo test modify_streams_create_virtual_defaults_parent_flow_options_after_approval`: PASS, 1 passed.
+- `rtk cargo test modify_streams_update_treats_no_files_to_resolve_as_noop`: PASS, 1 passed.
+- `rtk cargo test modify_streams_switch_executes_client_switch_and_have_table_sync_after_approval`: PASS, 1 passed.
+- `rtk cargo test modify_streams_update`: PASS, 10 passed.
+- `rtk cargo test modify_streams_create`: PASS, 10 passed.
+- `rtk cargo test modify_streams_switch`: PASS, 5 passed.
+- `rtk cargo test modify_streams_`: PASS, 39 passed.
+- `rtk cargo fmt --check`: PASS.
 - `rtk cargo clippy --all-targets --all-features -- -D warnings`: PASS.
-- `rtk git status --short`: only this plan file was uncommitted before recording evidence.
+- `rtk cargo test`: first sandbox run failed because `wiremock` could not bind a local mock-server port; rerun outside sandbox PASS, 256 passed.
 - PR review reply drafts were prepared in this plan and were not posted.
