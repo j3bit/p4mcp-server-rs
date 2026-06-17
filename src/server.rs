@@ -87,6 +87,13 @@ struct P4ApprovalContext<'a> {
     invocation: &'a P4Invocation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamExistence {
+    Active,
+    Deleted,
+    Missing,
+}
+
 impl P4McpServer {
     pub fn new(config: AppConfig) -> Self {
         let executor = Arc::new(TokioP4Executor::new(config.p4_bin.clone()));
@@ -241,6 +248,130 @@ impl P4McpServer {
             ))));
         }
         Ok(())
+    }
+
+    async fn stream_existence(&self, stream_name: &str) -> McpResult<StreamExistence> {
+        let active = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if !active.records.is_empty() {
+            return Ok(StreamExistence::Active);
+        }
+
+        let including_deleted = self
+            .run_p4(json_invocation(
+                vec![
+                    "streams".into(),
+                    "-a".into(),
+                    "-F".into(),
+                    format!("Stream={stream_name}"),
+                ],
+                None,
+            ))
+            .await?;
+        if including_deleted.records.is_empty() {
+            Ok(StreamExistence::Missing)
+        } else {
+            Ok(StreamExistence::Deleted)
+        }
+    }
+
+    async fn require_active_stream(&self, stream_name: &str, label: &str) -> McpResult<()> {
+        match self.stream_existence(stream_name).await? {
+            StreamExistence::Active => Ok(()),
+            StreamExistence::Deleted => Err(to_mcp_error(invalid_input(format!(
+                "{label} stream '{stream_name}' has been deleted"
+            )))),
+            StreamExistence::Missing => Err(to_mcp_error(invalid_input(format!(
+                "{label} stream '{stream_name}' does not exist"
+            )))),
+        }
+    }
+
+    async fn fetch_stream_form(&self, stream_name: &str) -> McpResult<String> {
+        let output = self
+            .run_p4(text_invocation(vec![
+                "stream".to_string(),
+                "-o".to_string(),
+                stream_name.to_string(),
+            ]))
+            .await?;
+        output
+            .text
+            .get("stdout")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| to_mcp_error(invalid_input("p4 stream -o did not return stdout")))
+    }
+
+    async fn save_stream_form(
+        &self,
+        action: &str,
+        patched: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        self.call_p4_tool(
+            action,
+            json_invocation(vec!["stream".to_string(), "-i".to_string()], Some(patched)),
+        )
+        .await
+    }
+
+    async fn execute_stream_create(
+        &self,
+        params: &ModifyStreamsParams,
+        stream_name: String,
+    ) -> McpResult<Json<ToolResponse>> {
+        let stream_type = required_option(params.stream_type.as_deref(), "stream_type", "create")?;
+        if !is_valid_stream_type(&stream_type) {
+            return Err(to_mcp_error(invalid_input(format!(
+                "invalid stream_type: {stream_type}. Valid stream types: mainline, development, sparsedev, release, sparserel, task, virtual"
+            ))));
+        }
+
+        match self.stream_existence(&stream_name).await? {
+            StreamExistence::Active => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Stream '{stream_name}' already exists"
+                ))));
+            }
+            StreamExistence::Deleted => {
+                return Err(to_mcp_error(invalid_input(format!(
+                    "Stream '{stream_name}' has been deleted"
+                ))));
+            }
+            StreamExistence::Missing => {}
+        }
+
+        let parent = if is_mainline_stream_type(&stream_type) {
+            "none".to_string()
+        } else {
+            let parent = required_option(params.parent.as_deref(), "Parent stream", "create")?;
+            self.require_active_stream(&parent, "Parent").await?;
+            parent
+        };
+
+        let current_form = self.fetch_stream_form(&stream_name).await?;
+        let patch = StreamFormPatch {
+            stream: Some(stream_name),
+            stream_type: Some(stream_type),
+            parent: Some(parent),
+            name: params.name.clone(),
+            description: params.description.clone(),
+            options: params.options.clone(),
+            parent_view: params.parent_view.clone(),
+            paths: params.paths.clone(),
+            remapped: params.remapped.clone(),
+            ignored: params.ignored.clone(),
+        };
+        let patched = patch_stream_form(&current_form, &patch).map_err(to_mcp_error)?;
+        self.save_stream_form("create", patched).await
     }
 
     async fn query_workspace_get(
@@ -1040,8 +1171,10 @@ impl P4McpServer {
         }
         match command {
             StreamModifyCommand::Single(invocation) => self.call_p4_tool(&action, invocation).await,
-            StreamModifyCommand::Create { stream_name }
-            | StreamModifyCommand::Update { stream_name } => {
+            StreamModifyCommand::Create { stream_name } => {
+                self.execute_stream_create(&params, stream_name).await
+            }
+            StreamModifyCommand::Update { stream_name } => {
                 let current = self
                     .run_p4(text_invocation(vec![
                         "stream".to_string(),
@@ -2201,6 +2334,17 @@ fn form_has_non_empty_field(form: &str, field: &str) -> bool {
         line.strip_prefix(&prefix)
             .is_some_and(|value| !value.trim().is_empty())
     })
+}
+
+fn is_valid_stream_type(stream_type: &str) -> bool {
+    matches!(
+        stream_type,
+        "mainline" | "development" | "sparsedev" | "release" | "sparserel" | "task" | "virtual"
+    )
+}
+
+fn is_mainline_stream_type(stream_type: &str) -> bool {
+    stream_type == "mainline"
 }
 
 fn approval_summary(action: &str, targets: &[String]) -> String {
@@ -3709,6 +3853,161 @@ Files:
         );
         assert!(executor.invocations().is_empty());
         assert!(approval_gate.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_rejects_existing_stream_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
+            records: vec![json!({"Stream": "//streams/dev"})],
+            text: json!({}),
+        }]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.stream_type = Some("mainline".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("duplicate stream create should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message
+                .contains("Stream '//streams/dev' already exists")
+        );
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(invocations[0].mode, OutputMode::JsonLines);
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_rejects_missing_parent_for_child_stream_after_approval() {
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.stream_type = Some("development".to_string());
+
+        let err = match server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+        {
+            Ok(_) => panic!("child stream create without parent should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("Parent stream is required"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/dev"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/dev"]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_streams_create_saves_new_mainline_stream_after_approval() {
+        let template_form = "\
+Stream: //streams/dev
+Type: development
+Parent: //streams/main
+Name: old
+
+Description:
+\told description
+
+Paths:
+\tshare ...
+";
+        let executor = Arc::new(QueuedExecutor::success(vec![
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({}),
+            },
+            P4CommandOutput {
+                records: Vec::new(),
+                text: json!({"stdout": template_form, "stderr": ""}),
+            },
+            P4CommandOutput {
+                records: vec![json!({"Stream": "//streams/main"})],
+                text: json!({}),
+            },
+        ]));
+        let approval_gate = Arc::new(FakeApprovalGate::approved());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate,
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Create);
+        params.stream_name = Some("//streams/main".to_string());
+        params.stream_type = Some("mainline".to_string());
+        params.name = Some("Main".to_string());
+        params.description = Some("mainline stream".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approved stream create should succeed");
+
+        assert_eq!(response.0.status, "success");
+        assert_eq!(response.0.action, "create");
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(
+            invocations[0].args,
+            ["streams", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            ["streams", "-a", "-F", "Stream=//streams/main"]
+        );
+        assert_eq!(invocations[2].args, ["stream", "-o", "//streams/main"]);
+        assert_eq!(invocations[2].mode, OutputMode::Text);
+        assert_eq!(invocations[3].args, ["stream", "-i"]);
+        let saved_form = invocations[3]
+            .stdin
+            .as_deref()
+            .expect("stream -i should receive patched form");
+        assert!(saved_form.contains("Stream: //streams/main"));
+        assert!(saved_form.contains("Type: mainline"));
+        assert!(saved_form.contains("Parent: none"));
+        assert!(saved_form.contains("Name: Main"));
+        assert!(saved_form.contains("Description:\n\tmainline stream"));
     }
 
     #[tokio::test]
