@@ -1256,25 +1256,48 @@ impl P4McpServer {
             .map_err(to_mcp_error)?;
         let action = params.action.as_str().to_string();
         let command = build_stream_modify_command(&params).map_err(to_mcp_error)?;
-        let preview_invocation = match &command {
-            StreamModifyCommand::Single(invocation) => invocation.clone(),
-            StreamModifyCommand::Create { stream_name }
-            | StreamModifyCommand::Update { stream_name } => json_invocation(
+        let preview_invocations = match &command {
+            StreamModifyCommand::Single(invocation) => vec![invocation.clone()],
+            StreamModifyCommand::Create { stream_name } => vec![json_invocation(
                 vec!["stream".to_string(), "-i".to_string()],
                 Some(format!(
                     "Stream: {stream_name}\n\n<patched after approval>\n"
                 )),
-            ),
+            )],
+            StreamModifyCommand::Update { stream_name } => {
+                let mut invocations = vec![json_invocation(
+                    vec!["stream".to_string(), "-i".to_string()],
+                    Some(format!(
+                        "Stream: {stream_name}\n\n<patched after approval>\n"
+                    )),
+                )];
+                if let Some(parent_view) = params
+                    .parent_view
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    invocations.push(json_invocation(
+                        vec![
+                            "stream".to_string(),
+                            "parentview".to_string(),
+                            format!("--{parent_view}"),
+                            stream_name.clone(),
+                        ],
+                        None,
+                    ));
+                }
+                invocations
+            }
             StreamModifyCommand::Switch {
                 stream_name,
                 workspace,
                 preview,
             } => {
                 if *preview {
-                    json_invocation(
+                    vec![json_invocation(
                         vec!["stream".to_string(), "-o".to_string(), stream_name.clone()],
                         None,
-                    )
+                    )]
                 } else {
                     let mut args = vec![
                         "client".to_string(),
@@ -1285,21 +1308,21 @@ impl P4McpServer {
                     if let Some(workspace) = workspace {
                         args.push(workspace.clone());
                     }
-                    json_invocation(args, None)
+                    vec![json_invocation(args, None)]
                 }
             }
             StreamModifyCommand::CreateWorkspace {
                 stream_name,
                 workspace_name,
                 root,
-            } => json_invocation(
+            } => vec![json_invocation(
                 vec!["client".to_string(), "-i".to_string()],
                 Some(format!(
                     "Client: {workspace_name}\nStream: {stream_name}\nRoot: {root}\n\n<patched after approval>\n"
                 )),
-            ),
+            )],
         };
-        let request = self.modify_streams_approval_request(&params, &preview_invocation);
+        let request = self.modify_streams_approval_request(&params, &preview_invocations);
         if let Some(response) = self
             .require_write_approval(channel, request, params.approval_token.as_deref())
             .await?
@@ -1474,33 +1497,52 @@ impl P4McpServer {
     fn modify_streams_approval_request(
         &self,
         params: &ModifyStreamsParams,
-        invocation: &P4Invocation,
+        invocations: &[P4Invocation],
     ) -> ApprovalRequest {
         let mut approval_params = params.clone();
         approval_params.approval_token = None;
         let action = params.action.as_str().to_string();
+        let targets = if matches!(params.action, StreamModifyAction::CreateWorkspace) {
+            named_scope_targets(params.workspace_name.as_deref(), "stream workspace")
+        } else {
+            named_scope_targets(params.stream_name.as_deref(), "stream operation")
+        };
+        let commands: Vec<Vec<String>> = invocations
+            .iter()
+            .map(|invocation| command_preview(&self.config.p4_bin, invocation))
+            .collect();
+        let command = if commands.len() == 1 {
+            commands.first().cloned()
+        } else {
+            None
+        };
+        let commands = if commands.len() > 1 {
+            Some(commands)
+        } else {
+            None
+        };
 
         ApprovalRequest {
             tool: "modify_streams".to_string(),
             action: action.clone(),
             params: serde_json::to_value(approval_params)
                 .expect("modify streams params serialize to JSON"),
-            preview: self.p4_approval_preview(P4ApprovalContext {
-                tool: "modify_streams",
-                action: &action,
-                targets: if matches!(params.action, StreamModifyAction::CreateWorkspace) {
-                    named_scope_targets(params.workspace_name.as_deref(), "stream workspace")
-                } else {
-                    named_scope_targets(params.stream_name.as_deref(), "stream operation")
-                },
+            preview: ApprovalPreview {
+                summary: approval_summary(&action, &targets),
+                tool: "modify_streams".to_string(),
+                action,
                 changelist: params.changelist.clone(),
                 workspace: params
                     .workspace
                     .clone()
                     .or_else(|| params.workspace_name.clone()),
                 stream: params.stream_name.clone(),
-                invocation,
-            }),
+                targets,
+                review: None,
+                command,
+                commands,
+                request: None,
+            },
         }
     }
 
@@ -2453,7 +2495,10 @@ fn stream_update_is_view_affecting(params: &ModifyStreamsParams) -> bool {
     params.paths.is_some()
         || params.remapped.is_some()
         || params.ignored.is_some()
-        || params.parent_view.is_some()
+        || params
+            .parent_view
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn remove_stream_parent_view_field(form: &str) -> String {
@@ -3999,6 +4044,50 @@ Files:
     }
 
     #[tokio::test]
+    async fn modify_streams_update_parent_view_approval_preview_lists_both_writes() {
+        let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+            records: Vec::new(),
+            text: json!({}),
+        }));
+        let approval_gate = Arc::new(FakeApprovalGate::approval_required());
+        let server = P4McpServer::with_executor_and_approval(
+            test_config(false),
+            executor.clone(),
+            approval_gate.clone(),
+        );
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.stream_name = Some("//streams/dev".to_string());
+        params.parent_view = Some("noinherit".to_string());
+
+        let response = server
+            .modify_streams_inner(params, ApprovalChannel::FallbackOnly)
+            .await
+            .expect("approval response should be returned");
+
+        assert_eq!(response.0.status, "approval_required");
+        assert!(executor.invocations().is_empty());
+        let calls = approval_gate.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].fallback_only);
+        assert_eq!(calls[0].request.tool, "modify_streams");
+        assert_eq!(calls[0].request.action, "update");
+        assert_eq!(calls[0].request.preview.command, None);
+        assert_eq!(
+            calls[0].request.preview.commands,
+            Some(vec![
+                vec!["p4".to_string(), "stream".to_string(), "-i".to_string()],
+                vec![
+                    "p4".to_string(),
+                    "stream".to_string(),
+                    "parentview".to_string(),
+                    "--noinherit".to_string(),
+                    "//streams/dev".to_string(),
+                ],
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn modify_streams_create_rejects_existing_stream_after_approval() {
         let executor = Arc::new(QueuedExecutor::success(vec![P4CommandOutput {
             records: vec![json!({"Stream": "//streams/dev"})],
@@ -4416,6 +4505,14 @@ Paths:
         assert_eq!(invocations.len(), 5);
         assert_eq!(invocations[3].args, ["clients", "-S", "//streams/dev"]);
         assert_eq!(invocations[4].args, ["opened", "-C", "ws-dev"]);
+    }
+
+    #[test]
+    fn modify_streams_update_blank_parent_view_is_not_view_affecting() {
+        let mut params = modify_streams_params(StreamModifyAction::Update);
+        params.parent_view = Some(" \t ".to_string());
+
+        assert!(!stream_update_is_view_affecting(&params));
     }
 
     #[tokio::test]
