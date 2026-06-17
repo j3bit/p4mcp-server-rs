@@ -29,6 +29,13 @@ The write approval gate is an approved Rust-port extension because it is a safet
 - Do not support `workspace_name`; `p4 where` resolves through the active client context.
 - If a future implementation receives both `where` and `workspace_name`, return an invalid-params error rather than pretending the named workspace is used.
 
+### `status` Client Scoping
+
+- Keep the current PR aligned with upstream: `query_workspaces.status` validates and reads the named workspace spec, but the status probes run in the active client context.
+- Treat stricter per-request scoping as a deliberate Rust-port extension, not a parity bug fix.
+- If this extension is added, run every status probe under `P4CLIENT=<workspace_name>` or an equivalent temporary client context.
+- Cover `opened`, `sync -n`, `resolve -n`, and `changes -m1 #have` so the returned status cannot mix a named workspace spec with another active client's state.
+
 ## Reintroduction Checklist
 
 - Add explicit action documentation before exposing the action.
