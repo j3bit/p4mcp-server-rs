@@ -14,8 +14,9 @@ use p4mcp_server_rs::{
     server::P4McpServer,
     tools::{
         params::{
-            ChangelistQueryAction, FileQueryAction, QueryChangelistsParams, QueryFilesParams,
-            QueryStreamsParams, QueryWorkspacesParams, StreamQueryAction, WorkspaceQueryAction,
+            ChangelistQueryAction, FileQueryAction, JobQueryAction, QueryChangelistsParams,
+            QueryFilesParams, QueryJobsParams, QueryStreamsParams, QueryWorkspacesParams,
+            StreamQueryAction, WorkspaceQueryAction,
         },
         reviews::{QueryReviewsParams, ReviewQueryAction},
         server::{QueryServerParams, ServerQueryAction},
@@ -278,6 +279,37 @@ async fn query_changelists_calls_injected_executor() {
             "alice",
             "//depot/main/..."
         ]
+    );
+}
+
+#[tokio::test]
+async fn query_jobs_list_threads_max_results_to_fixes() {
+    let executor = Arc::new(FakeExecutor::success(P4CommandOutput {
+        records: vec![json!({"Job": "job000001", "Change": "123"})],
+        text: json!({}),
+    }));
+    let server = P4McpServer::with_executor(test_config(), executor.clone());
+
+    let response = server
+        .query_jobs(Parameters(QueryJobsParams {
+            action: JobQueryAction::ListJobs,
+            changelist_id: Some("123".to_string()),
+            job_id: None,
+            max_results: 3,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(response.0.status, "success");
+    assert_eq!(response.0.action, "list_jobs");
+    assert_eq!(
+        response.0.message,
+        json!([{"Job": "job000001", "Change": "123"}])
+    );
+    assert_eq!(executor.invocations().len(), 1);
+    assert_eq!(
+        executor.invocations()[0].args,
+        ["fixes", "-m3", "-c", "123"]
     );
 }
 

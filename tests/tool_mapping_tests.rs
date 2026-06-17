@@ -1544,9 +1544,9 @@ fn workspace_get_blank_name_errors() {
 }
 
 #[test]
-fn job_list_for_changelist_uses_fixes() {
+fn job_list_for_changelist_uses_fixes_with_max_results() {
     let invocation = build_job_query_invocation("list_jobs", Some("123"), None, 10).unwrap();
-    assert_eq!(invocation.args, vec!["fixes", "-c", "123"]);
+    assert_eq!(invocation.args, vec!["fixes", "-m10", "-c", "123"]);
 }
 
 #[test]

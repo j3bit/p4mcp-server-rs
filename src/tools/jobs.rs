@@ -8,11 +8,12 @@ pub fn build_job_query_invocation(
     action: &str,
     changelist_id: Option<&str>,
     job_id: Option<&str>,
-    _max_results: u16,
+    max_results: u16,
 ) -> Result<P4Invocation> {
     let args = match action {
         "list_jobs" => vec![
             "fixes".into(),
+            format!("-m{max_results}"),
             "-c".into(),
             required(changelist_id, "changelist_id")?,
         ],
